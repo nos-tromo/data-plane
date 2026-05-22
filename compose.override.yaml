@@ -1,0 +1,26 @@
+### Dev override — publishes service ports to the host.
+###
+### Named compose.dev.yaml (not compose.override.yaml) so it is NOT
+### auto-discovered. Production runbooks invoke `docker compose -f compose.yaml ...`
+### and never see this file. Dev uses `make up-dev` (or `docker compose
+### -f compose.yaml -f compose.dev.yaml up -d`) to layer it on top.
+###
+### Why this matters: in airgap production the only exposure is via the
+### inference-net network. Accidentally publishing 7474/7687/6333/6334 on
+### the host would breach that boundary.
+
+services:
+  neo4j-chorus:
+    ports:
+      - "${NEO4J_BOLT_HOST_PORT:-7687}:7687"
+      - "${NEO4J_HTTP_HOST_PORT:-7474}:7474"
+
+  qdrant-docint-cpu:
+    ports:
+      - "${QDRANT_HTTP_HOST_PORT:-6333}:6333"
+      - "${QDRANT_GRPC_HOST_PORT:-6334}:6334"
+
+  qdrant-docint-cuda:
+    ports:
+      - "${QDRANT_HTTP_HOST_PORT:-6333}:6333"
+      - "${QDRANT_GRPC_HOST_PORT:-6334}:6334"

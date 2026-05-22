@@ -1,0 +1,132 @@
+### data-plane compose — stateful services for chorus (Neo4j) and docint (Qdrant).
+###
+### What this project owns:
+###   - The named volumes that hold all graph + vector data
+###   - The neo4j and qdrant services that read/write that data
+###
+### What it does NOT own:
+###   - inference-net  (external; owned by the inference/ compose project)
+###   - Application code or app-side state (chorus/ and docint/ keep their own
+###     SQLite, caches, logs, etc.)
+###
+### Blast-radius design:
+###   `docker compose down -v` *here* will destroy graph + vector data — that
+###   risk is concentrated in this one project. The chorus and docint compose
+###   files declare zero application-state volumes, so `down -v` over there is
+###   always safe. Backup + restore runbooks live in backup/.
+
+name: data-plane
+
+networks:
+  inference-net:
+    external: true
+    name: ${INFERENCE_NET:-inference-net}
+
+services:
+  ##########################################################
+  # Neo4j  —  graph + native vector index for chorus
+  ##########################################################
+  neo4j-chorus:
+    image: docker.io/library/neo4j:5.26.26-community@sha256:0b5d3ab6ec1b866890dbfb53bf4fe1cf039f9e03c96165599a403005b7e7bcc3
+    environment:
+      NEO4J_AUTH: ${NEO4J_USER:-neo4j}/${NEO4J_PASSWORD:?NEO4J_PASSWORD must be set in .env}
+      # Airgap: no phone-home.
+      NEO4J_dbms_usage__report_enabled: "false"
+      # Memory tuning — adjust to host capacity.
+      NEO4J_server_memory_heap_initial__size: ${NEO4J_HEAP_INITIAL:-512m}
+      NEO4J_server_memory_heap_max__size: ${NEO4J_HEAP_MAX:-2G}
+      NEO4J_server_memory_pagecache_size: ${NEO4J_PAGECACHE:-1G}
+      # Listen on all interfaces inside the container so other compose projects
+      # on inference-net can reach bolt + http.
+      NEO4J_server_default__listen__address: 0.0.0.0
+      # NEO4J_PLUGINS would auto-download from the internet on first boot —
+      # leave empty in airgap. Mirror plugins into the plugins volume out-of-band.
+      NEO4J_PLUGINS: ${NEO4J_PLUGINS:-}
+    expose:
+      - "7687"   # bolt
+      - "7474"   # http
+    volumes:
+      - neo4j-data:/data
+      - neo4j-logs:/logs
+      - neo4j-import:/var/lib/neo4j/import
+      - neo4j-plugins:/plugins
+    networks:
+      inference-net:
+        aliases:
+          - neo4j-chorus
+          - neo4j
+    healthcheck:
+      # $$ escapes compose variable substitution so the container shell does
+      # the parameter expansion on NEO4J_AUTH ("user/password").
+      test:
+        - CMD-SHELL
+        - cypher-shell -u "$${NEO4J_AUTH%%/*}" -p "$${NEO4J_AUTH#*/}" 'RETURN 1' >/dev/null
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    restart: unless-stopped
+
+  ##########################################################
+  # Qdrant  —  vector store for docint  (CPU profile)
+  ##########################################################
+  qdrant-docint-cpu:
+    image: docker.io/qdrant/qdrant:v1.17.0@sha256:f1c7272cdac52b38c1a0e89313922d940ba50afd90d593a1605dbbc214e66ffb
+    environment:
+      QDRANT__TELEMETRY_DISABLED: "true"
+    expose: &qdrant-ports
+      - "6333"   # http
+      - "6334"   # grpc
+    volumes: &qdrant-volumes
+      - qdrant-snapshots:/qdrant/snapshots
+      - qdrant-storage:/qdrant/storage
+    networks:
+      inference-net:
+        aliases:
+          - qdrant-docint
+          - qdrant
+    # Qdrant slim image ships no curl/wget/bash; the official suggestion is
+    # to skip an in-container healthcheck and let depends_on use
+    # service_started, or front it with an external probe.
+    restart: unless-stopped
+    profiles: ["cpu"]
+
+  ##########################################################
+  # Qdrant  —  vector store for docint  (CUDA profile)
+  ##########################################################
+  qdrant-docint-cuda:
+    image: docker.io/qdrant/qdrant:v1.17.0-gpu-nvidia@sha256:5315819b0721f5211ccb432c6949e81c56bdcf63cab33b4dec45f42126970bde
+    environment:
+      QDRANT__TELEMETRY_DISABLED: "true"
+      QDRANT__GPU__INDEXING: "1"
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility,graphics
+      NVIDIA_VISIBLE_DEVICES: all
+    expose: *qdrant-ports
+    volumes: *qdrant-volumes
+    networks:
+      inference-net:
+        aliases:
+          - qdrant-docint
+          - qdrant
+    gpus: all
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    # See note on the CPU profile re: in-container healthcheck.
+    restart: unless-stopped
+    profiles: ["cuda"]
+
+##########################################################
+# Volumes — all persistent data-plane state lives here.
+##########################################################
+volumes:
+  neo4j-data:
+  neo4j-logs:
+  neo4j-import:
+  neo4j-plugins:
+  qdrant-storage:
+  qdrant-snapshots:
