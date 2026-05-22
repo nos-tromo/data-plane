@@ -6,13 +6,14 @@ stateless and disposable.
 
 ## What lives here
 
-| Service  | Used by  | Network alias on `inference-net` | Why                       |
-|----------|----------|----------------------------------|---------------------------|
-| `neo4j`  | chorus   | `neo4j`                          | Graph + native vectors    |
-| `qdrant` | docint   | `qdrant`                         | Document vector store     |
+| Service  | Used by  | Network alias on `data-net` | Why                    |
+|----------|----------|-----------------------------|------------------------|
+| `neo4j`  | chorus   | `neo4j`                     | Graph + native vectors |
+| `qdrant` | docint   | `qdrant`                    | Document vector store  |
 
-Both services attach to the `inference-net` network owned by the
-`inference/` compose project; the apps reach them by alias.
+Both services attach to the external `data-net` network; the app
+backends reach them by alias. `data-net` carries data-plane traffic
+only — inference traffic runs on a separate `inference-net`.
 
 ## Why a separate compose project
 
@@ -31,15 +32,14 @@ that reason. Backups (`backup/`) are the recovery path.
 cp .env.example .env
 $EDITOR .env                  # set NEO4J_PASSWORD at minimum
 
-make network                  # create the external inference-net (idempotent)
+make network                  # create the external data-net (idempotent)
 make up                       # start with the CPU Qdrant profile (default)
 make up PROFILE=cuda          # GPU profile
 make up-dev                   # publish ports on the host (Neo4j Browser, Qdrant UI)
 ```
 
-The inference stack should already be running so `inference-net` exists.
-If not, `make network` will create it; the inference services will join
-the same network when they come up.
+`make network` creates the external `data-net` if it does not exist; the
+app backends (chorus, docint) join it when they come up.
 
 ## Operating
 
@@ -48,6 +48,7 @@ make ps                       # service state
 make health                   # health + uptime
 make logs S=neo4j             # tail logs for one service
 make down                     # stop, keep volumes
+make bundle                   # save images as a versioned airgap tarball
 make nuke                     # interactive: DESTROY all volumes
 ```
 
@@ -62,11 +63,12 @@ steps in [`backup/README.md`](backup/README.md).
 
 ```
 data-plane/
-  compose.yaml          production-shape compose (no host ports)
-  compose.dev.yaml      dev overlay — publishes ports on the host
-  .env.example          copy to .env
-  Makefile              operator commands
-  backup/               runbooks + snapshot drop location
+  docker/
+    compose.yaml          production-shape compose (no host ports)
+    compose.override.yaml dev overlay — publishes ports on the host
+  .env.example            copy to .env
+  Makefile                operator commands
+  backup/                 runbooks + snapshot drop location
 ```
 
 ## Pointers

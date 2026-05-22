@@ -5,7 +5,7 @@
 ###   - The neo4j and qdrant services that read/write that data
 ###
 ### What it does NOT own:
-###   - inference-net  (external; owned by the inference/ compose project)
+###   - data-net  (external; created via 'make network', shared with app backends)
 ###   - Application code or app-side state (chorus/ and docint/ keep their own
 ###     SQLite, caches, logs, etc.)
 ###
@@ -18,9 +18,9 @@
 name: data-plane
 
 networks:
-  inference-net:
+  data-net:
     external: true
-    name: ${INFERENCE_NET:-inference-net}
+    name: ${DATA_NET:-data-net}
 
 services:
   ##########################################################
@@ -37,7 +37,7 @@ services:
       NEO4J_server_memory_heap_max__size: ${NEO4J_HEAP_MAX:-2G}
       NEO4J_server_memory_pagecache_size: ${NEO4J_PAGECACHE:-1G}
       # Listen on all interfaces inside the container so other compose projects
-      # on inference-net can reach bolt + http.
+      # on data-net can reach bolt + http.
       NEO4J_server_default__listen__address: 0.0.0.0
       # NEO4J_PLUGINS would auto-download from the internet on first boot —
       # leave empty in airgap. Mirror plugins into the plugins volume out-of-band.
@@ -51,7 +51,7 @@ services:
       - neo4j-import:/var/lib/neo4j/import
       - neo4j-plugins:/plugins
     networks:
-      inference-net:
+      data-net:
         aliases:
           - neo4j
     healthcheck:
@@ -80,7 +80,7 @@ services:
       - qdrant-snapshots:/qdrant/snapshots
       - qdrant-storage:/qdrant/storage
     networks:
-      inference-net:
+      data-net:
         aliases:
           - qdrant
     # Qdrant slim image ships no curl/wget/bash; the official suggestion is
@@ -102,7 +102,7 @@ services:
     expose: *qdrant-ports
     volumes: *qdrant-volumes
     networks:
-      inference-net:
+      data-net:
         aliases:
           - qdrant
     gpus: all

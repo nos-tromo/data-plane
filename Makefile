@@ -8,26 +8,27 @@ SHELL := /usr/bin/env bash
 .DEFAULT_GOAL := help
 
 # Default the Qdrant profile to CPU. Override via PROFILE env var or .env file.
-PROFILE ?= $(shell test -f .env && grep -E '^PROFILE=' .env | cut -d= -f2 || echo cpu)
+PROFILE ?= $(or $(strip $(shell test -f .env && grep -E '^PROFILE=' .env | cut -d= -f2)),cpu)
 
-# Read INFERENCE_NET from .env if present, otherwise fall back.
-INFERENCE_NET ?= $(shell test -f .env && grep -E '^INFERENCE_NET=' .env | cut -d= -f2 || echo inference-net)
+# Read DATA_NET from .env if present, otherwise fall back.
+DATA_NET ?= $(or $(strip $(shell test -f .env && grep -E '^DATA_NET=' .env | cut -d= -f2)),data-net)
 
-COMPOSE        := docker compose -f compose.yaml
-COMPOSE_DEV    := docker compose -f compose.yaml -f compose.override.yaml
+COMPOSE        := docker compose --env-file .env -f docker/compose.yaml
+COMPOSE_DEV    := docker compose --env-file .env -f docker/compose.yaml -f docker/compose.override.yaml
 PROFILE_FLAG   := --profile $(PROFILE)
 TS             := $(shell date -u +%Y%m%dT%H%M%SZ)
 BACKUP_DIR     ?= ./backup/snapshots
 
-.PHONY: help network pull up up-dev stop down restart logs ps \
+.PHONY: help network pull bundle up up-dev stop down restart logs ps \
         health nuke backup backup-neo4j backup-qdrant restore-neo4j
 
 help:
 	@echo "data-plane — stateful services for chorus (Neo4j) + docint (Qdrant)."
 	@echo
 	@echo "Lifecycle:"
-	@echo "  make network         create the external inference-net if missing"
+	@echo "  make network         create the external data-net if missing"
 	@echo "  make pull            pull all images from the registry"
+	@echo "  make bundle          save images as a versioned airgap tarball ($(PROFILE))"
 	@echo "  make up              start neo4j + qdrant ($(PROFILE) profile)"
 	@echo "  make up-dev          like 'up', but publishes ports on the host"
 	@echo "  make down            stop the stack (volumes preserved)"
@@ -47,12 +48,16 @@ help:
 	@echo "Profile: $(PROFILE)  (override with PROFILE=cuda)"
 
 network:
-	@docker network inspect $(INFERENCE_NET) >/dev/null 2>&1 \
-	  || (echo ">> creating external network $(INFERENCE_NET)" \
-	      && docker network create $(INFERENCE_NET))
+	@docker network inspect $(DATA_NET) >/dev/null 2>&1 \
+	  || (echo ">> creating external network $(DATA_NET)" \
+	      && docker network create $(DATA_NET))
 
 pull:
 	$(COMPOSE) --profile cpu --profile cuda pull
+
+# Save images as a versioned tarball for transfer to an offline host.
+bundle:
+	./scripts/bundle_images.sh $(PROFILE)
 
 up: network
 	$(COMPOSE) $(PROFILE_FLAG) up --no-build -d

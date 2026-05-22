@@ -1,13 +1,12 @@
 ### Dev override — publishes service ports to the host.
 ###
-### Named compose.dev.yaml (not compose.override.yaml) so it is NOT
-### auto-discovered. Production runbooks invoke `docker compose -f compose.yaml ...`
-### and never see this file. Dev uses `make up-dev` (or `docker compose
-### -f compose.yaml -f compose.dev.yaml up -d`) to layer it on top.
+### NOT auto-loaded: it lives in docker/ and operators always pass explicit
+### -f flags via the Makefile. `make up` uses docker/compose.yaml only
+### (production shape, no host ports); `make up-dev` layers this file on top.
 ###
 ### Why this matters: in airgap production the only exposure is via the
-### inference-net network. Accidentally publishing 7474/7687/6333/6334 on
-### the host would breach that boundary.
+### data-net network. Accidentally publishing 7474/7687/6333/6334 on the
+### host would breach that boundary.
 
 services:
   neo4j:
