@@ -23,10 +23,10 @@ offline `neo4j-admin database dump` while the service is stopped.
 ```bash
 make backup-neo4j
 # wraps:
-#   docker compose stop neo4j-chorus
-#   docker compose run --rm --entrypoint /bin/bash neo4j-chorus \
+#   docker compose stop neo4j
+#   docker compose run --rm --entrypoint /bin/bash neo4j \
 #     -c "neo4j-admin database dump neo4j --to-path=/backup"
-#   docker compose start neo4j-chorus
+#   docker compose start neo4j
 # writes ./backup/snapshots/neo4j-<ISO8601-utc>.dump
 ```
 
@@ -38,18 +38,18 @@ chorus already publishes for retention sweeps.
 
 ```bash
 # 0. Stop the service.
-docker compose -f compose.yaml stop neo4j-chorus
+docker compose -f compose.yaml stop neo4j
 
 # 1. Mount the dump into a one-shot container and load it. This
 #    OVERWRITES the existing neo4j database in the data volume.
 docker compose -f compose.yaml run --rm \
   -v "$PWD/backup/snapshots:/backup" \
-  --entrypoint /bin/bash neo4j-chorus -c \
+  --entrypoint /bin/bash neo4j -c \
   "neo4j-admin database load neo4j --from-path=/backup --overwrite-destination=true"
 
 # 2. Start the service. Chorus migrations will re-run idempotently on
 #    the next chorus deploy and bring the schema forward if needed.
-docker compose -f compose.yaml start neo4j-chorus
+docker compose -f compose.yaml start neo4j
 ```
 
 Validate after restore: open the Neo4j Browser (dev: http://localhost:7474),
@@ -71,7 +71,7 @@ Qdrant supports online snapshots via its HTTP API. No service downtime.
 ```bash
 make backup-qdrant
 # wraps: POST http://qdrant:6333/collections/<name>/snapshots
-# Snapshots land inside the qdrant-docint-snapshots volume, NOT on the host.
+# Snapshots land inside the qdrant-snapshots volume, NOT on the host.
 ```
 
 To get a snapshot off-host:
@@ -79,7 +79,7 @@ To get a snapshot off-host:
 ```bash
 # Replace <collection> and <snapshot>.
 docker compose -f compose.yaml cp \
-  qdrant-docint-cpu:/qdrant/snapshots/<collection>/<snapshot> \
+  qdrant-cpu:/qdrant/snapshots/<collection>/<snapshot> \
   ./backup/snapshots/
 ```
 
@@ -96,7 +96,7 @@ curl -X POST http://localhost:6333/collections/<collection>/snapshots
 # Push the snapshot back into the container, then recover it via API.
 docker compose -f compose.yaml cp \
   ./backup/snapshots/<snapshot> \
-  qdrant-docint-cpu:/qdrant/snapshots/<collection>/<snapshot>
+  qdrant-cpu:/qdrant/snapshots/<collection>/<snapshot>
 
 curl -X PUT \
   -H 'Content-Type: application/json' \

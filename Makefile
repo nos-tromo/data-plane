@@ -95,28 +95,28 @@ backup: backup-neo4j backup-qdrant
 # Neo4j community edition has no online backup. We stop, dump, restart.
 # Confirm the brief downtime window is acceptable before scheduling.
 backup-neo4j: | $(BACKUP_DIR)
-	@echo ">> stopping neo4j-chorus for offline dump"
-	$(COMPOSE) stop neo4j-chorus
+	@echo ">> stopping neo4j for offline dump"
+	$(COMPOSE) stop neo4j
 	$(COMPOSE) run --rm \
 	  -v $(abspath $(BACKUP_DIR)):/backup \
-	  --entrypoint /bin/bash neo4j-chorus -c \
+	  --entrypoint /bin/bash neo4j -c \
 	  "neo4j-admin database dump neo4j --to-path=/backup --overwrite-destination=true && \
 	   mv /backup/neo4j.dump /backup/neo4j-$(TS).dump"
-	$(COMPOSE) start neo4j-chorus
+	$(COMPOSE) start neo4j
 	@echo ">> wrote $(BACKUP_DIR)/neo4j-$(TS).dump"
 
 # Qdrant supports online snapshots via its HTTP API. Iterates every
-# collection. Snapshots land in the qdrant-docint-snapshots volume —
+# collection. Snapshots land in the qdrant-snapshots volume —
 # this target also copies them out to $(BACKUP_DIR) for off-host pickup.
 backup-qdrant: | $(BACKUP_DIR)
 	@echo ">> triggering qdrant snapshot for every collection"
-	@$(COMPOSE) exec -T qdrant-docint-$(PROFILE) sh -c '\
+	@$(COMPOSE) exec -T qdrant-$(PROFILE) sh -c '\
 	  for col in $$(wget -qO- http://localhost:6333/collections | \
 	    grep -oE "\"name\":\"[^\"]+\"" | cut -d\" -f4); do \
 	    echo "  snapshotting $$col"; \
 	    wget -qO- --post-data="" http://localhost:6333/collections/$$col/snapshots; \
 	  done' || echo "(if wget is absent in your qdrant image, see backup/README.md for the alternative)"
-	@echo ">> snapshots live in the qdrant-docint-snapshots volume"
+	@echo ">> snapshots live in the qdrant-snapshots volume"
 
 restore-neo4j:
 	@echo "See backup/README.md → Restore (Neo4j) for the procedure."

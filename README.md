@@ -6,10 +6,10 @@ stateless and disposable.
 
 ## What lives here
 
-| Service          | Used by  | Network alias on `inference-net` | Why                       |
-|------------------|----------|----------------------------------|---------------------------|
-| `neo4j-chorus`   | chorus   | `neo4j-chorus`, `neo4j`          | Graph + native vectors    |
-| `qdrant-docint`  | docint   | `qdrant-docint`, `qdrant`        | Document vector store     |
+| Service  | Used by  | Network alias on `inference-net` | Why                       |
+|----------|----------|----------------------------------|---------------------------|
+| `neo4j`  | chorus   | `neo4j`                          | Graph + native vectors    |
+| `qdrant` | docint   | `qdrant`                         | Document vector store     |
 
 Both services attach to the `inference-net` network owned by the
 `inference/` compose project; the apps reach them by alias.
@@ -46,7 +46,7 @@ the same network when they come up.
 ```bash
 make ps                       # service state
 make health                   # health + uptime
-make logs S=neo4j-chorus      # tail logs for one service
+make logs S=neo4j             # tail logs for one service
 make down                     # stop, keep volumes
 make nuke                     # interactive: DESTROY all volumes
 ```

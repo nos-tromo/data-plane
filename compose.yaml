@@ -26,7 +26,7 @@ services:
   ##########################################################
   # Neo4j  —  graph + native vector index for chorus
   ##########################################################
-  neo4j-chorus:
+  neo4j:
     image: docker.io/library/neo4j:5.26.26-community@sha256:0b5d3ab6ec1b866890dbfb53bf4fe1cf039f9e03c96165599a403005b7e7bcc3
     environment:
       NEO4J_AUTH: ${NEO4J_USER:-neo4j}/${NEO4J_PASSWORD:?NEO4J_PASSWORD must be set in .env}
@@ -53,7 +53,6 @@ services:
     networks:
       inference-net:
         aliases:
-          - neo4j-chorus
           - neo4j
     healthcheck:
       # $$ escapes compose variable substitution so the container shell does
@@ -70,7 +69,7 @@ services:
   ##########################################################
   # Qdrant  —  vector store for docint  (CPU profile)
   ##########################################################
-  qdrant-docint-cpu:
+  qdrant-cpu:
     image: docker.io/qdrant/qdrant:v1.17.0@sha256:f1c7272cdac52b38c1a0e89313922d940ba50afd90d593a1605dbbc214e66ffb
     environment:
       QDRANT__TELEMETRY_DISABLED: "true"
@@ -83,7 +82,6 @@ services:
     networks:
       inference-net:
         aliases:
-          - qdrant-docint
           - qdrant
     # Qdrant slim image ships no curl/wget/bash; the official suggestion is
     # to skip an in-container healthcheck and let depends_on use
@@ -94,7 +92,7 @@ services:
   ##########################################################
   # Qdrant  —  vector store for docint  (CUDA profile)
   ##########################################################
-  qdrant-docint-cuda:
+  qdrant-cuda:
     image: docker.io/qdrant/qdrant:v1.17.0-gpu-nvidia@sha256:5315819b0721f5211ccb432c6949e81c56bdcf63cab33b4dec45f42126970bde
     environment:
       QDRANT__TELEMETRY_DISABLED: "true"
@@ -106,7 +104,6 @@ services:
     networks:
       inference-net:
         aliases:
-          - qdrant-docint
           - qdrant
     gpus: all
     deploy:
@@ -128,5 +125,5 @@ volumes:
   neo4j-logs:
   neo4j-import:
   neo4j-plugins:
-  qdrant-storage:
   qdrant-snapshots:
+  qdrant-storage:

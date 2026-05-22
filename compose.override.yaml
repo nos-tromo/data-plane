@@ -10,17 +10,17 @@
 ### the host would breach that boundary.
 
 services:
-  neo4j-chorus:
+  neo4j:
     ports:
       - "${NEO4J_BOLT_HOST_PORT:-7687}:7687"
       - "${NEO4J_HTTP_HOST_PORT:-7474}:7474"
 
-  qdrant-docint-cpu:
+  qdrant-cpu:
     ports:
       - "${QDRANT_HTTP_HOST_PORT:-6333}:6333"
       - "${QDRANT_GRPC_HOST_PORT:-6334}:6334"
 
-  qdrant-docint-cuda:
+  qdrant-cuda:
     ports:
       - "${QDRANT_HTTP_HOST_PORT:-6333}:6333"
       - "${QDRANT_GRPC_HOST_PORT:-6334}:6334"
