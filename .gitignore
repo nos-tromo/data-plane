@@ -3,3 +3,7 @@
 *.log
 .remember
 *.code-workspace
+
+# Airgap bundle artifacts (produced by scripts/bundle_images.sh)
+.data-plane-version
+*.tar.gz
