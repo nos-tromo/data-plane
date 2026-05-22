@@ -7,26 +7,27 @@
 SHELL := /usr/bin/env bash
 .DEFAULT_GOAL := help
 
-# Default the Qdrant profile to CPU. Override on the command line.
-PROFILE ?= cpu
+# Default the Qdrant profile to CPU. Override via PROFILE env var or .env file.
+PROFILE ?= $(shell test -f .env && grep -E '^PROFILE=' .env | cut -d= -f2 || echo cpu)
 
 # Read INFERENCE_NET from .env if present, otherwise fall back.
 INFERENCE_NET ?= $(shell test -f .env && grep -E '^INFERENCE_NET=' .env | cut -d= -f2 || echo inference-net)
 
 COMPOSE        := docker compose -f compose.yaml
-COMPOSE_DEV    := docker compose -f compose.yaml -f compose.dev.yaml
+COMPOSE_DEV    := docker compose -f compose.yaml -f compose.override.yaml
 PROFILE_FLAG   := --profile $(PROFILE)
 TS             := $(shell date -u +%Y%m%dT%H%M%SZ)
 BACKUP_DIR     ?= ./backup/snapshots
 
-.PHONY: help network up up-dev down restart logs ps health \
-        nuke backup backup-neo4j backup-qdrant restore-neo4j
+.PHONY: help network pull up up-dev stop down restart logs ps \
+        health nuke backup backup-neo4j backup-qdrant restore-neo4j
 
 help:
 	@echo "data-plane — stateful services for chorus (Neo4j) + docint (Qdrant)."
 	@echo
 	@echo "Lifecycle:"
 	@echo "  make network         create the external inference-net if missing"
+	@echo "  make pull            pull all images from the registry"
 	@echo "  make up              start neo4j + qdrant ($(PROFILE) profile)"
 	@echo "  make up-dev          like 'up', but publishes ports on the host"
 	@echo "  make down            stop the stack (volumes preserved)"
@@ -36,7 +37,7 @@ help:
 	@echo "Observability:"
 	@echo "  make ps              service status"
 	@echo "  make health          show health + uptime of each service"
-	@echo "  make logs S=neo4j-chorus  tail logs for one service"
+	@echo "  make logs S=neo4j  tail logs for one service"
 	@echo
 	@echo "Backup / restore (see backup/README.md for the full runbook):"
 	@echo "  make backup          backup both DBs into $(BACKUP_DIR)"
@@ -50,11 +51,17 @@ network:
 	  || (echo ">> creating external network $(INFERENCE_NET)" \
 	      && docker network create $(INFERENCE_NET))
 
+pull:
+	$(COMPOSE) --profile cpu --profile cuda pull
+
 up: network
-	$(COMPOSE) $(PROFILE_FLAG) up -d
+	$(COMPOSE) $(PROFILE_FLAG) up --no-build -d
 
 up-dev: network
-	$(COMPOSE_DEV) $(PROFILE_FLAG) up -d
+	$(COMPOSE_DEV) $(PROFILE_FLAG) up --no-build -d
+
+stop:
+	$(COMPOSE) $(PROFILE_FLAG) stop
 
 down:
 	$(COMPOSE) $(PROFILE_FLAG) down
