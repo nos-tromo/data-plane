@@ -1,9 +1,8 @@
 version: 2
 updates:
-  - package-ecosystem: docker
-    directory: "/docker"
-    schedule:
-      interval: weekly
+  # No `docker` ecosystem block — data-plane is pull-only (Neo4j + Qdrant
+  # images referenced by compose). It has no Dockerfiles for dependabot
+  # to update, and the ecosystem fails the run when it finds nothing.
   - package-ecosystem: github-actions
     directory: "/"
     schedule:
