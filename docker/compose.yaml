@@ -17,6 +17,19 @@
 
 name: data-plane
 
+##########################################################
+# Shared logging — the local driver rotates and compresses
+# the container's stdout/stderr stream (not Neo4j's internal
+# /logs file directory, which still goes to the neo4j-logs
+# volume below). Tail with `docker compose logs -f <svc>`.
+##########################################################
+x-logging: &default-logging
+  driver: "local"
+  options:
+    max-size: "50m"
+    max-file: "5"
+    compress: "true"
+
 networks:
   data-net:
     external: true
@@ -28,6 +41,7 @@ services:
   ##########################################################
   neo4j:
     image: docker.io/library/neo4j:5.26.26-community@sha256:0b5d3ab6ec1b866890dbfb53bf4fe1cf039f9e03c96165599a403005b7e7bcc3
+    logging: *default-logging
     environment:
       NEO4J_AUTH: ${NEO4J_USER:-neo4j}/${NEO4J_PASSWORD:?NEO4J_PASSWORD must be set in .env}
       # Airgap: no phone-home.
@@ -71,6 +85,7 @@ services:
   ##########################################################
   qdrant-cpu:
     image: docker.io/qdrant/qdrant:v1.17.0@sha256:f1c7272cdac52b38c1a0e89313922d940ba50afd90d593a1605dbbc214e66ffb
+    logging: *default-logging
     environment:
       QDRANT__TELEMETRY_DISABLED: "true"
     expose: &qdrant-ports
@@ -94,6 +109,7 @@ services:
   ##########################################################
   qdrant-cuda:
     image: docker.io/qdrant/qdrant:v1.17.0-gpu-nvidia@sha256:5315819b0721f5211ccb432c6949e81c56bdcf63cab33b4dec45f42126970bde
+    logging: *default-logging
     environment:
       QDRANT__TELEMETRY_DISABLED: "true"
       QDRANT__GPU__INDEXING: "1"
