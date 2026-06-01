@@ -13,13 +13,18 @@ PROFILE ?= $(or $(strip $(shell test -f .env && grep -E '^PROFILE=' .env | cut -
 # Read DATA_NET from .env if present, otherwise fall back.
 DATA_NET ?= $(or $(strip $(shell test -f .env && grep -E '^DATA_NET=' .env | cut -d= -f2)),data-net)
 
+# External named volumes this project owns. `make volumes` creates them
+# (compose won't — they're external) and `make nuke` removes them (compose's
+# `down -v` won't, same reason). Keep in sync with docker/compose.yaml.
+VOLUMES := neo4j-data neo4j-logs neo4j-import neo4j-plugins qdrant-snapshots qdrant-storage
+
 COMPOSE        := docker compose --env-file .env -f docker/compose.yaml
 COMPOSE_DEV    := docker compose --env-file .env -f docker/compose.yaml -f docker/compose.override.yaml
 PROFILE_FLAG   := --profile $(PROFILE)
 TS             := $(shell date -u +%Y%m%dT%H%M%SZ)
 BACKUP_DIR     ?= ./backup/snapshots
 
-.PHONY: help network pull bundle up up-dev stop down restart logs ps \
+.PHONY: help network volumes pull bundle up up-dev stop down restart logs ps \
         health nuke backup backup-neo4j backup-qdrant restore-neo4j
 
 help:
@@ -27,6 +32,7 @@ help:
 	@echo
 	@echo "Lifecycle:"
 	@echo "  make network         create the external data-net if missing"
+	@echo "  make volumes         create the external data volumes if missing"
 	@echo "  make pull            pull all images from the registry"
 	@echo "  make bundle          save images as a versioned airgap tarball ($(PROFILE))"
 	@echo "  make up              start neo4j + qdrant ($(PROFILE) profile)"
@@ -52,6 +58,14 @@ network:
 	  || (echo ">> creating external network $(DATA_NET)" \
 	      && docker network create $(DATA_NET))
 
+# Pre-create the external volumes. Idempotent — skips any that already exist.
+# Compose refuses to auto-create external volumes, so `up`/`up-dev` depend on this.
+volumes:
+	@for v in $(VOLUMES); do \
+	  docker volume inspect $$v >/dev/null 2>&1 \
+	    || (echo ">> creating external volume $$v" && docker volume create $$v >/dev/null); \
+	done
+
 pull:
 	$(COMPOSE) --profile cpu --profile cuda pull
 
@@ -59,10 +73,10 @@ pull:
 bundle:
 	./scripts/bundle_images.sh $(PROFILE)
 
-up: network
+up: network volumes
 	$(COMPOSE) $(PROFILE_FLAG) up --no-build -d
 
-up-dev: network
+up-dev: network volumes
 	$(COMPOSE_DEV) $(PROFILE_FLAG) up --no-build -d
 
 stop:
@@ -74,13 +88,18 @@ down:
 restart: down up
 
 # Destructive — needs an interactive confirm. Mirrors the chorus
-# architecture invariant: only this project's `down -v` can wipe data.
+# architecture invariant: only this project can wipe graph + vector data.
+# The volumes are external, so `down -v` won't remove them — we stop the
+# stack, then delete the volumes by name.
 nuke:
 	@echo "This will DESTROY all data-plane volumes:"
-	@docker volume ls --filter label=com.docker.compose.project=data-plane --format '  - {{.Name}}'
+	@for v in $(VOLUMES); do echo "  - $$v"; done
 	@read -p "Type 'nuke' to confirm: " confirm && [ "$$confirm" = "nuke" ] \
 	  || (echo "aborted"; exit 1)
-	$(COMPOSE) --profile cpu --profile cuda down -v
+	$(COMPOSE) --profile cpu --profile cuda down
+	@for v in $(VOLUMES); do \
+	  docker volume rm $$v >/dev/null 2>&1 && echo "  removed $$v" || true; \
+	done
 
 ps:
 	$(COMPOSE) $(PROFILE_FLAG) ps

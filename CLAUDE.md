@@ -17,6 +17,7 @@ No application code. No Python venv, no test suite, no linter. The whole repo is
 
 ```bash
 make network                  # create external data-net (idempotent; required once per host)
+make volumes                  # create external data volumes (idempotent; required once per host)
 make up                       # production shape — services on data-net only, NO host ports
 make up-dev                   # layers docker/compose.override.yaml — publishes 7474/7687/6333/6334
 make down                     # stop; volumes preserved
@@ -40,7 +41,7 @@ make nuke                     # DESTROY all volumes (interactive: type 'nuke' to
 
 ### 1. data-plane is the only project that can destroy data
 
-App compose files (`chorus/`, `docint/`) declare zero data-plane volumes, so their `docker compose down -v` cannot wipe graph or vector data. The blast radius of `down -v` *here* is the entire dataset — that is concentrated in this one project on purpose. `make nuke` therefore activates **both** profiles (`--profile cpu --profile cuda down -v`) so it reaches the inactive Qdrant variant too, and gates the action behind an interactive `nuke` confirmation that lists the volumes about to die. The recovery path is `backup/snapshots/` copied off-host on a schedule.
+App compose files (`chorus/`, `docint/`) declare zero data-plane volumes, so their `docker compose down -v` cannot wipe graph or vector data. The blast radius of destroying this project's volumes is the entire dataset — that is concentrated in this one project on purpose. The volumes are declared `external`, so `docker compose down -v` cannot remove them either; `make nuke` therefore stops the stack with **both** profiles active (`--profile cpu --profile cuda down`, so it reaches the inactive Qdrant variant too) and then deletes each volume by name from the shared `VOLUMES` list in the `Makefile`, gated behind an interactive `nuke` confirmation that lists the volumes about to die. The recovery path is `backup/snapshots/` copied off-host on a schedule.
 
 ### 2. Production shape never publishes ports
 
@@ -63,7 +64,7 @@ App compose files (`chorus/`, `docint/`) declare zero data-plane volumes, so the
 - The Neo4j healthcheck uses `cypher-shell` with parameter expansion on `$NEO4J_AUTH`. The `$$` is compose escaping — keep both `$$` so the container shell does the expansion, not compose itself.
 - Qdrant's `expose:` and `volumes:` are YAML anchors (`&qdrant-ports`, `&qdrant-volumes`) shared by the `qdrant-cpu` and `qdrant-cuda` services. Edit one set; both consume it. Both write to the same `qdrant-storage` + `qdrant-snapshots` volumes, so switching `PROFILE` preserves data, but only one Qdrant runs at a time.
 - The slim Qdrant image ships no `curl`/`wget`/`bash`, which is why there is no in-container healthcheck on either Qdrant variant and `make backup-qdrant` carries a fallback message. Don't add a healthcheck that assumes a shell or HTTP client without verifying the image first.
-- `name: data-plane` at the top of `compose.yaml` is what `make nuke` filters volumes by (`label=com.docker.compose.project=data-plane`). Renaming the project breaks the nuke confirmation list.
+- The `volumes:` block in `compose.yaml` declares its six named volumes `external`, so compose neither creates nor destroys them — `make volumes` creates them and `make nuke` deletes them by name. Those names must stay in sync with the `VOLUMES` list in the `Makefile`; adding or renaming a volume means editing both files.
 
 ## Backups: what the runbook assumes
 

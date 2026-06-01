@@ -138,8 +138,14 @@ services:
 ##########################################################
 volumes:
   neo4j-data:
+    external: true
   neo4j-logs:
+    external: true
   neo4j-import:
+    external: true
   neo4j-plugins:
+    external: true
   qdrant-snapshots:
+    external: true
   qdrant-storage:
+    external: true

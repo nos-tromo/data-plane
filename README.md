@@ -22,9 +22,10 @@ application-state volumes. The worst case from `docker compose down -v`
 in those projects is a service restart — they cannot wipe graph or
 vector data because that data lives in volumes owned by *this* project.
 
-The blast radius of `docker compose down -v` here, by contrast, is the
-entire data set. `make nuke` requires an interactive confirmation for
-that reason. Backups (`backup/`) are the recovery path.
+Those volumes are declared `external`, so even `docker compose down -v`
+*here* leaves them intact — only `make nuke`, which deletes them by name
+behind an interactive confirmation, can wipe the data set. Backups
+(`backup/`) are the recovery path.
 
 ## Quick start
 
@@ -33,13 +34,18 @@ cp .env.example .env
 $EDITOR .env                  # set NEO4J_PASSWORD at minimum
 
 make network                  # create the external data-net (idempotent)
+make volumes                  # create the external data volumes (idempotent)
 make up                       # start with the CPU Qdrant profile (default)
 make up PROFILE=cuda          # GPU profile
 make up-dev                   # publish ports on the host (Neo4j Browser, Qdrant UI)
 ```
 
 `make network` creates the external `data-net` if it does not exist; the
-app backends (chorus, docint) join it when they come up.
+app backends (chorus, docint) join it when they come up. `make volumes`
+pre-creates the named data volumes — they are declared `external`, so
+compose will not create them itself. Both targets are idempotent and run
+automatically as prerequisites of `make up`, so a fresh host can also just
+run `make up`.
 
 ## Operating
 
