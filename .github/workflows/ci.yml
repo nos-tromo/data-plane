@@ -16,7 +16,7 @@ concurrency:
 jobs:
   validate:
     # Pinned to v1 (latest stable v1.x.y).
-    uses: nos-tromo/.github/.github/workflows/infra-validation.yml@v1
+    uses: nos-tromo/.github/.github/workflows/infra-validation.yml@v2
     with:
       compose-files: '-f docker/compose.yaml -f docker/compose.override.yaml'
       compose-profiles: '--profile cpu --profile cuda'
