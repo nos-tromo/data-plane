@@ -1,0 +1,36 @@
+name: claude
+
+# Manual @claude invocation — a thin caller of the org-wide reusable workflow
+# in nos-tromo/.github. The comment/issue triggers and the permissions block
+# must live HERE: a reusable workflow cannot declare triggers that fire in this
+# repo, and id-token: write (for the Claude GitHub App's OIDC token) is not
+# covered by the default token permissions. Manual only — there is no
+# pull_request trigger and no prompt, so Claude never runs an automatic review;
+# it acts solely on an explicit @claude mention.
+#
+# Prerequisites (org-wide, one-time): the Claude GitHub App is installed and an
+# org-level CLAUDE_CODE_OAUTH_TOKEN secret is scoped to this repo (forwarded by
+# `secrets: inherit`). See the nos-tromo/.github README, "Using the Claude
+# mention workflow".
+
+on:
+  issue_comment:
+    types: [created]
+  pull_request_review_comment:
+    types: [created]
+  issues:
+    types: [opened, assigned]
+  pull_request_review:
+    types: [submitted]
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+  id-token: write
+  actions: read
+
+jobs:
+  claude:
+    uses: nos-tromo/.github/.github/workflows/claude.yml@v2
+    secrets: inherit
