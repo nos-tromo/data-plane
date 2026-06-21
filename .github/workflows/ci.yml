@@ -16,7 +16,7 @@ concurrency:
 jobs:
   validate:
     # Pinned to v2.6 (infra checks + make/common.mk and bundle-lib drift-checks).
-    uses: nos-tromo/.github/.github/workflows/infra-validation.yml@v2.6
+    uses: nos-tromo/.github/.github/workflows/infra-validation.yml@v2.9
     with:
       compose-files: '-f docker/compose.yaml -f docker/compose.override.yaml'
       compose-profiles: '--profile cpu --profile cuda'
