@@ -3,6 +3,14 @@
 # By default operates on the *cpu* Qdrant profile. Override with
 # `make up PROFILE=cuda` for the GPU profile. Neo4j has no profile —
 # it always runs.
+#
+# This repo keeps a bespoke Makefile and does NOT `include make/common.mk` from
+# nos-tromo/.github. common.mk targets a build-and-run app shape (single compose
+# file, build/up/pre-commit, no profiles); data-plane is profile-aware (Qdrant
+# cpu/cuda), pulls rather than builds, has no Python, and adds stateful-DB
+# targets (backup/restore/nuke) common.mk does not model. It does adopt the
+# shared airgap bundle library (scripts/bundle-lib.sh, CI drift-checked) via
+# scripts/bundle_images.sh.
 
 SHELL := /usr/bin/env bash
 .DEFAULT_GOAL := help
