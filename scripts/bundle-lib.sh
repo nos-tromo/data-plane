@@ -39,17 +39,25 @@
 #       misclassified as locally-built.
 
 bundle_version() {
-  local repo="$1" repo_uc override_var override _git_sha _git_date _date ver
+  local repo="$1" repo_uc override_var override _git_tag _git_sha _git_date _date ver
   repo_uc=$(printf '%s' "$repo" | tr 'a-z-' 'A-Z_')
   override_var="${repo_uc}_VERSION_OVERRIDE"
   override="${!override_var:-}"
   if [[ -n "$override" ]]; then
     ver="$override"
   else
-    _git_sha=$(git rev-parse --short HEAD 2>/dev/null || true)
-    _git_date=$(git log -1 --format=%cs 2>/dev/null || true)
-    _date="${_git_date:-$(date +%Y-%m-%d)}"
-    ver="${_date}${_git_sha:+-${_git_sha}}"
+    # Release: HEAD sits exactly on an annotated tag -> use it verbatim.
+    # (`git describe --exact-match` without `--tags` considers ONLY annotated
+    #  tags, so a stray lightweight tag can never become a release version.)
+    _git_tag=$(git describe --exact-match HEAD 2>/dev/null || true)
+    if [[ -n "$_git_tag" ]]; then
+      ver="$_git_tag"
+    else
+      _git_sha=$(git rev-parse --short HEAD 2>/dev/null || true)
+      _git_date=$(git log -1 --format=%cs 2>/dev/null || true)
+      _date="${_git_date:-$(date +%Y-%m-%d)}"
+      ver="${_date}${_git_sha:+-${_git_sha}}"
+    fi
   fi
   export "${repo_uc}_VERSION=$ver"
   printf '%s=%s\n' "${repo_uc}_VERSION" "$ver"
