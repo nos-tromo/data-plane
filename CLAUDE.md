@@ -28,7 +28,7 @@ make logs                     # tail all
 make logs S=neo4j             # tail one service
 
 make pull                     # pull images for BOTH profiles (cpu + cuda)
-make bundle                   # versioned airgap tarball for current PROFILE
+make bundle                   # airgap tarball from the latest release tag (current PROFILE)
 
 make backup                   # neo4j (offline dump) + qdrant (online snapshot)
 make backup-neo4j             # neo4j only — briefly STOPS the service
@@ -36,6 +36,8 @@ make backup-qdrant            # qdrant only — online, no downtime
 
 make nuke                     # DESTROY all volumes (interactive: type 'nuke' to confirm)
 ```
+
+`make bundle` checks out the latest annotated release tag and bundles that (production). To bundle the current working tree instead, set `DATA_PLANE_VERSION_OVERRIDE=<version>` — this repo keeps a bespoke Makefile, so there is no separate `bundle-dev` target.
 
 ## Load-bearing invariants
 
