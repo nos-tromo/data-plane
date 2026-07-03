@@ -54,9 +54,11 @@ make ps                       # service state
 make health                   # health + uptime
 make logs S=neo4j             # tail logs for one service
 make down                     # stop, keep volumes
-make bundle                   # save images as a versioned airgap tarball
+make bundle                   # airgap tarball from the latest release tag
 make nuke                     # interactive: DESTROY all volumes
 ```
+
+`make bundle` bundles the latest annotated release tag; set `DATA_PLANE_VERSION_OVERRIDE=<version>` to bundle the current working tree instead (bespoke Makefile — no `bundle-dev` target).
 
 ## Backup / restore
 
