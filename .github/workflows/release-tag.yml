@@ -1,0 +1,16 @@
+name: release-tag
+# Mints the annotated vX.Y.Z tag on merge to main by reading the VERSION file
+# via the shared reusable workflow. Idempotent: no-op unless the version changed.
+on:
+  push:
+    branches: [main]
+permissions:
+  contents: write
+concurrency:
+  group: release-tag-${{ github.ref }}
+jobs:
+  tag:
+    uses: nos-tromo/.github/.github/workflows/release-tag.yml@v3
+    with:
+      version-file: VERSION
+      version-source: plain
