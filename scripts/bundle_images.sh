@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
-# shellcheck disable=SC1091,SC2154  # sources vendored scripts/bundle-lib.sh (sets BUNDLE_*)
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"; cd "$ROOT"
+# shellcheck disable=SC1091,SC2154  # sources vendored scripts/bundle-lib.sh (sets BUNDLE_*)
 . scripts/bundle-lib.sh
 
 PROFILE="${1:-cpu}"
