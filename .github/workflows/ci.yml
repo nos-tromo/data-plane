@@ -15,8 +15,9 @@ concurrency:
 
 jobs:
   validate:
-    # Pinned to the moving v2 alias (infra checks + make/common.mk and bundle-lib drift-checks).
-    uses: nos-tromo/.github/.github/workflows/infra-validation.yml@v3
+    # Pinned to an immutable commit SHA (v3.11): infra checks + make/common.mk
+    # and bundle-lib drift-checks.
+    uses: nos-tromo/.github/.github/workflows/infra-validation.yml@589ea4656ecba00c278ea02b4dbf754727b18062 # v3.11
     with:
       compose-files: '-f docker/compose.yaml -f docker/compose.override.yaml'
       compose-profiles: '--profile cpu --profile cuda'
