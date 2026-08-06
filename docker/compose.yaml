@@ -84,7 +84,7 @@ services:
   # Qdrant  —  vector store for docint  (CPU profile)
   ##########################################################
   qdrant-cpu:
-    image: docker.io/qdrant/qdrant:v1.17.0@sha256:f1c7272cdac52b38c1a0e89313922d940ba50afd90d593a1605dbbc214e66ffb
+    image: docker.io/qdrant/qdrant:v1.18.3@sha256:0bd98fa7977f1e75694779359ca4e212822e5a71334e28421182f72f209d5286
     logging: *default-logging
     environment:
       QDRANT__TELEMETRY_DISABLED: "true"
@@ -108,7 +108,7 @@ services:
   # Qdrant  —  vector store for docint  (CUDA profile)
   ##########################################################
   qdrant-cuda:
-    image: docker.io/qdrant/qdrant:v1.17.0-gpu-nvidia@sha256:5315819b0721f5211ccb432c6949e81c56bdcf63cab33b4dec45f42126970bde
+    image: docker.io/qdrant/qdrant:v1.18.3-gpu-nvidia@sha256:aec0e543da5076119e209336e7f41fbda0afc5222c0202ef58f4c6088a6280f3
     logging: *default-logging
     environment:
       QDRANT__TELEMETRY_DISABLED: "true"
