@@ -23,7 +23,7 @@ root (e.g. `docker/compose.yaml`).
 The **state tier** of the nos-tromo federation: a Docker Compose project that owns the named volumes holding all graph and vector data, plus the two services that read/write them.
 
 - **Neo4j** (community 5.x) — graph + native vector index for chorus
-- **Qdrant** (1.17, `cpu`/`cuda` profile variants) — vector store for docint
+- **Qdrant** (1.18, `cpu`/`cuda` profile variants) — vector store for docint
 
 No application code. No Python venv, no test suite, no linter. The whole repo is a `Makefile`, two compose files under `docker/`, an airgap bundler under `scripts/`, and a backup runbook under `backup/`. For how this tier slots into the wider workspace (inference vs state vs apps, the two external networks `inference-net` / `data-net`, bring-up order), see the parent `../CLAUDE.md`.
 
