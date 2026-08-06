@@ -149,12 +149,13 @@ backup-neo4j: | $(BACKUP_DIR)
 # this target also copies them out to $(BACKUP_DIR) for off-host pickup.
 backup-qdrant: | $(BACKUP_DIR)
 	@echo ">> triggering qdrant snapshot for every collection"
-	@$(COMPOSE) exec -T qdrant-$(PROFILE) sh -c '\
-	  for col in $$(wget -qO- http://localhost:6333/collections | \
-	    grep -oE "\"name\":\"[^\"]+\"" | cut -d\" -f4); do \
-	    echo "  snapshotting $$col"; \
-	    wget -qO- --post-data="" http://localhost:6333/collections/$$col/snapshots; \
-	  done' || echo "(if wget is absent in your qdrant image, see backup/README.md for the alternative)"
+	@if $(COMPOSE) exec -T qdrant-$(PROFILE) sh -c 'command -v bash >/dev/null 2>&1'; then \
+	  $(COMPOSE) exec -T qdrant-$(PROFILE) bash -s < scripts/qdrant_snapshot.sh; \
+	else \
+	  echo "ERROR: qdrant image has no bash — snapshot NOT taken." >&2; \
+	  echo "       See backup/README.md for the host-side alternative." >&2; \
+	  exit 1; \
+	fi
 	@echo ">> snapshots live in the qdrant-snapshots volume"
 
 restore-neo4j:

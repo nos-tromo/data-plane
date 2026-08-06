@@ -74,6 +74,10 @@ make backup-qdrant
 # Snapshots land inside the qdrant-snapshots volume, NOT on the host.
 ```
 
+The target pipes `scripts/qdrant_snapshot.sh` into the container's `bash`,
+which talks to the API over bash's built-in `/dev/tcp` — the Qdrant image
+ships no `curl`/`wget`/`python3`, and this avoids needing any of them.
+
 To get a snapshot off-host:
 
 ```bash
@@ -83,8 +87,8 @@ docker compose -f compose.yaml cp \
   ./backup/snapshots/
 ```
 
-If `wget` is absent from the running Qdrant image (some slim builds), use
-the API from the host instead while `make up-dev` is active:
+If the running Qdrant image has no `bash` at all (the target then fails
+loudly), use the API from the host instead while `make up-dev` is active:
 
 ```bash
 curl -X POST http://localhost:6333/collections/<collection>/snapshots
