@@ -81,7 +81,7 @@ App compose files (`chorus/`, `docint/`) declare zero data-plane volumes, so the
 
 - The Neo4j healthcheck uses `cypher-shell` with parameter expansion on `$NEO4J_AUTH`. The `$$` is compose escaping — keep both `$$` so the container shell does the expansion, not compose itself.
 - Qdrant's `expose:` and `volumes:` are YAML anchors (`&qdrant-ports`, `&qdrant-volumes`) shared by the `qdrant-cpu` and `qdrant-cuda` services. Edit one set; both consume it. Both write to the same `qdrant-storage` + `qdrant-snapshots` volumes, so switching `PROFILE` preserves data, but only one Qdrant runs at a time.
-- The slim Qdrant image ships no `curl`/`wget`/`bash`, which is why there is no in-container healthcheck on either Qdrant variant and `make backup-qdrant` carries a fallback message. Don't add a healthcheck that assumes a shell or HTTP client without verifying the image first.
+- The Qdrant images ship no `curl`/`wget`/`python3` (the slim cpu variant especially), which is why there is no in-container healthcheck on either Qdrant variant and `make backup-qdrant` pipes `scripts/qdrant_snapshot.sh` into the container's `bash`, talking to the API over bash's built-in `/dev/tcp`. Don't add a healthcheck that assumes an HTTP client without verifying the image first.
 - The `volumes:` block in `compose.yaml` declares its six named volumes `external`, so compose neither creates nor destroys them — `make volumes` creates them and `make nuke` deletes them by name. Those names must stay in sync with the `VOLUMES` list in the `Makefile`; adding or renaming a volume means editing both files.
 
 ## Backups: what the runbook assumes
