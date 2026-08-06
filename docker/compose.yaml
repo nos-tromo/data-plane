@@ -98,9 +98,21 @@ services:
       data-net:
         aliases:
           - qdrant
-    # Qdrant slim image ships no curl/wget/bash; the official suggestion is
-    # to skip an in-container healthcheck and let depends_on use
-    # service_started, or front it with an external probe.
+    # The image ships no curl/wget/python3, but bash with /dev/tcp is present
+    # (verified on both variants), so the probe speaks HTTP/1.0 to /readyz over
+    # bash's built-in socket redirection. $$ escapes compose interpolation.
+    # start_period is generous: a minor-version bump migrates the storage
+    # format on first boot, which can take a while on large datasets.
+    healthcheck: &qdrant-healthcheck
+      test:
+        - CMD
+        - bash
+        - -c
+        - 'exec 3<>/dev/tcp/localhost/6333; printf "GET /readyz HTTP/1.0\r\n\r\n" >&3; read -r _ code _ <&3; [ "$$code" = 200 ]'
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 120s
     restart: unless-stopped
     profiles: ["cpu"]
 
@@ -129,7 +141,8 @@ services:
             - driver: nvidia
               count: all
               capabilities: [gpu]
-    # See note on the CPU profile re: in-container healthcheck.
+    # See note on the CPU profile re: the /dev/tcp healthcheck.
+    healthcheck: *qdrant-healthcheck
     restart: unless-stopped
     profiles: ["cuda"]
 
