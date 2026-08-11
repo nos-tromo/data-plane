@@ -30,6 +30,23 @@ x-logging: &default-logging
     max-file: "5"
     compress: "true"
 
+##########################################################
+# Shared hardening (deploy ADR 0001) — no privilege
+# escalation, all capabilities dropped (Neo4j re-adds the
+# ones its entrypoint needs, below). Deliberately deferred
+# here: `user:` and `read_only:` — both databases manage
+# their own on-disk state on external volumes whose
+# existing ownership is image-managed, and this repo's CI
+# is lint-only, so a UID change would land untested. The
+# root-daemon exposure is instead compensated host-side
+# (userns-remap; runbook in the deploy repo).
+##########################################################
+x-hardened: &hardened
+  security_opt:
+    - no-new-privileges:true
+  cap_drop:
+    - ALL
+
 networks:
   data-net:
     external: true
@@ -40,8 +57,19 @@ services:
   # Neo4j  —  graph + native vector index for chorus
   ##########################################################
   neo4j:
+    <<: *hardened
     image: docker.io/library/neo4j:5.26.26-community@sha256:0b5d3ab6ec1b866890dbfb53bf4fe1cf039f9e03c96165599a403005b7e7bcc3
     logging: *default-logging
+    # The image's entrypoint chowns/chmods its dirs and drops to the
+    # internal neo4j user — exactly this set, verified empirically:
+    # the trio alone fails at chmod (FOWNER), and without DAC_OVERRIDE
+    # root can no longer traverse the dirs it just restricted.
+    cap_add:
+      - CHOWN
+      - SETUID
+      - SETGID
+      - FOWNER
+      - DAC_OVERRIDE
     environment:
       NEO4J_AUTH: ${NEO4J_USER:-neo4j}/${NEO4J_PASSWORD:?NEO4J_PASSWORD must be set in .env}
       # Airgap: no phone-home.
@@ -84,6 +112,7 @@ services:
   # Qdrant  —  vector store for docint  (CPU profile)
   ##########################################################
   qdrant-cpu:
+    <<: *hardened
     image: docker.io/qdrant/qdrant:v1.18.3@sha256:0bd98fa7977f1e75694779359ca4e212822e5a71334e28421182f72f209d5286
     logging: *default-logging
     environment:
@@ -120,6 +149,7 @@ services:
   # Qdrant  —  vector store for docint  (CUDA profile)
   ##########################################################
   qdrant-cuda:
+    <<: *hardened
     image: docker.io/qdrant/qdrant:v1.18.3-gpu-nvidia@sha256:aec0e543da5076119e209336e7f41fbda0afc5222c0202ef58f4c6088a6280f3
     logging: *default-logging
     environment:

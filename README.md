@@ -60,6 +60,17 @@ make nuke                     # interactive: DESTROY all volumes
 
 `make bundle` bundles the latest annotated release tag; set `DATA_PLANE_VERSION_OVERRIDE=<version>` to bundle the current working tree instead (bespoke Makefile — no `bundle-dev` target).
 
+## Container hardening (deploy ADR 0001)
+
+Both services run with `no-new-privileges` and `cap_drop: ALL`; Neo4j re-adds
+the five capabilities its entrypoint needs to chown/chmod its dirs and drop to
+the internal `neo4j` user (verified empirically — see the compose comment),
+Qdrant needs none. `user:` and `read_only:` are **deliberately deferred**: both
+databases manage their own on-disk state on external volumes with
+image-managed ownership, and this repo's CI is lint-only, so a UID change
+would land untested. The root-daemon exposure is compensated host-side via
+`userns-remap` (runbook in the `deploy` repo).
+
 ## Backup / restore
 
 `make backup` writes a Neo4j offline dump and triggers Qdrant snapshots.
