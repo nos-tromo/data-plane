@@ -62,14 +62,19 @@ make nuke                     # interactive: DESTROY all volumes
 
 ## Container hardening (deploy ADR 0001)
 
-Both services run with `no-new-privileges` and `cap_drop: ALL`; Neo4j re-adds
-the five capabilities its entrypoint needs to chown/chmod its dirs and drop to
-the internal `neo4j` user (verified empirically — see the compose comment),
-Qdrant needs none. `user:` and `read_only:` are **deliberately deferred**: both
-databases manage their own on-disk state on external volumes with
-image-managed ownership, and this repo's CI is lint-only, so a UID change
-would land untested. The root-daemon exposure is compensated host-side via
-`userns-remap` (runbook in the `deploy` repo).
+Both services run with `no-new-privileges` and `cap_drop: ALL`. Neo4j re-adds
+the five capabilities its entrypoint needs to chown/chmod its directories and
+drop to the internal `neo4j` user — verified empirically, see the compose
+comment; Qdrant needs none.
+
+`user:` and `read_only:` are **deliberately deferred** here: both databases
+manage their own on-disk state on external volumes with image-managed
+ownership, and this repo's CI is lint-only, so a UID change would land
+untested. The residual root-daemon exposure is compensated host-side via
+`userns-remap` — runbook in
+[`../deploy/docs/runbooks/userns-remap.md`](../deploy/docs/runbooks/userns-remap.md),
+rationale in
+[`../deploy/docs/decisions/0001-container-engine-docker.md`](../deploy/docs/decisions/0001-container-engine-docker.md).
 
 ## Backup / restore
 
@@ -95,4 +100,6 @@ data-plane/
 - chorus architecture contract: `../chorus/docs/architecture.md`
   ("Data-plane integration contract")
 - chorus invariant — vectors live in Neo4j, not Qdrant: `../chorus/docs/decisions/0003-vectors-in-neo4j.md`
-- docint Qdrant usage: `../docint/docker-compose.yml`
+- docint Qdrant usage: `../docint/docker/compose.yaml`
+- Ordered federation bring-up: [`../deploy/README.md`](../deploy/README.md)
+- Questions and bugs: <https://github.com/nos-tromo/data-plane/issues>
