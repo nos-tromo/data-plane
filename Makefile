@@ -45,7 +45,8 @@ help:
 	@echo "  make bundle          save images as a versioned airgap tarball ($(PROFILE))"
 	@echo "  make up              start neo4j + qdrant ($(PROFILE) profile)"
 	@echo "  make up-dev          like 'up', but publishes ports on the host"
-	@echo "  make down            stop the stack (volumes preserved)"
+	@echo "  make stop            stop containers (keep them)"
+	@echo "  make down            stop + remove containers (volumes preserved)"
 	@echo "  make restart         down + up"
 	@echo "  make nuke            DESTROY all data + volumes (interactive)"
 	@echo
