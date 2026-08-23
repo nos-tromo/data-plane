@@ -6,10 +6,10 @@ stateless and disposable.
 
 ## What lives here
 
-| Service  | Used by  | Network alias on `data-net` | Why                    |
-|----------|----------|-----------------------------|------------------------|
-| `neo4j`  | chorus   | `neo4j`                     | Graph + native vectors |
-| `qdrant` | docint   | `qdrant`                    | Document vector store  |
+| Compose service | Used by | Network alias on `data-net` | Why |
+|---|---|---|---|
+| `neo4j` | chorus | `neo4j` | Graph + native vectors |
+| `qdrant-cpu` / `qdrant-cuda` | docint | `qdrant` | Document vector store — one variant runs at a time, picked by `PROFILE` |
 
 Both services attach to the external `data-net` network; the app
 backends reach them by alias. `data-net` carries data-plane traffic
@@ -90,8 +90,13 @@ data-plane/
   docker/
     compose.yaml          production-shape compose (no host ports)
     compose.override.yaml dev overlay — publishes ports on the host
+  scripts/
+    bundle_images.sh      airgap bundler (sources the vendored bundle-lib.sh)
+    bundle-lib.sh         shared bundle library, vendored from nos-tromo/.github
+    qdrant_snapshot.sh    snapshot-every-collection script, run inside the container
   .env.example            copy to .env
   Makefile                operator commands
+  VERSION                 release version read by the release-tag workflow
   backup/                 runbooks + snapshot drop location
 ```
 

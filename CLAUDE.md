@@ -25,7 +25,7 @@ The **state tier** of the nos-tromo federation: a Docker Compose project that ow
 - **Neo4j** (community 5.x) — graph + native vector index for chorus
 - **Qdrant** (1.18, `cpu`/`cuda` profile variants) — vector store for docint
 
-No application code. No Python venv, no test suite, no linter. The whole repo is a `Makefile`, two compose files under `docker/`, an airgap bundler under `scripts/`, and a backup runbook under `backup/`. For how this tier slots into the wider workspace (inference vs state vs apps, the two external networks `inference-net` / `data-net`, bring-up order), see the parent `../CLAUDE.md`.
+No application code. No Python venv, no test suite, no linter. The whole repo is a `Makefile`, a `VERSION` file, two compose files under `docker/`, three shell scripts under `scripts/` (the airgap bundler, its vendored `bundle-lib.sh`, and `qdrant_snapshot.sh`), a backup runbook under `backup/`, and CI under `.github/`. For how this tier slots into the wider workspace (inference vs state vs apps, the three external network seams `inference-net` / `data-net` / `edge-net`, bring-up order), see the parent `../CLAUDE.md`.
 
 ## Common commands
 
@@ -75,7 +75,7 @@ App compose files (`chorus/`, `docint/`) declare zero data-plane volumes, so the
 
 ### 4. `data-net` is external and shared across compose projects
 
-`data-net` is declared `external: true` (`name: ${DATA_NET:-data-net}`). `make network` creates it once per host; the app backends attach to the same network when they come up. The aliases `neo4j` and `qdrant` are how apps find these services across compose projects. `inference-net` is the other seam (apps ↔ vllm-service) and is **not** touched here.
+`data-net` is declared `external: true` (`name: ${DATA_NET:-data-net}`). `make network` creates it once per host; the app backends attach to the same network when they come up. The aliases `neo4j` and `qdrant` are how apps find these services across compose projects. It is the only network this project joins: the federation's other two seams — `inference-net` (apps ↔ vllm-service) and `edge-net` (gateway ↔ app frontends) — are **not** touched here.
 
 ## When editing the compose files
 
