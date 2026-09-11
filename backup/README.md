@@ -55,7 +55,9 @@ docker compose --env-file .env -f docker/compose.yaml run --rm \
 docker compose --env-file .env -f docker/compose.yaml start neo4j
 ```
 
-Validate after restore: open the Neo4j Browser (dev: http://localhost:7474),
+Validate after restore: open the Neo4j Browser at http://localhost:7474
+(dev: `make up-dev`; production: `make up-admin` + SSH tunnel, see README
+§ Admin access),
 run `MATCH (n) RETURN count(n)`, and spot-check entity counts against the
 record kept at backup time.
 
