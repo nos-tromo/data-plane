@@ -1,0 +1,27 @@
+### Admin overlay — loopback-only ports for dashboard access over an SSH tunnel.
+###
+### NOT auto-loaded: it lives in docker/ and is layered only by `make up-admin`
+### via explicit -f flags. Every binding is 127.0.0.1, so nothing becomes
+### reachable from the network — the production boundary (no published ports)
+### holds; the host itself is the only new client. Admins reach the dashboards
+### through an SSH tunnel:
+###
+###   ssh -L 7474:localhost:7474 -L 7687:localhost:7687 -L 6333:localhost:6333 <host>
+###
+### then open http://localhost:7474 (Neo4j Browser, needs bolt on 7687 too) and
+### http://localhost:6333/dashboard (Qdrant). `make up` drops the ports again.
+### Qdrant gRPC (6334) is deliberately omitted — the dashboard does not use it.
+
+services:
+  neo4j:
+    ports:
+      - "127.0.0.1:7687:7687"
+      - "127.0.0.1:7474:7474"
+
+  qdrant-cpu:
+    ports:
+      - "127.0.0.1:6333:6333"
+
+  qdrant-cuda:
+    ports:
+      - "127.0.0.1:6333:6333"

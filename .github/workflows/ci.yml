@@ -19,7 +19,7 @@ jobs:
     # and bundle-lib drift-checks.
     uses: nos-tromo/.github/.github/workflows/infra-validation.yml@0b022a325f9fc87b6bb3b56eb9b34769d730962f # v3.16
     with:
-      compose-files: '-f docker/compose.yaml -f docker/compose.override.yaml'
+      compose-files: '-f docker/compose.yaml -f docker/compose.override.yaml -f docker/compose.admin.yaml'
       compose-profiles: '--profile cpu --profile cuda'
       dockerfiles-glob: 'docker/Dockerfile.*'
       shell-scripts-glob: 'scripts/*.sh'

@@ -40,6 +40,7 @@ make network                  # create external data-net (idempotent; required o
 make volumes                  # create external data volumes (idempotent; required once per host)
 make up                       # production shape — services on data-net only, NO host ports
 make up-dev                   # layers docker/compose.override.yaml — publishes 7474/7687/6333/6334
+make up-admin                 # layers docker/compose.admin.yaml — binds 7474/7687/6333 to 127.0.0.1 only (SSH tunnel)
 make down                     # stop; volumes preserved
 make restart                  # down + up
 
@@ -70,6 +71,8 @@ App compose files (`chorus/`, `docint/`) declare zero data-plane volumes, so the
 `docker/compose.yaml` is production-shape: services `expose:` internally and join `data-net` by alias (`neo4j`, `qdrant`) but publish nothing to the host. Apps reach them at `bolt://neo4j:7687` and `http://qdrant:6333` purely over the network seam.
 
 `docker/compose.override.yaml` is the dev overlay that publishes 7474/7687/6333/6334. **It is not auto-loaded** — it lives under `docker/` (not at the project root, where compose would pick it up implicitly), and the Makefile passes explicit `-f` flags. Only `make up-dev` layers it. The placement is intentional: in airgap production the host must not expose data-plane ports, and an override file at the default location would breach that boundary on a plain `compose up`.
+
+`docker/compose.admin.yaml` is the only other port-publishing file. It binds 7474/7687/6333 to `127.0.0.1` only, is likewise not auto-loaded (`make up-admin`), and exists because edge-plane deliberately does not route the Neo4j Browser or Qdrant dashboard — admins reach them over an SSH tunnel to those loopback ports (README § Admin access).
 
 ### 3. Airgap-first; no runtime fetches
 

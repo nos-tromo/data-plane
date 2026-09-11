@@ -38,6 +38,7 @@ make volumes                  # create the external data volumes (idempotent)
 make up                       # start with the CPU Qdrant profile (default)
 make up PROFILE=cuda          # GPU profile
 make up-dev                   # publish ports on the host (Neo4j Browser, Qdrant UI)
+make up-admin                 # production + loopback-only dashboard ports (see Admin access)
 ```
 
 `make network` creates the external `data-net` if it does not exist; the
@@ -46,6 +47,24 @@ pre-creates the named data volumes — they are declared `external`, so
 compose will not create them itself. Both targets are idempotent and run
 automatically as prerequisites of `make up`, so a fresh host can also just
 run `make up`.
+
+## Admin access (production)
+
+Production shape publishes no ports, and the edge-plane gateway deliberately
+does not route Neo4j Browser or the Qdrant dashboard (see
+[`../edge-plane/README.md`](../edge-plane/README.md), "What is deliberately
+NOT routed") — the SSH tunnel is their access model. `make up-admin` gives
+that tunnel a target: it layers `docker/compose.admin.yaml`, which binds
+7474/7687 (Neo4j http + bolt) and 6333 (Qdrant http) to `127.0.0.1` only.
+Nothing becomes reachable from the network.
+
+```bash
+make up-admin                 # on the host
+ssh -L 7474:localhost:7474 -L 7687:localhost:7687 -L 6333:localhost:6333 <host>   # from your machine
+# Neo4j Browser:    http://localhost:7474   (connects to bolt://localhost:7687)
+# Qdrant dashboard: http://localhost:6333/dashboard
+make up                       # drop the loopback ports again (brief container restart)
+```
 
 ## Operating
 
@@ -90,6 +109,7 @@ data-plane/
   docker/
     compose.yaml          production-shape compose (no host ports)
     compose.override.yaml dev overlay — publishes ports on the host
+    compose.admin.yaml    admin overlay — loopback-only ports for SSH-tunnelled dashboards
   scripts/
     bundle_images.sh      airgap bundler (sources the vendored bundle-lib.sh)
     bundle-lib.sh         shared bundle library, vendored from nos-tromo/.github
