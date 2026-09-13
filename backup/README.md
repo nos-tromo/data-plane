@@ -100,6 +100,12 @@ loudly), use the API from the host instead while `make up-dev` is active:
 curl -X POST http://localhost:6333/collections/<collection>/snapshots
 ```
 
+With `QDRANT__SERVICE__API_KEY` set in `.env`, `make backup-qdrant` keeps
+working unchanged — the script runs inside the container and reads the
+server's own key from its environment. Every host-side call above needs the
+header added instead, `-H 'api-key: <value>'`, including the `curl` fallback
+and anything you run over the admin SSH tunnel.
+
 ### Restore
 
 ```bash
