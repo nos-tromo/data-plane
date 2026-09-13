@@ -28,11 +28,12 @@ VOLUMES := neo4j-data neo4j-logs neo4j-import neo4j-plugins qdrant-snapshots qdr
 
 COMPOSE        := docker compose --env-file .env -f docker/compose.yaml
 COMPOSE_DEV    := docker compose --env-file .env -f docker/compose.yaml -f docker/compose.override.yaml
+COMPOSE_ADMIN  := docker compose --env-file .env -f docker/compose.yaml -f docker/compose.admin.yaml
 PROFILE_FLAG   := --profile $(PROFILE)
 TS             := $(shell date -u +%Y%m%dT%H%M%SZ)
 BACKUP_DIR     ?= ./backup/snapshots
 
-.PHONY: help network volumes pull bundle up up-dev stop down restart logs ps \
+.PHONY: help network volumes pull bundle up up-dev up-admin stop down restart logs ps \
         health nuke backup backup-neo4j backup-qdrant restore-neo4j
 
 help:
@@ -45,6 +46,7 @@ help:
 	@echo "  make bundle          save images as a versioned airgap tarball ($(PROFILE))"
 	@echo "  make up              start neo4j + qdrant ($(PROFILE) profile)"
 	@echo "  make up-dev          like 'up', but publishes ports on the host"
+	@echo "  make up-admin        like 'up', but binds 7474/7687/6333 to 127.0.0.1 for SSH-tunnelled admin access"
 	@echo "  make stop            stop containers (keep them)"
 	@echo "  make down            stop + remove containers (volumes preserved)"
 	@echo "  make restart         down + up"
@@ -87,6 +89,12 @@ up: network volumes
 
 up-dev: network volumes
 	$(COMPOSE_DEV) $(PROFILE_FLAG) up --no-build -d
+
+# Loopback-only dashboard ports for SSH-tunnelled admin access (see
+# docker/compose.admin.yaml). A later plain `make up` recreates the
+# containers without the ports — brief restart, volumes untouched.
+up-admin: network volumes
+	$(COMPOSE_ADMIN) $(PROFILE_FLAG) up --no-build -d
 
 stop:
 	$(COMPOSE) $(PROFILE_FLAG) stop
