@@ -12,12 +12,22 @@ set -euo pipefail
 
 QDRANT_PORT="${QDRANT_PORT:-6333}"
 
+# The script runs inside the container, so the server's own key is right here
+# in the environment; send it back as the api-key header so snapshots keep
+# working when authentication is enabled. Absent/empty = no header.
+# Built with ANSI-C quoting, not $(printf ...) — command substitution strips
+# the trailing newline and would leave a bare CR, which Qdrant rejects (400).
+API_KEY_HEADER=""
+if [[ -n "${QDRANT_API_KEY:-}" ]]; then
+  API_KEY_HEADER="api-key: ${QDRANT_API_KEY}"$'\r\n'
+fi
+
 # http METHOD PATH -> prints "STATUS<newline>BODY", using fd 3 for the socket.
 http() {
   local method=$1 path=$2 response
   exec 3<>"/dev/tcp/localhost/${QDRANT_PORT}"
-  printf '%s %s HTTP/1.0\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n' \
-    "$method" "$path" >&3
+  printf '%s %s HTTP/1.0\r\nHost: localhost\r\n%sContent-Length: 0\r\n\r\n' \
+    "$method" "$path" "$API_KEY_HEADER" >&3
   response=$(cat <&3)
   exec 3>&- 3<&-
   awk 'NR==1 {print $2}' <<<"$response"

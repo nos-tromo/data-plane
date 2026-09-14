@@ -115,7 +115,8 @@ services:
     <<: *hardened
     image: docker.io/qdrant/qdrant:v1.18.3@sha256:0bd98fa7977f1e75694779359ca4e212822e5a71334e28421182f72f209d5286
     logging: *default-logging
-    environment:
+    environment: &qdrant-env
+      QDRANT__SERVICE__API_KEY: ${QDRANT_API_KEY:-}
       QDRANT__TELEMETRY_DISABLED: "true"
     expose: &qdrant-ports
       - "6333"   # http
@@ -153,7 +154,7 @@ services:
     image: docker.io/qdrant/qdrant:v1.18.3-gpu-nvidia@sha256:aec0e543da5076119e209336e7f41fbda0afc5222c0202ef58f4c6088a6280f3
     logging: *default-logging
     environment:
-      QDRANT__TELEMETRY_DISABLED: "true"
+      <<: *qdrant-env
       QDRANT__GPU__INDEXING: "1"
       NVIDIA_DRIVER_CAPABILITIES: compute,utility,graphics
       NVIDIA_VISIBLE_DEVICES: all
