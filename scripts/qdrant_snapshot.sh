@@ -18,8 +18,8 @@ QDRANT_PORT="${QDRANT_PORT:-6333}"
 # Built with ANSI-C quoting, not $(printf ...) — command substitution strips
 # the trailing newline and would leave a bare CR, which Qdrant rejects (400).
 API_KEY_HEADER=""
-if [[ -n "${QDRANT__SERVICE__API_KEY:-}" ]]; then
-  API_KEY_HEADER="api-key: ${QDRANT__SERVICE__API_KEY}"$'\r\n'
+if [[ -n "${QDRANT_API_KEY:-}" ]]; then
+  API_KEY_HEADER="api-key: ${QDRANT_API_KEY}"$'\r\n'
 fi
 
 # http METHOD PATH -> prints "STATUS<newline>BODY", using fd 3 for the socket.

@@ -67,7 +67,7 @@ make up                       # drop the loopback ports again (brief container r
 ```
 
 Neo4j Browser always asks for the `NEO4J_USER` / `NEO4J_PASSWORD` login. The
-Qdrant dashboard has no login unless `QDRANT__SERVICE__API_KEY` is set in
+Qdrant dashboard has no login unless `QDRANT_API_KEY` is set in
 `.env`: uncomment it there (see `.env.example` — an *empty* value is not "no
 auth", it makes Qdrant 401 everything) and the dashboard prompts for the key,
 while every API call needs an `api-key` header — docint's, the backup

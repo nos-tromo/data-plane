@@ -116,16 +116,8 @@ services:
     image: docker.io/qdrant/qdrant:v1.18.3@sha256:0bd98fa7977f1e75694779359ca4e212822e5a71334e28421182f72f209d5286
     logging: *default-logging
     environment: &qdrant-env
+      QDRANT__SERVICE__API_KEY: ${QDRANT_API_KEY:-}
       QDRANT__TELEMETRY_DISABLED: "true"
-      # Optional API key, passed through from the environment (.env) ONLY when
-      # it is set there. Keep the valueless form: an EMPTY value is not "no
-      # auth" — Qdrant then rejects every request with 401 (verified against
-      # v1.18.3), so `${VAR:-}` interpolation would break an unauthenticated
-      # deployment. Absent = no auth. When set, every REST/gRPC call needs the
-      # `api-key` header; /readyz, /healthz and /livez stay open, so the
-      # healthcheck below never needs it. docint must carry the same value as
-      # its own QDRANT_API_KEY.
-      QDRANT__SERVICE__API_KEY:
     expose: &qdrant-ports
       - "6333"   # http
       - "6334"   # grpc
