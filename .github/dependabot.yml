@@ -1,4 +1,8 @@
 version: 2
+# Every update waits 7 days after its upstream release before Dependabot
+# proposes it, so a compromised or broken release is usually caught upstream
+# first. Security updates are exempt and still open immediately. Our own
+# nos-tromo/* workflows skip the wait, so a hub release is not held back.
 updates:
   # No `docker` ecosystem block — data-plane is pull-only (Neo4j + Qdrant
   # images referenced by compose). It has no Dockerfiles for dependabot
@@ -7,3 +11,7 @@ updates:
     directory: "/"
     schedule:
       interval: weekly
+    cooldown:
+      default-days: 7
+      exclude:
+        - "nos-tromo/*"
