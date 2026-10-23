@@ -10,7 +10,7 @@ concurrency:
   group: release-tag-${{ github.ref }}
 jobs:
   tag:
-    uses: nos-tromo/.github/.github/workflows/release-tag.yml@03c421deb194921d28554cc0d4676290e95490ee # v3.18
+    uses: nos-tromo/.github/.github/workflows/release-tag.yml@44032ac756bd7700ba19fc65e141a5c2f8992416 # v3.20
     with:
       version-file: VERSION
       version-source: plain

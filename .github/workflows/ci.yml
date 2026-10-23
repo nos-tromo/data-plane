@@ -17,7 +17,7 @@ jobs:
   validate:
     # Pinned to an immutable commit SHA (v3.12): infra checks + make/common.mk
     # and bundle-lib drift-checks.
-    uses: nos-tromo/.github/.github/workflows/infra-validation.yml@03c421deb194921d28554cc0d4676290e95490ee # v3.18
+    uses: nos-tromo/.github/.github/workflows/infra-validation.yml@44032ac756bd7700ba19fc65e141a5c2f8992416 # v3.20
     with:
       compose-files: '-f docker/compose.yaml -f docker/compose.override.yaml -f docker/compose.admin.yaml'
       compose-profiles: '--profile cpu --profile cuda'
