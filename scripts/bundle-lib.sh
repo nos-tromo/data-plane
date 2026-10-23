@@ -1,5 +1,5 @@
 # shellcheck shell=bash
-# shellcheck disable=SC2034  # BUNDLE_VERSION/BUNDLE_BUILT/BUNDLE_PULLED/_BUNDLE_ORIG_REF are set for the sourcing bundle_images.sh (the last is read by the EXIT trap)
+# shellcheck disable=SC2034  # BUNDLE_VERSION/BUNDLE_BUILT/BUNDLE_PULLED/_BUNDLE_ORIG_* are set for the sourcing bundle_images.sh (the last two are read by the EXIT trap)
 # bundle-lib.sh - shared helpers for nos-tromo airgap bundle scripts.
 #
 # Canonical source: nos-tromo/.github/configs/bundle/bundle-lib.sh
@@ -67,8 +67,11 @@ bundle_version() {
 
 # bundle_checkout_release <repo-slug>
 #     PRODUCTION bundle only (`make bundle`). Resolve the latest ANNOTATED tag
-#     reachable from HEAD, check it out (detached) so the compose build below is
-#     the tagged tree, and register an EXIT trap restoring the original branch.
+#     reachable from HEAD and switch to it (detached) so the compose build below
+#     is the tagged tree. On success HEAD STAYS on the tag, so the working tree
+#     matches the bundled images until the operator switches back; on failure an
+#     EXIT trap switches back to the original branch (or detached commit). When
+#     HEAD already is the tag's commit, nothing is switched at all.
 #     Refuses (nonzero) rather than ever bundling an unversioned artifact:
 #       - dirty *tracked* working tree (a checkout would clobber it), or
 #       - no annotated tag reachable from HEAD.
@@ -109,15 +112,48 @@ bundle_checkout_release() {
     return 1
   fi
 
-  # Where to return: branch name if on one, else the detached SHA.
-  orig_ref=$(git symbolic-ref --quiet --short HEAD 2>/dev/null || git rev-parse HEAD)
-  # Restore on ANY exit of the sourcing script (build success or failure).
-  # Deferred expansion of the global avoids re-quoting the ref into the trap.
-  _BUNDLE_ORIG_REF="$orig_ref"
-  trap 'git checkout --quiet "$_BUNDLE_ORIG_REF"' EXIT
+  # Already at the tag's commit (the usual case right after a release): the
+  # clean tree IS the tagged tree, so build in place and keep the branch.
+  if [[ "$(git rev-parse HEAD)" == "$(git rev-parse "${tag}^{commit}")" ]]; then
+    printf 'bundle: building release tag %s (already checked out)\n' "$tag"
+    return 0
+  fi
 
-  printf 'bundle: building release tag %s (restoring %s afterwards)\n' "$tag" "$orig_ref"
-  git checkout --quiet "$tag"
+  # Where to return on failure: the branch if on one, else the detached SHA.
+  # `git switch` needs --detach for a SHA (and must NOT get it for a branch),
+  # so remember which one it was.
+  if orig_ref=$(git symbolic-ref --quiet --short HEAD 2>/dev/null); then
+    _BUNDLE_ORIG_DETACHED=0
+  else
+    orig_ref=$(git rev-parse HEAD)
+    _BUNDLE_ORIG_DETACHED=1
+  fi
+  # The trap fires on ANY exit of the sourcing script; the handler reads the
+  # exit status to decide. Deferred expansion of the globals avoids re-quoting
+  # the ref into the trap body.
+  _BUNDLE_ORIG_REF="$orig_ref"
+  trap '_bundle_checkout_exit $?' EXIT
+
+  printf 'bundle: building release tag %s (switching back to %s only on failure)\n' "$tag" "$orig_ref"
+  git switch --quiet --detach "$tag"
+}
+
+# EXIT handler registered by bundle_checkout_release. Failure: switch back to
+# where the operator was. Success: stay on the tag and say how to get back.
+_bundle_checkout_exit() {
+  local status="$1" detach_flag=""
+  [[ "$_BUNDLE_ORIG_DETACHED" == 1 ]] && detach_flag="--detach "
+  if [[ "$status" -ne 0 ]]; then
+    if [[ -n "$detach_flag" ]]; then
+      git switch --quiet --detach "$_BUNDLE_ORIG_REF"
+    else
+      git switch --quiet "$_BUNDLE_ORIG_REF"
+    fi
+  else
+    printf "bundle: HEAD left detached at %s; 'git switch %s%s' returns to where you were.\n" \
+      "$(git describe --exact-match HEAD 2>/dev/null || git rev-parse --short HEAD)" \
+      "$detach_flag" "$_BUNDLE_ORIG_REF"
+  fi
 }
 
 bundle_retag() {
