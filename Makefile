@@ -30,11 +30,19 @@ COMPOSE        := docker compose --env-file .env -f docker/compose.yaml
 COMPOSE_DEV    := docker compose --env-file .env -f docker/compose.yaml -f docker/compose.override.yaml
 COMPOSE_ADMIN  := docker compose --env-file .env -f docker/compose.yaml -f docker/compose.admin.yaml
 PROFILE_FLAG   := --profile $(PROFILE)
-TS             := $(shell date -u +%Y%m%dT%H%M%SZ)
 BACKUP_DIR     ?= ./backup/snapshots
 
+# Direct database access, backups and restores are recorded in the
+# data-protection audit trail by the admin-audit service (README: Audit
+# trail): scripts/audit-admin.sh refuses to start one while admin-audit cannot
+# record it. CASE_REF=<ref> and/or REASON=<text> state the purpose (make hands
+# command-line variables to the recipe's environment); the operator is the
+# sudo user, else the login user, e.g.
+#   make db-shell CASE_REF=case-0001 REASON="verify a reported duplicate"
+AUDITED = COMPOSE='$(COMPOSE)' PROFILE='$(PROFILE)' BACKUP_DIR='$(BACKUP_DIR)' ./scripts/audit-admin.sh
+
 .PHONY: help network volumes pull bundle up up-dev up-admin stop down restart logs ps \
-        health nuke backup backup-neo4j backup-qdrant restore-neo4j
+        health nuke db-shell qdrant-shell backup backup-neo4j backup-qdrant restore-neo4j restore-qdrant
 
 help:
 	@echo "data-plane — stateful services for chorus (Neo4j) + docint (Qdrant)."
@@ -44,7 +52,7 @@ help:
 	@echo "  make volumes         create the external data volumes if missing"
 	@echo "  make pull            pull all images from the registry"
 	@echo "  make bundle          save images as a versioned airgap tarball ($(PROFILE))"
-	@echo "  make up              start neo4j + qdrant ($(PROFILE) profile)"
+	@echo "  make up              start neo4j + qdrant ($(PROFILE) profile) + admin-audit"
 	@echo "  make up-dev          like 'up', but publishes ports on the host"
 	@echo "  make up-admin        like 'up', but binds 7474/7687/6333 to 127.0.0.1 for SSH-tunnelled admin access"
 	@echo "  make stop            stop containers (keep them)"
@@ -54,13 +62,19 @@ help:
 	@echo
 	@echo "Observability:"
 	@echo "  make ps              service status"
-	@echo "  make health          show health + uptime of each service"
+	@echo "  make health          show health + uptime of each service; admin-audit can record"
 	@echo "  make logs S=neo4j  tail logs for one service"
 	@echo
-	@echo "Backup / restore (see backup/README.md for the full runbook):"
-	@echo "  make backup          backup both DBs into $(BACKUP_DIR)"
-	@echo "  make backup-neo4j    just Neo4j (offline dump)"
-	@echo "  make backup-qdrant   just Qdrant (snapshot API)"
+	@echo "Direct access (recorded in the audit trail; always needs CASE_REF= or REASON=):"
+	@echo "  make db-shell        cypher-shell session on Neo4j"
+	@echo "  make qdrant-shell    shell with Qdrant's HTTP API (qdrant METHOD /path [JSON])"
+	@echo
+	@echo "Backup / restore (recorded; see backup/README.md for the full runbook):"
+	@echo "  make backup          backup both DBs (needs CASE_REF= or REASON= by default)"
+	@echo "  make backup-neo4j    just Neo4j (offline dump into $(BACKUP_DIR))"
+	@echo "  make backup-qdrant   just Qdrant (snapshots into the qdrant-snapshots volume)"
+	@echo "  make restore-neo4j DUMP=<file>                        REPLACE the neo4j database with a dump (asks first)"
+	@echo "  make restore-qdrant COLLECTION=<name> SNAPSHOT=<file> REPLACE one collection with a snapshot (asks first)"
 	@echo
 	@echo "Profile: $(PROFILE)  (override with PROFILE=cuda)"
 
@@ -123,6 +137,8 @@ ps:
 
 health:
 	@$(COMPOSE) $(PROFILE_FLAG) ps --format '{{.Name}}\t{{.State}}\t{{.Status}}'
+	@echo
+	@$(COMPOSE) exec -T admin-audit python /app/admin_audit.py check && echo "admin-audit: can record"
 
 logs:
 ifndef S
@@ -131,42 +147,55 @@ else
 	$(COMPOSE) $(PROFILE_FLAG) logs --tail=200 -f $(S)
 endif
 
+# ---- Direct access ---------------------------------------------------------
+# Neo4j Community keeps no query log and Qdrant no access log, so these
+# records are the only trail of a session: who opened it, when, why, how long
+# it lasted. Both need a stated purpose, whatever AUDIT_REQUIRE_PURPOSE says.
+
+db-shell:
+	@$(AUDITED) shell neo4j -- ./scripts/neo4j_admin.sh shell
+
+qdrant-shell:
+	@$(AUDITED) shell qdrant -- ./scripts/qdrant_admin.sh shell
+
 # ---- Backups ---------------------------------------------------------------
 # These are intentionally minimal — see backup/README.md for retention,
-# off-host copy, and verify-restore steps.
-
-$(BACKUP_DIR):
-	@mkdir -p $(BACKUP_DIR)
+# off-host copy, and verify-restore steps. Each is recorded as a disclosure
+# to file:backup once it has run; under the default AUDIT_REQUIRE_PURPOSE
+# (query,disclose) it needs CASE_REF= or REASON= — a scheduled backup passes
+# one, e.g. REASON="nightly backup".
 
 backup: backup-neo4j backup-qdrant
 
-# Neo4j community edition has no online backup. We stop, dump, restart.
-# Confirm the brief downtime window is acceptable before scheduling.
-backup-neo4j: | $(BACKUP_DIR)
-	@echo ">> stopping neo4j for offline dump"
-	$(COMPOSE) stop neo4j
-	$(COMPOSE) run --rm \
-	  -v $(abspath $(BACKUP_DIR)):/backup \
-	  --entrypoint /bin/bash neo4j -c \
-	  "neo4j-admin database dump neo4j --to-path=/backup --overwrite-destination=true && \
-	   mv /backup/neo4j.dump /backup/neo4j-$(TS).dump"
-	$(COMPOSE) start neo4j
-	@echo ">> wrote $(BACKUP_DIR)/neo4j-$(TS).dump"
+# Neo4j community edition has no online backup. We stop, dump, restart (the
+# restart also runs when the dump fails). Confirm the brief downtime window
+# is acceptable before scheduling.
+backup-neo4j:
+	@$(AUDITED) backup neo4j -- ./scripts/neo4j_admin.sh dump
 
 # Qdrant supports online snapshots via its HTTP API. Iterates every
-# collection. Snapshots land in the qdrant-snapshots volume —
-# this target also copies them out to $(BACKUP_DIR) for off-host pickup.
-backup-qdrant: | $(BACKUP_DIR)
-	@echo ">> triggering qdrant snapshot for every collection"
-	@if $(COMPOSE) exec -T qdrant-$(PROFILE) sh -c 'command -v bash >/dev/null 2>&1'; then \
-	  $(COMPOSE) exec -T qdrant-$(PROFILE) bash -s < scripts/qdrant_snapshot.sh; \
-	else \
-	  echo "ERROR: qdrant image has no bash — snapshot NOT taken." >&2; \
-	  echo "       See backup/README.md for the host-side alternative." >&2; \
-	  exit 1; \
-	fi
-	@echo ">> snapshots live in the qdrant-snapshots volume"
+# collection. Snapshots land in the qdrant-snapshots volume; copying them
+# off-host is a separate step (backup/README.md).
+backup-qdrant:
+	@$(AUDITED) backup qdrant -- ./scripts/qdrant_admin.sh snapshot
+
+# ---- Restores --------------------------------------------------------------
+# Each REPLACES live data, so it asks for confirmation, then is recorded as a
+# modification once it has run (needs a purpose only if AUDIT_REQUIRE_PURPOSE
+# lists modify).
 
 restore-neo4j:
-	@echo "See backup/README.md → Restore (Neo4j) for the procedure."
-	@echo "Restores require stopping the service and operate on a dump file."
+	@test -n "$(DUMP)" || { echo "usage: make restore-neo4j DUMP=<dump file in $(BACKUP_DIR)> [CASE_REF=...] [REASON=...]" >&2; exit 2; }
+	@test -f "$(BACKUP_DIR)/$(DUMP)" || { echo "no dump $(DUMP) in $(BACKUP_DIR)" >&2; exit 2; }
+	@echo "This REPLACES the neo4j database with $(DUMP); Neo4j stops while it loads."
+	@read -p "Type 'restore' to confirm: " confirm && [ "$$confirm" = "restore" ] \
+	  || { echo "aborted"; exit 1; }
+	@$(AUDITED) restore neo4j 'file=$(DUMP)' -- ./scripts/neo4j_admin.sh load '$(DUMP)'
+
+restore-qdrant:
+	@test -n "$(COLLECTION)" && test -n "$(SNAPSHOT)" || { echo "usage: make restore-qdrant COLLECTION=<name> SNAPSHOT=<snapshot file> [CASE_REF=...] [REASON=...]" >&2; exit 2; }
+	@echo "This REPLACES the Qdrant collection $(COLLECTION) with the snapshot $(SNAPSHOT)."
+	@read -p "Type 'restore' to confirm: " confirm && [ "$$confirm" = "restore" ] \
+	  || { echo "aborted"; exit 1; }
+	@$(AUDITED) restore qdrant 'collection=$(COLLECTION)' 'snapshot=$(SNAPSHOT)' -- \
+	  ./scripts/qdrant_admin.sh recover '$(COLLECTION)' '$(SNAPSHOT)'
