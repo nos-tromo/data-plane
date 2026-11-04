@@ -13,13 +13,14 @@ set -euo pipefail
 QDRANT_PORT="${QDRANT_PORT:-6333}"
 
 # The script runs inside the container, so the server's own key is right here
-# in the environment; send it back as the api-key header so snapshots keep
-# working when authentication is enabled. Absent/empty = no header.
+# in the environment, under the name Qdrant reads (compose maps .env's
+# QDRANT_API_KEY onto it); send it back as the api-key header so snapshots
+# keep working when authentication is enabled. Absent/empty = no header.
 # Built with ANSI-C quoting, not $(printf ...) — command substitution strips
 # the trailing newline and would leave a bare CR, which Qdrant rejects (400).
 API_KEY_HEADER=""
-if [[ -n "${QDRANT_API_KEY:-}" ]]; then
-  API_KEY_HEADER="api-key: ${QDRANT_API_KEY}"$'\r\n'
+if [[ -n "${QDRANT__SERVICE__API_KEY:-}" ]]; then
+  API_KEY_HEADER="api-key: ${QDRANT__SERVICE__API_KEY}"$'\r\n'
 fi
 
 # http METHOD PATH -> prints "STATUS<newline>BODY", using fd 3 for the socket.
