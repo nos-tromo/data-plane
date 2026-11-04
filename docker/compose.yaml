@@ -63,13 +63,23 @@ services:
     # The image's entrypoint chowns/chmods its dirs and drops to the
     # internal neo4j user — exactly this set, verified empirically:
     # the trio alone fails at chmod (FOWNER), and without DAC_OVERRIDE
-    # root can no longer traverse the dirs it just restricted.
+    # root can no longer traverse the dirs it just restricted. KILL lets
+    # tini (PID 1, root) forward `docker stop`'s SIGTERM to the server,
+    # which runs as the neo4j user: without it tini dies with EPERM, the
+    # server is killed mid-flight, and the offline dump of make
+    # backup-neo4j refuses the unclean store ("Active logical log").
     cap_add:
       - CHOWN
       - SETUID
       - SETGID
       - FOWNER
       - DAC_OVERRIDE
+      - KILL
+    # The server then needs about 10 s to stop even on a small store: the
+    # databases checkpoint within a second, the Bolt server takes the rest.
+    # Docker's default 10 s grace SIGKILLed it just before the end (exit
+    # 137); the checkpoint grows with the store, so it gets room.
+    stop_grace_period: 2m
     environment:
       NEO4J_AUTH: ${NEO4J_USER:-neo4j}/${NEO4J_PASSWORD:?NEO4J_PASSWORD must be set in .env}
       # Airgap: no phone-home.

@@ -92,8 +92,9 @@ make nuke                     # interactive: DESTROY all volumes
 
 Both services run with `no-new-privileges` and `cap_drop: ALL`. Neo4j re-adds
 the five capabilities its entrypoint needs to chown/chmod its directories and
-drop to the internal `neo4j` user — verified empirically, see the compose
-comment; Qdrant needs none.
+drop to the internal `neo4j` user, plus `KILL`, without which its init cannot
+pass `docker stop`'s SIGTERM on to the server — verified empirically, see the
+compose comment; Qdrant needs none.
 
 `user:` and `read_only:` are **deliberately deferred** here: both databases
 manage their own on-disk state on external volumes with image-managed
