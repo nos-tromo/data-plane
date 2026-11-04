@@ -8,6 +8,7 @@ either is missing, e.g. in the pinned python image, which mounts only ``audit/``
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import http.server
 import io
 import json
@@ -41,6 +42,10 @@ PURPOSE = {"case_ref": "case-0001", "reason": "verify a reported duplicate"}
 DUMP = "neo4j-20260131T020000Z.dump"
 LOOPBACK = ["127.0.0.1:7474", "127.0.0.1:7687", "127.0.0.1:6333"]
 BOTH_STORES = {"kind": "store", "ids": ["neo4j", "qdrant"], "count": 2}
+FINGERPRINT = hashlib.sha256(b"age1synthetic0recipient\n").hexdigest()
+# What a backup reports about its encryption, and how its record shows it.
+ENCRYPTED = ("encryption=age", "recipients=2", f"recipients_sha256={FINGERPRINT}")
+ENCRYPTED_CRITERIA = {"encryption": "age", "recipients": 2, "recipients_sha256": FINGERPRINT}
 
 
 def lines(stream: io.StringIO) -> list[dict[str, Any]]:
@@ -182,6 +187,28 @@ class HelperTest(unittest.TestCase):
         for bad in ("", "-1", "1.5", "1e3", " 1", chr(0x0661), "1" * 19):
             with self.assertRaises(ValueError, msg=bad):
                 admin_audit.whole_number(bad)
+
+    def test_positive_number(self) -> None:
+        """A backup has at least one recipient: zero is refused like a non-number."""
+        self.assertEqual(admin_audit.positive_number("1"), 1)
+        self.assertEqual(admin_audit.positive_number("12"), 12)
+        for bad in ("0", "", "-2", "two"):
+            with self.assertRaises(ValueError, msg=bad):
+                admin_audit.positive_number(bad)
+
+    def test_sha256_hex(self) -> None:
+        """A fingerprint is 64 lowercase hex digits, nothing else."""
+        self.assertEqual(admin_audit.sha256_hex(FINGERPRINT), FINGERPRINT)
+        for bad in ("", FINGERPRINT[:-1], FINGERPRINT.upper(), FINGERPRINT + "0", "g" * 64):
+            with self.assertRaises(ValueError, msg=bad):
+                admin_audit.sha256_hex(bad)
+
+    def test_encryption(self) -> None:
+        """The only encryption a backup can report is age."""
+        self.assertEqual(admin_audit.encryption("age"), "age")
+        for bad in ("", "none", "gpg", "AGE"):
+            with self.assertRaises(ValueError, msg=bad):
+                admin_audit.encryption(bad)
 
     def test_file_name(self) -> None:
         """Only a base name is accepted: a path could name a user."""
@@ -453,6 +480,24 @@ class EndTest(Workspace):
         self.assertNotIn("parent_event_id", event)
         self.assert_chains_intact()
 
+    def test_backup_records_its_encryption(self) -> None:
+        """The record names the encryption, how many recipients and their set's fingerprint; never a key."""
+        pairs = (f"file={DUMP}.age", "size_bytes=22512", *ENCRYPTED)
+        status, events = self.end(self.purposed(), "backup", "neo4j", *pairs)
+        self.assertEqual(status, 0)
+        (event,) = records(events)
+        self.assertEqual(
+            event["criteria"],
+            {"file": f"{DUMP}.age", "size_bytes": 22512, **ENCRYPTED_CRITERIA, "exit_status": 0, "duration_s": 7},
+        )
+        facts = ["collection=docs", "snapshots=1", "size_bytes=4096", "failed=0", *ENCRYPTED]
+        _, events = self.end(self.purposed(), "backup", "qdrant", *facts)
+        (event,) = records(events)
+        self.assertEqual(event["criteria"]["recipients"], 2)
+        self.assertEqual(event["criteria"]["recipients_sha256"], FINGERPRINT)
+        self.assertNotIn("age1", json.dumps(event))
+        self.assert_chains_intact()
+
     def test_failed_backup_is_an_error(self) -> None:
         """A backup that failed is recorded with what is known."""
         _, events = self.end(self.environ(), "backup", "neo4j", status=1, duration_s=None)
@@ -526,6 +571,12 @@ class EndTest(Workspace):
             ("backup", "neo4j", "path=/srv/backup/neo4j.dump"),
             ("backup", "neo4j", f"file={DUMP}", f"file={DUMP}"),
             ("restore", "qdrant", "collection=docs", "snapshot=x.snapshot", "source=usb"),
+            ("backup", "neo4j", "encryption=none"),
+            ("backup", "neo4j", "recipients=0"),
+            ("backup", "qdrant", "recipients_sha256=0123"),
+            ("backup", "neo4j", "recipient=age1synthetic0recipient"),
+            ("restore", "neo4j", f"file={DUMP}", "encryption=gpg"),
+            ("restore", "neo4j", f"file={DUMP}", "recipients=2"),
         ]
         for args in bad:
             status, events = self.end(self.purposed(), *args)

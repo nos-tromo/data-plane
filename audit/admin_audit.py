@@ -14,6 +14,10 @@ Every record is a chain of its own, written by a short ``docker compose exec``
 run in the ``admin-audit`` container (``AUDIT_OUTPUT=container``). It therefore
 lands in that container's log, the source obs-plane binds data-plane's chains to.
 
+Backups are encrypted with age on their way out of the stores
+(``scripts/backup_age.sh``): a backup's record says so, to how many public keys,
+and which set of them by its fingerprint, never the keys.
+
 Subcommands:
 
 ``serve``
@@ -75,12 +79,15 @@ BACKUP_RECIPIENT: Final = "file:backup"
 REQUIRABLE: Final = ACTIONS - {"lifecycle"}
 #: Where a restored Qdrant snapshot was read from.
 SNAPSHOT_SOURCES: Final = ("host", "volume")
+#: How backup files are encrypted (scripts/backup_age.sh): age, to public keys.
+ENCRYPTIONS: Final = ("age",)
 
 _PAIR: Final = re.compile(r"([a-z][a-z0-9_]{0,31})=(.*)", re.DOTALL)
 _VERSION: Final = re.compile(r"[0-9A-Za-z][0-9A-Za-z.+-]{0,63}")
 _EVENT_ID: Final = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
 # A base name only: never a directory, so a path naming a user cannot be recorded.
 _FILE_NAME: Final = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,254}")
+_SHA256: Final = re.compile(r"[0-9a-f]{64}")
 
 Parser = Callable[[str], object]
 
@@ -102,6 +109,58 @@ def whole_number(text: str) -> int:
     if not text.isascii() or not text.isdigit() or len(text) > 18:
         raise ValueError("not a whole number")
     return int(text)
+
+
+def positive_number(text: str) -> int:
+    """Parse a count that is never zero, e.g. of a backup's recipients.
+
+    Args:
+        text: Decimal digits.
+
+    Returns:
+        The number.
+
+    Raises:
+        ValueError: If it is not a whole number of at least 1.
+    """
+    value = whole_number(text)
+    if value < 1:
+        raise ValueError("not a positive number")
+    return value
+
+
+def sha256_hex(text: str) -> str:
+    """Accept a SHA-256 digest, e.g. the fingerprint of a backup's recipients.
+
+    Args:
+        text: 64 lowercase hex digits.
+
+    Returns:
+        The digest.
+
+    Raises:
+        ValueError: If it is not one.
+    """
+    if _SHA256.fullmatch(text) is None:
+        raise ValueError("not a SHA-256 digest")
+    return text
+
+
+def encryption(text: str) -> str:
+    """Accept how a backup file is encrypted.
+
+    Args:
+        text: ``age``.
+
+    Returns:
+        The encryption.
+
+    Raises:
+        ValueError: If the scripts do not encrypt that way.
+    """
+    if text not in ENCRYPTIONS:
+        raise ValueError("not an encryption the backups use")
+    return text
 
 
 def file_name(text: str) -> str:
@@ -185,17 +244,26 @@ PARAMETERS: Final[Mapping[OperationKey, Mapping[str, Parser]]] = {
     ("restore", "neo4j"): {"file": file_name},
     ("restore", "qdrant"): {"collection": store_name, "snapshot": file_name},
 }
+#: What a backup reports about its encryption: age, to how many public keys
+#: (the recipients file's distinct entries), and the SHA-256 of that set, so a
+#: record shows which keys can read the file without naming one.
+ENCRYPTION_FACTS: Final[Mapping[str, Parser]] = {
+    "encryption": encryption,
+    "recipients": positive_number,
+    "recipients_sha256": sha256_hex,
+}
 #: The facts an operation reports for its record (``end`` only).
 FACTS: Final[Mapping[OperationKey, Mapping[str, Parser]]] = {
-    ("backup", "neo4j"): {"file": file_name, "size_bytes": whole_number},
+    ("backup", "neo4j"): {"file": file_name, "size_bytes": whole_number, **ENCRYPTION_FACTS},
     ("backup", "qdrant"): {
         "collection": store_name,
         "snapshots": whole_number,
         "size_bytes": whole_number,
         "failed": whole_number,
+        **ENCRYPTION_FACTS,
     },
-    ("restore", "neo4j"): {"size_bytes": whole_number},
-    ("restore", "qdrant"): {"source": snapshot_source},
+    ("restore", "neo4j"): {"size_bytes": whole_number, "encryption": encryption},
+    ("restore", "qdrant"): {"source": snapshot_source, "encryption": encryption},
     ("ports", None): {"by": port_closer},
 }
 #: The fact that may repeat, once per object of the record's target.
