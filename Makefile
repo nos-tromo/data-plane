@@ -44,7 +44,7 @@ help:
 	@echo "  make volumes         create the external data volumes if missing"
 	@echo "  make pull            pull all images from the registry"
 	@echo "  make bundle          save images as a versioned airgap tarball ($(PROFILE))"
-	@echo "  make up              start neo4j + qdrant ($(PROFILE) profile)"
+	@echo "  make up              start neo4j + qdrant ($(PROFILE) profile) + admin-audit"
 	@echo "  make up-dev          like 'up', but publishes ports on the host"
 	@echo "  make up-admin        like 'up', but binds 7474/7687/6333 to 127.0.0.1 for SSH-tunnelled admin access"
 	@echo "  make stop            stop containers (keep them)"
@@ -54,7 +54,7 @@ help:
 	@echo
 	@echo "Observability:"
 	@echo "  make ps              service status"
-	@echo "  make health          show health + uptime of each service"
+	@echo "  make health          show health + uptime of each service; admin-audit can record"
 	@echo "  make logs S=neo4j  tail logs for one service"
 	@echo
 	@echo "Backup / restore (see backup/README.md for the full runbook):"
@@ -123,6 +123,8 @@ ps:
 
 health:
 	@$(COMPOSE) $(PROFILE_FLAG) ps --format '{{.Name}}\t{{.State}}\t{{.Status}}'
+	@echo
+	@$(COMPOSE) exec -T admin-audit python /app/admin_audit.py check && echo "admin-audit: can record"
 
 logs:
 ifndef S

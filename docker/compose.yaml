@@ -3,6 +3,8 @@
 ### What this project owns:
 ###   - The named volumes that hold all graph + vector data
 ###   - The neo4j and qdrant services that read/write that data
+###   - admin-audit, which records direct database access, backups and
+###     restores in the data-protection audit trail (README: Audit trail)
 ###
 ### What it does NOT own:
 ###   - data-net  (external; created via 'make network', shared with app backends)
@@ -186,6 +188,49 @@ services:
     healthcheck: *qdrant-healthcheck
     restart: unless-stopped
     profiles: ["cuda"]
+
+  ##########################################################
+  # admin-audit  —  the record of access that bypasses the apps
+  ##########################################################
+  # Neo4j Community keeps no query log and Qdrant no access log, so the
+  # operator targets that open the stores directly (make db-shell,
+  # qdrant-shell), back them up or restore them run through
+  # scripts/audit-admin.sh, which records each one here with
+  # `docker compose exec`: a chain of its own per record, written into this
+  # container's log (README: Audit trail). The long-running process only
+  # records its configuration and beats. Stdlib Python mounted read-only;
+  # nothing is installed. No network, no volumes: it reads nothing and
+  # writes only its stdout.
+  admin-audit:
+    <<: *hardened
+    image: docker.io/library/python:3.12.16-alpine3.24@sha256:e6dae589c1c05976188fd3bd019afd091445fc533ed2ea29001beddc7368a9c8
+    logging: *default-logging
+    # The image's `nobody`.
+    user: "65534:65534"
+    read_only: true
+    network_mode: none
+    tmpfs:
+      - /tmp:size=1m
+    entrypoint: ["python", "/app/admin_audit.py"]
+    command: ["serve"]
+    environment:
+      PYTHONDONTWRITEBYTECODE: "1"
+      AUDIT_OUTPUT: container
+      # The actions whose records need a stated purpose (CASE_REF / REASON).
+      # Backups are `disclose`, restores `modify`; the shells always need
+      # one. Set it empty in .env to require none: the default applies only
+      # while the variable is unset.
+      AUDIT_REQUIRE_PURPOSE: ${AUDIT_REQUIRE_PURPOSE-query,disclose}
+    volumes:
+      - ../audit:/app:ro
+      - ../VERSION:/etc/data-plane/VERSION:ro
+    healthcheck:
+      test: ["CMD", "python", "/app/admin_audit.py", "check"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    restart: unless-stopped
 
 ##########################################################
 # Volumes — all persistent data-plane state lives here.

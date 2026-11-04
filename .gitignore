@@ -9,3 +9,6 @@ backup/
 .data-plane-version
 *.bundle
 *.tar.gz
+
+# Python bytecode (audit/ runs as mounted source)
+__pycache__/
