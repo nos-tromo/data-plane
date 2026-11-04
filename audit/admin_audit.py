@@ -248,6 +248,15 @@ FACTS: Final[Mapping[OperationKey, Mapping[str, Parser]]] = {
 }
 #: The fact that may repeat, once per object of the record's target.
 TARGET_FACTS: Final[Mapping[OperationKey, str]] = {("backup", "qdrant"): "collection"}
+#: The facts an operation that succeeded must report: a backup how it was
+#: encrypted and to which keys, a restore that it read an encrypted file. No
+#: ``ok`` record can therefore show an unencrypted backup.
+REQUIRED_FACTS: Final[Mapping[OperationKey, tuple[str, ...]]] = {
+    ("backup", "neo4j"): tuple(ENCRYPTION_FACTS),
+    ("backup", "qdrant"): tuple(ENCRYPTION_FACTS),
+    ("restore", "neo4j"): ("encryption",),
+    ("restore", "qdrant"): ("encryption",),
+}
 
 
 def parse_pairs(
@@ -587,7 +596,9 @@ def end(
         opened: For a shell or the admin ports, the id of the opening's event.
 
     Returns:
-        0 when the record was written, 1 when it was not, 2 on bad arguments.
+        0 when the record was written, 1 when it was not, 2 on bad arguments,
+        among them an operation that succeeded without its required facts
+        (:data:`REQUIRED_FACTS`).
     """
     names = PARAMETERS.get((kind, store), {})
     try:
@@ -603,6 +614,9 @@ def end(
         call = Invocation(environ, kind, store, {key: value for key, value in values.items() if key in names})
         if kind == "ports" and "by" not in values:
             raise ValueError(f"the admin ports' close needs by=<{'|'.join(PORT_CLOSERS)}>")
+        missing = [key for key in REQUIRED_FACTS.get((kind, store), ()) if key not in values]
+        if status == 0 and missing:
+            raise ValueError(f"{call.operation} succeeded without reporting {', '.join(missing)}")
     except PurposeError as exc:
         return _refuse(f"the stated purpose is not accepted ({exc})", 2)
     except ValueError as exc:

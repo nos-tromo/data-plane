@@ -469,14 +469,17 @@ class EndTest(Workspace):
             self.assertEqual((status, events), (2, []), pairs)
 
     def test_neo4j_backup_is_a_disclosure_to_file_backup(self) -> None:
-        """The dump's name and size, the database, the recipient."""
-        status, events = self.end(self.purposed(), "backup", "neo4j", f"file={DUMP}", "size_bytes=22430")
+        """The dump's name and size, its encryption, the database, the recipient."""
+        status, events = self.end(self.purposed(), "backup", "neo4j", f"file={DUMP}", "size_bytes=22430", *ENCRYPTED)
         self.assertEqual(status, 0)
         (event,) = records(events)
         self.assertEqual((event["action"], event["operation"], event["outcome"]), ("disclose", "backup.neo4j", "ok"))
         self.assertEqual(event["recipient"], "file:backup")
         self.assertEqual(event["target"], {"kind": "database", "ids": ["neo4j"], "count": 1})
-        self.assertEqual(event["criteria"], {"file": DUMP, "size_bytes": 22430, "exit_status": 0, "duration_s": 7})
+        self.assertEqual(
+            event["criteria"],
+            {"file": DUMP, "size_bytes": 22430, **ENCRYPTED_CRITERIA, "exit_status": 0, "duration_s": 7},
+        )
         self.assertEqual(event["purpose"], PURPOSE)
         self.assertNotIn("parent_event_id", event)
         self.assert_chains_intact()
@@ -497,6 +500,23 @@ class EndTest(Workspace):
         self.assertEqual(event["criteria"]["recipients"], 2)
         self.assertEqual(event["criteria"]["recipients_sha256"], FINGERPRINT)
         self.assertNotIn("age1", json.dumps(event))
+        self.assert_chains_intact()
+
+    def test_success_must_state_the_encryption(self) -> None:
+        """An ok backup without its encryption facts, or an ok restore without its: exit 2, nothing written."""
+        restore_qdrant = ("collection=docs", "snapshot=qdrant-docs-1.snapshot.age")
+        for kind, store, pairs in (
+            ("backup", "neo4j", (f"file={DUMP}.age", "size_bytes=1")),
+            ("backup", "neo4j", (f"file={DUMP}.age", "encryption=age", "recipients=2")),
+            ("backup", "qdrant", ("collection=docs", "snapshots=1", "size_bytes=1", "failed=0")),
+            ("restore", "neo4j", (f"file={DUMP}.age", "size_bytes=1")),
+            ("restore", "qdrant", restore_qdrant),
+        ):
+            status, events = self.end(self.purposed(), kind, store, *pairs)
+            self.assertEqual((status, events), (2, []), (kind, store, pairs))
+        self.assertIn("succeeded without reporting", self.stderr.getvalue())
+        status, events = self.end(self.purposed(), "restore", "qdrant", *restore_qdrant, status=1)
+        self.assertEqual((status, records(events)[0]["outcome"]), (0, "error"))
         self.assert_chains_intact()
 
     def test_failed_backup_is_an_error(self) -> None:
@@ -523,7 +543,7 @@ class EndTest(Workspace):
     def test_long_collection_list_continues_in_id_events(self) -> None:
         """More than 200 collections are not cut: continuation events carry the rest."""
         names = [f"collection-{n:03d}" for n in range(450)]
-        _, events = self.end(self.purposed(), "backup", "qdrant", *[f"collection={name}" for name in names])
+        _, events = self.end(self.purposed(), "backup", "qdrant", *[f"collection={name}" for name in names], *ENCRYPTED)
         primary, *more = records(events)
         self.assertEqual(primary["operation"], "backup.qdrant")
         self.assertEqual(primary["target"]["count"], 450)
@@ -538,11 +558,15 @@ class EndTest(Workspace):
 
     def test_neo4j_restore_is_a_modification(self) -> None:
         """The dump loaded, by name and size; no recipient."""
-        _, events = self.end(self.environ(), "restore", "neo4j", f"file={DUMP}", "size_bytes=22430")
+        pairs = (f"file={DUMP}.age", "size_bytes=22512", "encryption=age")
+        _, events = self.end(self.environ(), "restore", "neo4j", *pairs)
         (event,) = records(events)
         self.assertEqual((event["action"], event["operation"], event["outcome"]), ("modify", "restore.neo4j", "ok"))
         self.assertEqual(event["target"], {"kind": "database", "ids": ["neo4j"], "count": 1})
-        self.assertEqual(event["criteria"], {"file": DUMP, "size_bytes": 22430, "exit_status": 0, "duration_s": 7})
+        self.assertEqual(
+            event["criteria"],
+            {"file": f"{DUMP}.age", "size_bytes": 22512, "encryption": "age", "exit_status": 0, "duration_s": 7},
+        )
         self.assertNotIn("recipient", event)
         self.assert_chains_intact()
 
@@ -596,10 +620,10 @@ class EndTest(Workspace):
             def write(self, s: str) -> int:
                 raise OSError("disk full")
 
-        code, events = self.end(self.purposed(AUDIT_OUTPUT="nowhere"), "backup", "neo4j")
+        code, events = self.end(self.purposed(AUDIT_OUTPUT="nowhere"), "backup", "neo4j", *ENCRYPTED)
         self.assertEqual((code, events), (1, []))
         with contextlib.redirect_stdout(Broken()), contextlib.redirect_stderr(self.stderr):
-            code = admin_audit.end(self.purposed(), "backup", "neo4j", [], status=0)
+            code = admin_audit.end(self.purposed(), "backup", "neo4j", list(ENCRYPTED), status=0)
         self.assertEqual(code, 1)
         self.assertIn("could not write the record", self.stderr.getvalue())
 
@@ -703,7 +727,18 @@ class CommandLineTest(Workspace):
         status, events, _ = self.run_main(self.purposed(), argv)
         self.assertEqual(status, 0)
         self.assertEqual(records(events)[0]["parent_event_id"], other[0])
-        argv = ["end", "backup", "neo4j", "--status", "0", "--duration-s", "3", f"file={DUMP}", "size_bytes=10"]
+        argv = [
+            "end",
+            "backup",
+            "neo4j",
+            "--status",
+            "0",
+            "--duration-s",
+            "3",
+            f"file={DUMP}",
+            "size_bytes=10",
+            *ENCRYPTED,
+        ]
         status, events, _ = self.run_main(self.purposed(), argv)
         self.assertEqual((status, records(events)[0]["criteria"]["size_bytes"]), (0, 10))
         self.assert_chains_intact()
@@ -899,12 +934,21 @@ class WrapperScriptTest(ComposeStandIn):
     def test_parameters_reach_both_calls(self) -> None:
         """A restore's parameters are checked at begin and recorded at end."""
         status, calls, events, _ = self.run_wrapper(
-            "restore", "neo4j", f"file={DUMP}", "--", "sh", "-c", 'echo "size_bytes=10" >> "$AUDIT_FACTS"'
+            "restore",
+            "neo4j",
+            f"file={DUMP}",
+            "--",
+            "sh",
+            "-c",
+            'printf "size_bytes=10\\nencryption=age\\n" >> "$AUDIT_FACTS"',
         )
         self.assertEqual(status, 0)
         self.assertTrue(calls[0].endswith(f"begin restore neo4j file={DUMP}"), calls[0])
         (event,) = records(events)
-        self.assertEqual(event["criteria"], {"file": DUMP, "size_bytes": 10, "exit_status": 0, "duration_s": 0})
+        self.assertEqual(
+            event["criteria"],
+            {"file": DUMP, "size_bytes": 10, "encryption": "age", "exit_status": 0, "duration_s": 0},
+        )
         self.assert_chains_intact()
 
     def test_piped_input_reaches_the_command(self) -> None:
