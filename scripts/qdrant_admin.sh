@@ -4,7 +4,7 @@
 #
 #   COMPOSE=<docker compose command> [PROFILE=cpu|cuda] scripts/qdrant_admin.sh shell
 #   COMPOSE=... BACKUP_DIR=<dir> BACKUP_RECIPIENTS=<file> scripts/qdrant_admin.sh snapshot
-#   COMPOSE=... BACKUP_DIR=<dir> scripts/qdrant_admin.sh recover <collection> <snapshot file>
+#   COMPOSE=... BACKUP_DIR=<dir> IDENTITY=<file> scripts/qdrant_admin.sh recover <collection> <encrypted snapshot>
 #
 # make qdrant-shell, backup-qdrant and restore-qdrant run them through
 # scripts/audit-admin.sh, which records each in the audit trail. They work
@@ -19,14 +19,15 @@
 # once, also when the copy failed or was interrupted: no unencrypted snapshot
 # stays behind.
 #
-# recover takes the snapshot from BACKUP_DIR when it is there (a copy brought
-# back from off-host), copying it into the container first; otherwise from
-# the qdrant-snapshots volume. Facts for the audit record go to $AUDIT_FACTS
-# (key=value lines).
+# recover decrypts an encrypted snapshot from BACKUP_DIR with the identity
+# file given for the run (IDENTITY), streaming it into the container, where
+# Qdrant reads it from its volume; it is renamed into place only once whole
+# and authentic, and deleted again after the recovery, whatever its outcome.
+# Facts for the audit record go to $AUDIT_FACTS (key=value lines).
 set -euo pipefail
 
 usage() {
-  echo "usage: COMPOSE=<docker compose command> [PROFILE=cpu|cuda] [BACKUP_DIR=<dir>] [BACKUP_RECIPIENTS=<file>] $0 shell | snapshot | recover <collection> <snapshot file>" >&2
+  echo "usage: COMPOSE=<docker compose command> [PROFILE=cpu|cuda] [BACKUP_DIR=<dir>] [BACKUP_RECIPIENTS=<file>] [IDENTITY=<file>] $0 shell | snapshot | recover <collection> <snapshot file>" >&2
   exit 2
 }
 
@@ -39,10 +40,12 @@ service="qdrant-${PROFILE:-cpu}"
 facts=${AUDIT_FACTS:-/dev/null}
 safe='^[A-Za-z0-9_-][A-Za-z0-9._-]*$'
 # While a snapshot is on its way out: its collection and name in the volume,
-# and the host file being written. The exit trap deletes both.
+# and the host file being written; while one is restored, its path in the
+# volume. The exit trap deletes them.
 pending_collection=""
 pending_snapshot=""
 partial=""
+restored=""
 
 # api COMMAND [ARG...]: scripts/qdrant_api.sh in the Qdrant container.
 api() {
@@ -63,13 +66,19 @@ drop_pending() {
 }
 
 # cleanup: on any exit, delete a snapshot still on its way out and the
-# unfinished host file (an interrupted backup).
+# unfinished host file (an interrupted backup), and a decrypted snapshot from
+# the volume (every restore).
 cleanup() {
   if [[ -n $partial ]]; then
     rm -f "$partial"
   fi
   if [[ -n $pending_snapshot ]]; then
     drop_pending || true
+  fi
+  if [[ -n $restored ]]; then
+    if ! "${compose[@]}" exec -T "$service" rm -f "$restored" "$restored.part" </dev/null; then
+      echo "ERROR: the decrypted snapshot $restored may still be in the qdrant-snapshots volume: delete it" >&2
+    fi
   fi
 }
 trap cleanup EXIT
@@ -129,6 +138,23 @@ snapshot_one() {
   total=$((total + size))
 }
 
+# decrypt_into PATH: decrypt the backup file into PATH.part in the container.
+# Streamed in, not `docker compose cp`: cp keeps the host file's owner and
+# mode, and Qdrant (root without capabilities) cannot read a file it does not
+# own. Private like Qdrant's own snapshots.
+decrypt_into() {
+  local statuses
+  # shellcheck disable=SC2016  # expanded by the container's shell
+  age -d -i "$IDENTITY" "$dir/$file" |
+    "${compose[@]}" exec -T "$service" sh -c 'umask 077 && mkdir -p "${1%/*}" && cat >"$1.part"' _ "$1"
+  statuses=("${PIPESTATUS[@]}")
+  if [[ ${statuses[0]} -ne 0 || ${statuses[1]} -ne 0 ]]; then
+    echo "ERROR: $file could not be decrypted into the container (age exit ${statuses[0]}, copy exit ${statuses[1]})." >&2
+    echo "       The collection was not touched." >&2
+    return 1
+  fi
+}
+
 # leftovers: how many files the qdrant-snapshots volume holds: snapshots an
 # earlier version left there, or one that could not be deleted.
 leftovers() {
@@ -185,22 +211,20 @@ case ${1:-} in
   recover)
     [[ $# -eq 3 && $2 =~ $safe && $3 =~ $safe && $3 != *..* ]] || usage
     collection=$2
-    snapshot=$3
-    path="/qdrant/snapshots/$collection/$snapshot"
-    if [[ -n ${BACKUP_DIR:-} && -f "$BACKUP_DIR/$snapshot" ]]; then
-      echo ">> copying $snapshot from ${BACKUP_DIR} into the Qdrant container"
-      # Streamed in, not `docker compose cp`: cp keeps the host file's owner
-      # and mode, and Qdrant (root without capabilities) cannot read a file
-      # it does not own. Private like Qdrant's own snapshots; the rename
-      # keeps a broken copy from looking whole.
-      # shellcheck disable=SC2016  # expanded by the container's shell
-      "${compose[@]}" exec -T "$service" sh -c 'umask 077 && mkdir -p "${1%/*}" && cat >"$1.part" && mv "$1.part" "$1"' \
-        _ "$path" <"$BACKUP_DIR/$snapshot"
-      printf 'source=host\n' >>"$facts"
-    else
-      printf 'source=volume\n' >>"$facts"
+    file=$3
+    dir=$(backup_dir)
+    if [[ ! -f "$dir/$file" ]]; then
+      echo "ERROR: no snapshot $file in ${BACKUP_DIR}" >&2
+      exit 2
     fi
-    echo ">> recovering collection $collection from $snapshot"
+    age_identity "$dir/$file" || exit 2
+    printf 'encryption=age\n' >>"$facts"
+    path="/qdrant/snapshots/$collection/${file%.age}"
+    restored=$path
+    echo ">> decrypting $file into the Qdrant container"
+    decrypt_into "$path" || exit 1
+    "${compose[@]}" exec -T "$service" mv "$path.part" "$path" </dev/null
+    echo ">> recovering collection $collection from $file"
     api recover "$collection" "$path"
     ;;
   *)

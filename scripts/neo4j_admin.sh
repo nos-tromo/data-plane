@@ -4,7 +4,7 @@
 #
 #   COMPOSE=<docker compose command> scripts/neo4j_admin.sh shell
 #   COMPOSE=... BACKUP_DIR=<dir> BACKUP_RECIPIENTS=<file> scripts/neo4j_admin.sh dump
-#   COMPOSE=... BACKUP_DIR=<dir> scripts/neo4j_admin.sh load <dump file in BACKUP_DIR>
+#   COMPOSE=... BACKUP_DIR=<dir> IDENTITY=<file> scripts/neo4j_admin.sh load <encrypted dump in BACKUP_DIR>
 #
 # make db-shell, backup-neo4j and restore-neo4j run them through
 # scripts/audit-admin.sh, which records each in the audit trail. Neo4j
@@ -15,11 +15,16 @@
 #
 # The dump never reaches the host's disk unencrypted: neo4j-admin writes it to
 # stdout, and age encrypts it on the way to BACKUP_DIR, to the public keys in
-# BACKUP_RECIPIENTS (scripts/backup_age.sh).
+# BACKUP_RECIPIENTS (scripts/backup_age.sh). The load decrypts it the same way,
+# with the identity file given for the run (IDENTITY), into neo4j-admin's
+# stdin. neo4j-admin replaces the database before it has read a byte: an empty
+# or broken stream leaves it empty. So the whole file is decrypted and checked
+# first, while Neo4j still runs, and the load starts only once the stream has
+# delivered a dump's first bytes.
 set -euo pipefail
 
 usage() {
-  echo "usage: COMPOSE=<docker compose command> [BACKUP_DIR=<dir>] [BACKUP_RECIPIENTS=<file>] $0 shell | dump | load <dump file>" >&2
+  echo "usage: COMPOSE=<docker compose command> [BACKUP_DIR=<dir>] [BACKUP_RECIPIENTS=<file>] [IDENTITY=<file>] $0 shell | dump | load <dump file>" >&2
   exit 2
 }
 
@@ -29,6 +34,8 @@ here=$(cd "$(dirname "$0")" && pwd)
 
 read -r -a compose <<<"${COMPOSE:?COMPOSE must hold the docker compose command}"
 facts=${AUDIT_FACTS:-/dev/null}
+# The first bytes of every dump neo4j-admin writes here (its zstd format).
+DUMP_MAGIC=DZV1
 # Set while this script has Neo4j stopped, and to a file it is writing: the
 # exit trap starts Neo4j again and removes the unfinished file.
 stopped=0
@@ -107,6 +114,62 @@ dump_to() {
   partial=""
 }
 
+# first_bytes N: read N bytes of stdin and print them. dd reads them one at a
+# time, so nothing beyond them is taken from a pipe.
+first_bytes() {
+  dd bs=1 count="$1" 2>/dev/null
+}
+
+# verify FILE: decrypt FILE whole, which authenticates every part of it, and
+# check that it holds a Neo4j dump. Nothing is written.
+verify() {
+  local statuses
+  age -d -i "$IDENTITY" "$1" | {
+    magic=$(first_bytes 4)
+    cat >/dev/null
+    [[ $magic == "$DUMP_MAGIC" ]]
+  }
+  statuses=("${PIPESTATUS[@]}")
+  if [[ ${statuses[0]} -ne 0 ]]; then
+    echo "ERROR: ${1##*/} does not decrypt with this identity, or is damaged. Neo4j was not touched." >&2
+    return 1
+  fi
+  if [[ ${statuses[1]} -ne 0 ]]; then
+    echo "ERROR: ${1##*/} decrypts, but holds no Neo4j dump. Neo4j was not touched." >&2
+    return 1
+  fi
+}
+
+# load_gated: neo4j-admin's load from stdin, started only once stdin has
+# delivered a dump's first bytes, which are passed on in front of the rest.
+# Returns neo4j-admin's status, or 3 when it was never started.
+load_gated() {
+  local magic statuses
+  magic=$(first_bytes 4)
+  if [[ $magic != "$DUMP_MAGIC" ]]; then
+    return 3
+  fi
+  { printf '%s' "$magic"; cat; } | neo4j_admin database load neo4j --from-stdin --overwrite-destination=true
+  statuses=("${PIPESTATUS[@]}")
+  return "${statuses[1]}"
+}
+
+# load_from FILE: decrypt FILE into the load. age releases plaintext only
+# once it has authenticated it, so a stream that fails at once (a mistyped
+# passphrase, another identity) never starts neo4j-admin.
+load_from() {
+  local statuses
+  age -d -i "$IDENTITY" "$1" | load_gated
+  statuses=("${PIPESTATUS[@]}")
+  if [[ ${statuses[1]} -eq 3 ]]; then
+    echo "ERROR: ${1##*/} did not decrypt this time (age exit ${statuses[0]}); the database was not touched" >&2
+    return 1
+  elif [[ ${statuses[1]} -ne 0 ]]; then
+    echo "ERROR: neo4j-admin could not load ${1##*/} (exit ${statuses[1]}, age exit ${statuses[0]})" >&2
+    return 1
+  fi
+}
+
 case ${1:-} in
   shell)
     [[ $# -eq 1 ]] || usage
@@ -144,11 +207,13 @@ case ${1:-} in
       echo "ERROR: no dump $2 in ${BACKUP_DIR}" >&2
       exit 2
     fi
+    age_identity "$dir/$2" || exit 2
     fact_size "$dir/$2"
+    fact encryption age
+    echo ">> decrypting $2 whole to check it; Neo4j keeps running meanwhile"
+    verify "$dir/$2" || exit 1
     echo ">> stopping neo4j to load $2"
-    # neo4j-admin loads <database>.dump from --from-path: mount the file as that.
-    offline "${compose[@]}" run --rm -v "$dir/$2:/backup/neo4j.dump:ro" --entrypoint /bin/bash neo4j \
-      -c "neo4j-admin database load neo4j --from-path=/backup --overwrite-destination=true" </dev/null
+    offline load_from "$dir/$2"
     echo ">> loaded $2 into the neo4j database"
     ;;
   *)

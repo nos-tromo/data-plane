@@ -86,8 +86,10 @@ help:
 	@echo "  make backup-neo4j    just Neo4j (offline dump, encrypted into $(BACKUP_DIR))"
 	@echo "  make backup-qdrant   just Qdrant (online snapshots, encrypted into $(BACKUP_DIR))"
 	@echo "                       both encrypt to the public keys in $(BACKUP_RECIPIENTS)"
-	@echo "  make restore-neo4j DUMP=<file>                        REPLACE the neo4j database with a dump (asks first)"
-	@echo "  make restore-qdrant COLLECTION=<name> SNAPSHOT=<file> REPLACE one collection with a snapshot (asks first)"
+	@echo "  make restore-neo4j DUMP=<file> IDENTITY=<key file>    REPLACE the neo4j database with a dump (asks first)"
+	@echo "  make restore-qdrant COLLECTION=<name> SNAPSHOT=<file> IDENTITY=<key file>"
+	@echo "                       REPLACE one collection with a snapshot (asks first)"
+	@echo "                       both decrypt with the age identity given for that run only"
 	@echo
 	@echo "Profile: $(PROFILE)  (override with PROFILE=cuda)"
 
@@ -208,20 +210,26 @@ backup-qdrant:
 	@$(AUDITED) backup qdrant -- ./scripts/qdrant_admin.sh snapshot
 
 # ---- Restores --------------------------------------------------------------
-# Each REPLACES live data, so it asks for confirmation, then is recorded as a
+# Each takes an encrypted backup from BACKUP_DIR and IDENTITY=<file>, the age
+# identity it was encrypted to, for this run only (never stored or recorded),
+# and decrypts by streaming; both are checked before anything is asked. Each
+# REPLACES live data, so it asks for confirmation, then is recorded as a
 # modification once it has run (needs a purpose only if AUDIT_REQUIRE_PURPOSE
 # lists modify).
 
 restore-neo4j:
-	@test -n "$(DUMP)" || { echo "usage: make restore-neo4j DUMP=<dump file in $(BACKUP_DIR)> [CASE_REF=...] [REASON=...]" >&2; exit 2; }
+	@test -n "$(DUMP)" || { echo "usage: make restore-neo4j DUMP=<encrypted dump in $(BACKUP_DIR)> IDENTITY=<age identity file> [CASE_REF=...] [REASON=...]" >&2; exit 2; }
 	@test -f "$(BACKUP_DIR)/$(DUMP)" || { echo "no dump $(DUMP) in $(BACKUP_DIR)" >&2; exit 2; }
+	@$(ENCRYPTION) identity '$(BACKUP_DIR)/$(DUMP)'
 	@echo "This REPLACES the neo4j database with $(DUMP); Neo4j stops while it loads."
 	@read -p "Type 'restore' to confirm: " confirm && [ "$$confirm" = "restore" ] \
 	  || { echo "aborted"; exit 1; }
 	@$(AUDITED) restore neo4j 'file=$(DUMP)' -- ./scripts/neo4j_admin.sh load '$(DUMP)'
 
 restore-qdrant:
-	@test -n "$(COLLECTION)" && test -n "$(SNAPSHOT)" || { echo "usage: make restore-qdrant COLLECTION=<name> SNAPSHOT=<snapshot file> [CASE_REF=...] [REASON=...]" >&2; exit 2; }
+	@test -n "$(COLLECTION)" && test -n "$(SNAPSHOT)" || { echo "usage: make restore-qdrant COLLECTION=<name> SNAPSHOT=<encrypted snapshot in $(BACKUP_DIR)> IDENTITY=<age identity file> [CASE_REF=...] [REASON=...]" >&2; exit 2; }
+	@test -f "$(BACKUP_DIR)/$(SNAPSHOT)" || { echo "no snapshot $(SNAPSHOT) in $(BACKUP_DIR)" >&2; exit 2; }
+	@$(ENCRYPTION) identity '$(BACKUP_DIR)/$(SNAPSHOT)'
 	@echo "This REPLACES the Qdrant collection $(COLLECTION) with the snapshot $(SNAPSHOT)."
 	@read -p "Type 'restore' to confirm: " confirm && [ "$$confirm" = "restore" ] \
 	  || { echo "aborted"; exit 1; }

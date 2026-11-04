@@ -9,15 +9,19 @@
 # file on the host: the dumps and snapshots stream through age.
 #
 #   BACKUP_RECIPIENTS=<file> scripts/backup_age.sh recipients
+#       exit 0 when backups can be encrypted: age is installed and accepts
+#       every line of the file as a public key.
+#   IDENTITY=<file> scripts/backup_age.sh identity <backup file>
+#       exit 0 when a restore can decrypt the file: an identity file is given
+#       for this run, age is installed, and the file is age-encrypted.
 #
-# exits 0 when backups can be encrypted: age is installed and accepts every
-# line of the file as a public key. Otherwise 2, saying what to do. make runs
-# it before a backup asks admin-audit for anything.
+# Both exit 2 otherwise, saying what to do. make runs them before a backup or
+# a restore asks admin-audit (or the operator) for anything.
 #
 # scripts/neo4j_admin.sh and scripts/qdrant_admin.sh source this file for the
-# same check (age_recipients), for the facts of the audit record (age_facts:
-# the encryption, how many distinct public keys, and the SHA-256 of that set,
-# never a key) and for the backup directory.
+# same checks (age_recipients, age_identity), for the facts of the audit
+# record (age_facts: the encryption, how many distinct public keys, and the
+# SHA-256 of that set, never a key) and for the backup directory.
 
 # Set by age_recipients: the recipients file, how many distinct public keys it
 # holds, and the SHA-256 of their set.
@@ -97,6 +101,38 @@ age_recipients() {
   AGE_RECIPIENTS_SHA256=$(age_recipient_lines "$file" | _age_sha256)
 }
 
+# age_identity FILE: check that a restore can decrypt FILE: IDENTITY names a
+# readable identity file, given for this run only, age is installed, and
+# FILE is an age-encrypted file. Returns 2, saying why, when it cannot.
+age_identity() {
+  local file=$1 first=""
+  if [[ -z ${IDENTITY:-} ]]; then
+    echo "ERROR: a restore decrypts the backup with the age identity it was encrypted to." >&2
+    echo "       Give that identity's file for this run only: IDENTITY=<file> (backup/README.md, Restore). Nothing was done." >&2
+    return 2
+  fi
+  if [[ ! -f $IDENTITY || ! -r $IDENTITY ]]; then
+    echo "ERROR: there is no readable identity file at $IDENTITY. Nothing was done." >&2
+    return 2
+  fi
+  if ! command -v age >/dev/null 2>&1; then
+    echo "ERROR: age is not installed on this host (backup/README.md: Installing age). Nothing was done." >&2
+    return 2
+  fi
+  if [[ ! -f $file || ! -r $file ]]; then
+    echo "ERROR: there is no readable backup file at $file. Nothing was done." >&2
+    return 2
+  fi
+  # The first line of an age file names the format (binary, or armored).
+  LC_ALL=C IFS= read -r -n 64 first <"$file" || true
+  first=${first%$'\r'}
+  if [[ $first != "age-encryption.org/v1" && $first != "-----BEGIN AGE ENCRYPTED FILE-----" ]]; then
+    echo "ERROR: ${file##*/} is not age-encrypted, and a restore takes only encrypted backups" >&2
+    echo "       (backup/README.md: Plaintext from earlier versions). Nothing was done." >&2
+    return 2
+  fi
+}
+
 # age_facts FILE: the encryption facts of a backup's audit record, as
 # key=value lines appended to FILE.
 age_facts() {
@@ -132,9 +168,12 @@ warn_plaintext() {
 
 if [[ ${BASH_SOURCE[0]} == "$0" ]]; then
   set -euo pipefail
-  if [[ $# -ne 1 || $1 != recipients ]]; then
-    echo "usage: BACKUP_RECIPIENTS=<file> $0 recipients" >&2
-    exit 2
-  fi
-  age_recipients
+  case "${1:-}:$#" in
+    recipients:1) age_recipients ;;
+    identity:2) age_identity "$2" ;;
+    *)
+      echo "usage: BACKUP_RECIPIENTS=<file> $0 recipients | IDENTITY=<file> $0 identity <backup file>" >&2
+      exit 2
+      ;;
+  esac
 fi

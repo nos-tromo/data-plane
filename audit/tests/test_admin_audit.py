@@ -547,8 +547,8 @@ class EndTest(Workspace):
         self.assert_chains_intact()
 
     def test_qdrant_restore_names_its_collection(self) -> None:
-        """The collection replaced is the target; the snapshot and its source are criteria."""
-        pairs = ["collection=docs", "snapshot=docs-1-2026-01-31-02-00-00.snapshot", "source=host"]
+        """The collection replaced is the target; the snapshot and its encryption are criteria."""
+        pairs = ["collection=docs", "snapshot=qdrant-docs-20260131T020000Z.snapshot.age", "encryption=age"]
         _, events = self.end(self.purposed(), "restore", "qdrant", *pairs)
         (event,) = records(events)
         self.assertEqual(event["target"], {"kind": "collection", "ids": ["docs"], "count": 1})
@@ -556,8 +556,8 @@ class EndTest(Workspace):
             event["criteria"],
             {
                 "collection": "docs",
-                "snapshot": "docs-1-2026-01-31-02-00-00.snapshot",
-                "source": "host",
+                "snapshot": "qdrant-docs-20260131T020000Z.snapshot.age",
+                "encryption": "age",
                 "exit_status": 0,
                 "duration_s": 7,
             },
@@ -571,7 +571,7 @@ class EndTest(Workspace):
             ("backup", "neo4j", "size_bytes=ten"),
             ("backup", "neo4j", "path=/srv/backup/neo4j.dump"),
             ("backup", "neo4j", f"file={DUMP}", f"file={DUMP}"),
-            ("restore", "qdrant", "collection=docs", "snapshot=x.snapshot", "source=usb"),
+            ("restore", "qdrant", "collection=docs", "snapshot=x.snapshot.age", "source=host"),
             ("backup", "neo4j", "encryption=none"),
             ("backup", "neo4j", "recipients=0"),
             ("backup", "qdrant", "recipients_sha256=0123"),
@@ -952,8 +952,8 @@ class WrapperScriptTest(ComposeStandIn):
 # refuses recipients that are not age1... keys and identities without the
 # stand-in's secret, and logs every call. FAKE_AGE_FAIL=encrypt|decrypt fails
 # that direction once it has written (a decryption after FAKE_AGE_PASS_BYTES
-# bytes), except into /dev/null; FAKE_AGE_WARN warns like age about a key it
-# skips.
+# bytes, and only from its FAKE_AGE_FAIL_FROM-th call on), except into
+# /dev/null; FAKE_AGE_WARN warns like age about a key it skips.
 FAKE_AGE = r"""#!/usr/bin/env python3
 import os
 import sys
@@ -991,6 +991,10 @@ if decrypt:
     if not data.startswith(HEADER):
         fail("failed to read header")
     out = data[len(HEADER):]
+    with open(os.environ["FAKE_AGE_LOG"], encoding="utf-8") as log:
+        decryptions = sum(line.startswith("age -d ") for line in log)
+    if decryptions < int(os.environ.get("FAKE_AGE_FAIL_FROM", "1")):
+        os.environ.pop("FAKE_AGE_FAIL", None)
     if os.environ.get("FAKE_AGE_FAIL") == "decrypt":
         out = out[: int(os.environ.get("FAKE_AGE_PASS_BYTES", "0"))]
 else:
@@ -1261,22 +1265,107 @@ class StoreScriptTest(AgeStandIn):
         self.assertNotEqual(status, 0)
         self.assertEqual([call.split()[0] for call in calls], ["stop"])
 
-    def test_load_mounts_the_dump_as_neo4j_dump(self) -> None:
-        """The chosen dump is loaded read-only under the name neo4j-admin expects."""
-        self.backup_dir.mkdir()
-        (self.backup_dir / DUMP).write_bytes(b"x" * 99)
-        status, calls, facts = self.run_script("neo4j_admin.sh", "load", DUMP)
-        self.assertEqual(status, 0)
-        self.assertEqual([call.split()[0] for call in calls], ["stop", "run", "start"])
-        self.assertIn(f"-v {self.backup_dir}/{DUMP}:/backup/neo4j.dump:ro", calls[1])
-        self.assertIn("neo4j-admin database load neo4j --from-path=/backup --overwrite-destination=true", calls[1])
-        self.assertEqual(facts, ["size_bytes=99"])
+    def encrypted(self, name: str, plaintext: bytes) -> Path:
+        """Put a backup encrypted by the stand-in into the backup directory.
 
-    def test_load_refuses_a_missing_or_odd_dump(self) -> None:
-        """No such dump, or a name with a path in it: exit 2, Neo4j untouched."""
-        for name in (DUMP, "../neo4j.dump", "a:b.dump"):
-            status, calls, _ = self.run_script("neo4j_admin.sh", "load", name)
-            self.assertEqual((status, calls), (2, []), name)
+        Args:
+            name: Its file name.
+            plaintext: What it decrypts to.
+
+        Returns:
+            Its path.
+        """
+        self.backup_dir.mkdir(exist_ok=True)
+        path = self.backup_dir / name
+        path.write_bytes(AGE_HEADER + plaintext)
+        return path
+
+    def identity(self, secret: str = AGE_SECRET) -> str:
+        """Write an identity file, as an operator brings one for a restore.
+
+        Args:
+            secret: Its key; the stand-in's own unless another is wanted.
+
+        Returns:
+            Its path.
+        """
+        path = self.tmp / "offline" / "backup-identity.txt"
+        path.parent.mkdir(exist_ok=True)
+        path.write_text(f"# created offline\n{secret}\n", encoding="utf-8")
+        return str(path)
+
+    def test_load_checks_the_whole_file_then_streams_it_in(self) -> None:
+        """Decrypted whole while Neo4j runs, then stopped, decrypted into neo4j-admin, started again."""
+        dump = self.encrypted(f"{DUMP}.age", b"DZV1 synthetic dump of Alice Example")
+        identity = self.identity()
+        status, calls, facts = self.run_script("neo4j_admin.sh", "load", dump.name, IDENTITY=identity)
+        self.assertEqual(status, 0, self.stderr)
+        self.assertEqual(self.age_calls(), [f"age -d -i {identity} {dump}"] * 2)
+        self.assertEqual(
+            calls,
+            [
+                "stop neo4j",
+                "run --rm -T --entrypoint neo4j-admin neo4j"
+                " database load neo4j --from-stdin --overwrite-destination=true",
+                "start neo4j",
+            ],
+        )
+        self.assertEqual((self.tmp / "loaded").read_bytes(), b"DZV1 synthetic dump of Alice Example")
+        self.assertEqual(facts, [f"size_bytes={dump.stat().st_size}", "encryption=age"])
+        self.assertEqual(sorted(path.name for path in self.backup_dir.iterdir()), [dump.name])
+
+    def test_load_refuses_before_anything_without_a_usable_identity_or_file(self) -> None:
+        """No identity, an unreadable one, a plaintext dump, a missing or odd name: exit 2, nothing run."""
+        dump = self.encrypted(f"{DUMP}.age", b"DZV1 synthetic dump")
+        (self.backup_dir / DUMP).write_bytes(b"DZV1 an earlier, unencrypted dump")
+        cases: list[tuple[str, dict[str, str]]] = [
+            (dump.name, {}),
+            (dump.name, {"IDENTITY": str(self.tmp / "missing.key")}),
+            (DUMP, {"IDENTITY": self.identity()}),
+            ("neo4j-20260101T000000Z.dump.age", {"IDENTITY": self.identity()}),
+            ("../neo4j.dump", {"IDENTITY": self.identity()}),
+            ("a:b.dump", {"IDENTITY": self.identity()}),
+        ]
+        for name, env in cases:
+            status, calls, _ = self.run_script("neo4j_admin.sh", "load", name, **env)
+            self.assertEqual((status, calls), (2, []), (name, env))
+        self.assertEqual(self.age_calls(), [])
+
+    def test_another_identity_never_stops_neo4j(self) -> None:
+        """The whole-file check fails: Neo4j keeps running untouched."""
+        dump = self.encrypted(f"{DUMP}.age", b"DZV1 synthetic dump")
+        status, calls, facts = self.run_script(
+            "neo4j_admin.sh", "load", dump.name, IDENTITY=self.identity("AGE-SECRET-KEY-1ZZOTHER")
+        )
+        self.assertEqual((status, calls), (1, []))
+        self.assertIn("does not decrypt with this identity", self.stderr)
+        self.assertIn("encryption=age", facts)
+
+    def test_a_file_that_holds_no_dump_never_stops_neo4j(self) -> None:
+        """An encrypted Qdrant snapshot given as a dump decrypts, but is refused before the stop."""
+        snapshot = self.encrypted("qdrant-docs-20260131T020000Z.snapshot.age", b"a tar archive, not a dump")
+        status, calls, _ = self.run_script("neo4j_admin.sh", "load", snapshot.name, IDENTITY=self.identity())
+        self.assertEqual((status, calls), (1, []))
+        self.assertIn("holds no Neo4j dump", self.stderr)
+
+    def test_a_decryption_that_fails_at_once_never_starts_the_load(self) -> None:
+        """The second decryption fails before any byte (a mistyped passphrase): neo4j-admin never runs."""
+        dump = self.encrypted(f"{DUMP}.age", b"DZV1 synthetic dump")
+        second_fails = {"FAKE_AGE_FAIL": "decrypt", "FAKE_AGE_FAIL_FROM": "2"}
+        status, calls, _ = self.run_script(
+            "neo4j_admin.sh", "load", dump.name, IDENTITY=self.identity(), **second_fails
+        )
+        self.assertEqual(status, 1)
+        self.assertEqual(calls, ["stop neo4j", "start neo4j"])
+        self.assertFalse((self.tmp / "loaded").exists())
+        self.assertIn("the database was not touched", self.stderr)
+
+    def test_a_failed_load_still_starts_neo4j(self) -> None:
+        """neo4j-admin failing never leaves Neo4j down."""
+        dump = self.encrypted(f"{DUMP}.age", b"DZV1 synthetic dump")
+        status, calls, _ = self.run_script("neo4j_admin.sh", "load", dump.name, IDENTITY=self.identity(), FAKE_LOAD="1")
+        self.assertEqual(status, 1)
+        self.assertEqual([call.split()[0] for call in calls], ["stop", "run", "start"])
 
     def test_snapshots_leave_the_volume_encrypted(self) -> None:
         """Per collection: snapshot, copy out through age, delete in the volume; a file and a fact each."""
@@ -1365,33 +1454,75 @@ class StoreScriptTest(AgeStandIn):
         self.assertIn("3 unencrypted file(s) remain in the qdrant-snapshots volume", self.stderr)
         self.assertTrue((self.backup_dir / DUMP).is_file())
 
-    def test_recover_copies_a_host_snapshot_in_first(self) -> None:
-        """A snapshot in the backup directory is streamed into the container, then recovered."""
-        self.backup_dir.mkdir()
-        snapshot = "docs-1-2026-01-31-02-00-00.snapshot"
-        (self.backup_dir / snapshot).write_bytes(b"snapshot bytes")
-        status, calls, facts = self.run_script("qdrant_admin.sh", "recover", "docs", snapshot, PROFILE="cuda")
-        self.assertEqual(status, 0)
-        path = f"/qdrant/snapshots/docs/{snapshot}"
-        self.assertTrue(calls[0].startswith("exec -T qdrant-cuda sh -c "), calls[0])
-        self.assertTrue(calls[0].endswith(f" _ {path}"), calls[0])
-        self.assertEqual((self.tmp / "streamed").read_bytes(), b"snapshot bytes")
-        self.assertTrue(calls[1].startswith("exec -T qdrant-cuda bash -c "), calls[1])
-        self.assertTrue(calls[1].endswith(f"qdrant_api recover docs {path}"), calls[1])
-        self.assertEqual(facts, ["source=host"])
+    def test_recover_decrypts_into_the_volume_and_cleans_up(self) -> None:
+        """Decrypted into a private .part, renamed, recovered from, then deleted from the volume."""
+        snapshot = self.encrypted("qdrant-docs-20260131T020000Z.snapshot.age", b"synthetic snapshot tar")
+        identity = self.identity()
+        status, calls, facts = self.run_script(
+            "qdrant_admin.sh", "recover", "docs", snapshot.name, PROFILE="cuda", IDENTITY=identity
+        )
+        self.assertEqual(status, 0, self.stderr)
+        path = "/qdrant/snapshots/docs/qdrant-docs-20260131T020000Z.snapshot"
+        steps = self.qdrant_steps(calls)
+        self.assertTrue(steps[0].startswith("exec -T qdrant-cuda sh -c umask 077 && "), steps[0])
+        self.assertTrue(steps[0].endswith(f' && cat >"$1.part" _ {path}'), steps[0])
+        self.assertEqual(
+            steps[1:],
+            [
+                f"exec -T qdrant-cuda mv {path}.part {path}",
+                f"api recover docs {path}",
+                f"exec -T qdrant-cuda rm -f {path} {path}.part",
+            ],
+        )
+        self.assertEqual((self.tmp / "streamed").read_bytes(), b"synthetic snapshot tar")
+        self.assertEqual(self.age_calls(), [f"age -d -i {identity} {snapshot}"])
+        self.assertEqual(facts, ["encryption=age"])
 
-    def test_recover_from_the_volume(self) -> None:
-        """Without a host copy, the snapshot is taken from Qdrant's volume."""
-        status, calls, facts = self.run_script("qdrant_admin.sh", "recover", "docs", "docs-1.snapshot")
-        self.assertEqual(status, 0)
-        self.assertEqual(len(calls), 1)
-        self.assertEqual(facts, ["source=volume"])
+    def test_a_failed_decryption_recovers_nothing(self) -> None:
+        """Age fails part-way: the part is never renamed or recovered from, and is deleted."""
+        snapshot = self.encrypted("qdrant-docs-20260131T020000Z.snapshot.age", b"synthetic snapshot tar")
+        status, calls, _ = self.run_script(
+            "qdrant_admin.sh",
+            "recover",
+            "docs",
+            snapshot.name,
+            IDENTITY=self.identity(),
+            FAKE_AGE_FAIL="decrypt",
+            FAKE_AGE_PASS_BYTES="9",
+        )
+        self.assertEqual(status, 1)
+        steps = self.qdrant_steps(calls)
+        self.assertEqual(len(steps), 2, steps)
+        self.assertTrue(steps[1].startswith("exec -T qdrant-cpu rm -f "), steps[1])
+        self.assertEqual((self.tmp / "streamed").read_bytes(), b"synthetic")
+        self.assertIn("The collection was not touched", self.stderr)
 
-    def test_recover_refuses_odd_names(self) -> None:
-        """Names that could leave the snapshot directory are refused before anything runs."""
-        for args in (("../docs", "x.snapshot"), ("docs", "../x.snapshot"), ("docs", "a..b"), ("docs files", "x")):
-            status, calls, _ = self.run_script("qdrant_admin.sh", "recover", *args)
-            self.assertEqual((status, calls), (2, []), args)
+    def test_a_failed_recovery_still_cleans_up(self) -> None:
+        """Qdrant refusing the snapshot: exit 1, the decrypted copy is deleted all the same."""
+        snapshot = self.encrypted("qdrant-docs-20260131T020000Z.snapshot.age", b"synthetic snapshot tar")
+        status, calls, _ = self.run_script(
+            "qdrant_admin.sh", "recover", "docs", snapshot.name, IDENTITY=self.identity(), FAKE_RECOVER="1"
+        )
+        self.assertEqual(status, 1)
+        self.assertTrue(self.qdrant_steps(calls)[-1].startswith("exec -T qdrant-cpu rm -f "))
+
+    def test_recover_refuses_before_anything(self) -> None:
+        """Odd names, a missing or plaintext snapshot, no identity: exit 2, nothing run."""
+        snapshot = self.encrypted("qdrant-docs-20260131T020000Z.snapshot.age", b"synthetic snapshot tar")
+        (self.backup_dir / "docs-1.snapshot").write_bytes(b"an earlier, unencrypted snapshot")
+        identity = {"IDENTITY": self.identity()}
+        cases: list[tuple[tuple[str, str], dict[str, str]]] = [
+            (("../docs", snapshot.name), identity),
+            (("docs", "../x.snapshot"), identity),
+            (("docs", "a..b"), identity),
+            (("docs files", snapshot.name), identity),
+            (("docs", "missing.snapshot.age"), identity),
+            (("docs", "docs-1.snapshot"), identity),
+            (("docs", snapshot.name), {}),
+        ]
+        for args, env in cases:
+            status, calls, _ = self.run_script("qdrant_admin.sh", "recover", *args, **env)
+            self.assertEqual((status, calls), (2, []), (args, env))
 
 
 @unittest.skipUnless(HAS_SCRIPTS, "needs bash and the repo's scripts/")
@@ -1520,9 +1651,44 @@ class BackupAgeTest(AgeStandIn):
         self.assertEqual(len(list(backups.iterdir())), 4)
         self.assertEqual(self.sourced('warn_plaintext "$1"', str(self.tmp / "bin")).stderr, "")
 
+    def test_a_restore_needs_an_identity_and_an_encrypted_file(self) -> None:
+        """IDENTITY unset or unreadable, the file missing or unencrypted: exit 2. Binary and armored age files pass."""
+        identity = self.tmp / "backup-identity.txt"
+        identity.write_text(f"{AGE_SECRET}\n", encoding="utf-8")
+        files = {
+            "binary": AGE_HEADER + b"DZV1",
+            "armored": b"-----BEGIN AGE ENCRYPTED FILE-----\r\nYWdl\r\n-----END AGE ENCRYPTED FILE-----\r\n",
+            "plaintext": b"DZV1 an earlier, unencrypted dump",
+        }
+        for name, content in files.items():
+            (self.tmp / name).write_bytes(content)
+
+        def identity_check(name: str, **env: str) -> subprocess.CompletedProcess[str]:
+            return subprocess.run(
+                ["bash", str(SCRIPTS / "backup_age.sh"), "identity", str(self.tmp / name)],
+                env={**self.env, **env},
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+        for name in ("binary", "armored"):
+            result = identity_check(name, IDENTITY=str(identity))
+            self.assertEqual((result.returncode, result.stderr), (0, ""), name)
+        result = identity_check("binary")
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("IDENTITY=<file>", result.stderr)
+        self.assertEqual(identity_check("binary", IDENTITY=str(self.tmp / "missing.key")).returncode, 2)
+        result = identity_check("plaintext", IDENTITY=str(identity))
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("plaintext is not age-encrypted", result.stderr)
+        self.assertEqual(identity_check("missing", IDENTITY=str(identity)).returncode, 2)
+        self.assertEqual(self.age_calls(), [])
+
     def test_usage(self) -> None:
-        """Anything but `recipients`: exit 2."""
-        for args in ((), ("identity",), ("recipients", "extra")):
+        """Anything but `recipients` or `identity <file>`: exit 2."""
+        for args in ((), ("identity",), ("identity", "a", "b"), ("recipients", "extra"), ("encrypt",)):
             result = subprocess.run(
                 ["bash", str(SCRIPTS / "backup_age.sh"), *args],
                 env=self.env,
@@ -1591,6 +1757,48 @@ class MakefileTest(AgeStandIn):
         self.assertIn(" end backup neo4j --status 0 ", record)
         fingerprint = recipients_fingerprint(RECIPIENT_KEYS)
         self.assertIn(f" encryption=age recipients=2 recipients_sha256={fingerprint} file={name} ", record)
+
+    def restorable(self) -> str:
+        """Put an encrypted dump, an earlier plaintext one and an encrypted snapshot in place, and an identity.
+
+        Returns:
+            The identity file's path.
+        """
+        self.backup_dir.mkdir()
+        (self.backup_dir / f"{DUMP}.age").write_bytes(AGE_HEADER + b"DZV1 synthetic dump")
+        (self.backup_dir / DUMP).write_bytes(b"DZV1 an earlier, unencrypted dump")
+        (self.backup_dir / "qdrant-docs-1.snapshot.age").write_bytes(AGE_HEADER + b"synthetic snapshot tar")
+        identity = self.tmp / "offline" / "backup-identity.txt"
+        identity.parent.mkdir()
+        identity.write_text(f"{AGE_SECRET}\n", encoding="utf-8")
+        return str(identity)
+
+    def test_a_restore_without_a_usable_identity_asks_nothing(self) -> None:
+        """No IDENTITY, or a plaintext dump: refused before the confirmation; nothing is called."""
+        identity = self.restorable()
+        cases = [
+            ("restore-neo4j", f"DUMP={DUMP}.age"),
+            ("restore-neo4j", f"DUMP={DUMP}", f"IDENTITY={identity}"),
+            ("restore-qdrant", "COLLECTION=docs", "SNAPSHOT=qdrant-docs-1.snapshot.age"),
+        ]
+        for target, *args in cases:
+            result, calls = self.make(target, *args, stdin="restore\n")
+            self.assertNotEqual(result.returncode, 0, args)
+            self.assertEqual(calls, [], args)
+            self.assertNotIn("REPLACES", result.stdout, args)
+        self.assertEqual(self.age_calls(), [])
+
+    def test_a_restore_decrypts_with_the_identity_of_the_run(self) -> None:
+        """Confirmed, then recorded at both ends; the identity's path reaches no record."""
+        identity = self.restorable()
+        result, calls = self.make("restore-neo4j", f"DUMP={DUMP}.age", f"IDENTITY={identity}", stdin="restore\n")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(calls[0].endswith(f"admin_audit.py begin restore neo4j file={DUMP}.age"), calls[0])
+        self.assertEqual([call.split()[0] for call in calls[1:4]], ["stop", "run", "start"])
+        self.assertIn(" end restore neo4j --status 0 ", calls[4])
+        self.assertTrue(calls[4].endswith(" encryption=age"), calls[4])
+        self.assertNotIn("offline", "".join(calls))
+        self.assertEqual(self.age_calls(), [f"age -d -i {identity} {self.backup_dir}/{DUMP}.age"] * 2)
 
 
 @unittest.skipUnless(ADMIN_OVERLAY.is_file(), "needs the repo's docker/")

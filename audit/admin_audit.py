@@ -77,8 +77,6 @@ PORT_CLOSERS: Final = ("up", "down", "up-admin")
 BACKUP_RECIPIENT: Final = "file:backup"
 #: The actions ``AUDIT_REQUIRE_PURPOSE`` may list.
 REQUIRABLE: Final = ACTIONS - {"lifecycle"}
-#: Where a restored Qdrant snapshot was read from.
-SNAPSHOT_SOURCES: Final = ("host", "volume")
 #: How backup files are encrypted (scripts/backup_age.sh): age, to public keys.
 ENCRYPTIONS: Final = ("age",)
 
@@ -198,24 +196,6 @@ def store_name(text: str) -> str:
     return text
 
 
-def snapshot_source(text: str) -> str:
-    """Accept where a restored snapshot came from.
-
-    Args:
-        text: ``host`` (a copy in the backup directory) or ``volume`` (still in
-            Qdrant's snapshot volume).
-
-    Returns:
-        The source.
-
-    Raises:
-        ValueError: If it is neither.
-    """
-    if text not in SNAPSHOT_SOURCES:
-        raise ValueError("not a snapshot source")
-    return text
-
-
 def port_closer(text: str) -> str:
     """Accept what ended an admin-ports window.
 
@@ -263,7 +243,7 @@ FACTS: Final[Mapping[OperationKey, Mapping[str, Parser]]] = {
         **ENCRYPTION_FACTS,
     },
     ("restore", "neo4j"): {"size_bytes": whole_number, "encryption": encryption},
-    ("restore", "qdrant"): {"source": snapshot_source, "encryption": encryption},
+    ("restore", "qdrant"): {"encryption": encryption},
     ("ports", None): {"by": port_closer},
 }
 #: The fact that may repeat, once per object of the record's target.
