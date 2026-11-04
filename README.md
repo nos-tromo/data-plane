@@ -71,8 +71,10 @@ Neo4j Browser always asks for the `NEO4J_USER` / `NEO4J_PASSWORD` login. The
 Qdrant dashboard has no login unless `QDRANT_API_KEY` is set in
 `.env`: uncomment it there (see `.env.example` — an *empty* value is not "no
 auth", it makes Qdrant 401 everything) and the dashboard prompts for the key,
-while every API call needs an `api-key` header — docint's, the backup
-script's, and yours over the tunnel. Without it, anyone who can reach the
+while every API call needs an `api-key` header — docint's, and yours over
+the tunnel (`make backup-qdrant`, `make qdrant-shell` and `make
+restore-qdrant` send the server's own key themselves; the shell warns when
+Qdrant was started with an empty one). Without it, anyone who can reach the
 loopback ports, and every service on `data-net`, has unauthenticated read and
 write access to the vector store.
 

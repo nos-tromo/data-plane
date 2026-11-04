@@ -8,6 +8,7 @@ either is missing, e.g. in the pinned python image, which mounts only ``audit/``
 from __future__ import annotations
 
 import contextlib
+import http.server
 import io
 import json
 import os
@@ -975,6 +976,126 @@ class StoreScriptTest(unittest.TestCase):
         for args in (("../docs", "x.snapshot"), ("docs", "../x.snapshot"), ("docs", "a..b"), ("docs files", "x")):
             status, calls, _ = self.run_script("qdrant_admin.sh", "recover", *args)
             self.assertEqual((status, calls), (2, []), args)
+
+
+class FakeQdrant:
+    """A stand-in for Qdrant's HTTP API: answers with a set status, keeps each request."""
+
+    def __init__(self) -> None:
+        """Start serving on a free local port."""
+        self.status = 200
+        self.requests: list[tuple[str, str, dict[str, str], bytes]] = []
+        fake = self
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            """Records the request and answers like Qdrant, with a JSON body."""
+
+            def answer(self) -> None:
+                """Record the request and send the set status."""
+                length = int(self.headers.get("Content-Length") or 0)
+                body = self.rfile.read(length) if length else b""
+                fake.requests.append((self.command, self.path, dict(self.headers.items()), body))
+                payload = b'{"status":"ok","time":0.0}'
+                self.send_response(fake.status)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+
+            def do_GET(self) -> None:
+                """Answer a GET."""
+                self.answer()
+
+            def do_PUT(self) -> None:
+                """Answer a PUT."""
+                self.answer()
+
+            @override
+            def log_message(self, format: str, *args: Any) -> None:
+                """Keep the test output clean."""
+                del format, args
+
+        self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.port = self.server.server_address[1]
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+
+    def close(self) -> None:
+        """Stop serving."""
+        self.server.shutdown()
+        self.server.server_close()
+
+
+@unittest.skipUnless(HAS_SCRIPTS, "needs bash and the repo's scripts/")
+class QdrantApiTest(unittest.TestCase):
+    """scripts/qdrant_api.sh, run as qdrant_admin.sh runs it, against a stand-in Qdrant."""
+
+    @override
+    def setUp(self) -> None:
+        """Start the stand-in."""
+        self.qdrant = FakeQdrant()
+        self.addCleanup(self.qdrant.close)
+
+    def shell(self, commands: str, **env: str) -> subprocess.CompletedProcess[str]:
+        """Pipe commands into the helper's shell mode.
+
+        Args:
+            commands: The shell input.
+            **env: The container's environment, e.g. ``QDRANT__SERVICE__API_KEY``.
+
+        Returns:
+            The finished process.
+        """
+        script = (SCRIPTS / "qdrant_api.sh").read_text(encoding="utf-8")
+        return subprocess.run(
+            ["bash", "-c", script, "qdrant_api", "shell"],
+            env={"PATH": os.environ["PATH"], "QDRANT_PORT": str(self.qdrant.port), **env},
+            input=commands,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=60,
+        )
+
+    def test_the_servers_key_is_sent(self) -> None:
+        """With QDRANT_API_KEY set, every request carries the container's key."""
+        result = self.shell("qdrant GET /collections\n", QDRANT__SERVICE__API_KEY="zz-test-key")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.splitlines()[0], "HTTP/1.0 200 OK")
+        ((method, path, headers, _),) = self.qdrant.requests
+        self.assertEqual((method, path), ("GET", "/collections"))
+        self.assertEqual(headers.get("api-key"), "zz-test-key")
+        self.assertNotIn("NOTE", result.stderr)
+
+    def test_without_a_key_none_is_sent(self) -> None:
+        """No key in the container: no header, nothing to explain."""
+        result = self.shell("qdrant GET /collections\n")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        ((_, _, headers, _),) = self.qdrant.requests
+        self.assertNotIn("api-key", {name.lower() for name in headers})
+        self.assertEqual(result.stderr, "")
+
+    def test_an_empty_key_is_explained(self) -> None:
+        """An empty key gets 401 for everything: the shell says so up front and with the answer."""
+        self.qdrant.status = 401
+        result = self.shell("qdrant GET /collections\n", QDRANT__SERVICE__API_KEY="")
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(result.stdout.splitlines()[0], "HTTP/1.0 401 Unauthorized")
+        ((_, _, headers, _),) = self.qdrant.requests
+        self.assertNotIn("api-key", {name.lower() for name in headers})
+        self.assertEqual(result.stderr.count("started with an empty API key"), 2)
+        self.assertEqual(result.stderr.count("NOTE: 401 because"), 1)
+        self.assertIn("without an api-key header with 401 Unauthorized", result.stderr)
+
+    def test_the_body_length_is_counted_in_bytes(self) -> None:
+        """A JSON body with non-ASCII text is sent whole."""
+        body = '{"payload":{"title":"Akten-' + chr(0xE4) + '"}}'
+        result = self.shell(f"qdrant PUT /collections/docs '{body}'\n", LC_ALL="C.UTF-8")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        ((method, _, headers, sent),) = self.qdrant.requests
+        self.assertEqual(method, "PUT")
+        self.assertEqual(sent, body.encode("utf-8"))
+        self.assertEqual(headers.get("Content-Length"), str(len(body.encode("utf-8"))))
 
 
 if __name__ == "__main__":
