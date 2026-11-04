@@ -5,8 +5,10 @@ that bypasses them leaves no trace there. Neo4j Community keeps no query log and
 Qdrant no access log, so the operator targets that open the stores directly
 (``make db-shell``, ``make qdrant-shell``), copy their data out (``make backup``)
 or write it back (``make restore-neo4j``, ``make restore-qdrant``) run through
-``scripts/audit-admin.sh``, which records them with this module. Operator guide:
-the README's "Audit trail" section.
+``scripts/audit-admin.sh``, which records them with this module; the admin
+overlay's loopback ports (``make up-admin``, closed by ``make up`` or ``make
+down``) through ``scripts/admin-ports.sh``. Operator guide: the README's "Audit
+trail" section.
 
 Every record is a chain of its own, written by a short ``docker compose exec``
 run in the ``admin-audit`` container (``AUDIT_OUTPUT=container``). It therefore
@@ -19,12 +21,13 @@ Subcommands:
     configuration, then only beats until the container stops.
 ``check``
     Exit 0 when a record could be written right now (the healthcheck).
-``begin KIND STORE [KEY=VALUE ...]``
+``begin KIND [STORE] [KEY=VALUE ...]``
     Admit an operation before it starts. Exit 2 when it needs a stated purpose
     and has none (recorded as ``denied``) or the purpose is malformed, 1 when
-    nothing can be recorded. A shell's opening is recorded here and the event's
-    id printed, for the record of its close.
-``end KIND STORE --status N [--duration-s N] [--opened EVENT_ID] [KEY=VALUE ...]``
+    nothing can be recorded. A shell's opening, and the admin ports' (kind
+    ``ports``, no store), are recorded here and the event's id printed, for the
+    record of the close.
+``end KIND [STORE] --status N [--duration-s N] [--opened EVENT_ID] [KEY=VALUE ...]``
     Record an operation that has run: ``ok`` when it exited 0, else ``error``.
 ``verify``
     Check the hash chains in audit lines read from stdin.
@@ -55,9 +58,17 @@ SERVICE: Final = "data-plane"
 DEFAULT_VERSION_FILE: Final = "/etc/data-plane/VERSION"
 STORES: Final = ("neo4j", "qdrant")
 #: Each kind of operation and the action its record has.
-KIND_ACTIONS: Final = {"shell": "admin", "backup": "disclose", "restore": "modify"}
-SHELL_OPEN: Final = "db.shell.open"
-SHELL_CLOSE: Final = "db.shell.close"
+KIND_ACTIONS: Final = {"shell": "admin", "backup": "disclose", "restore": "modify", "ports": "admin"}
+#: The kinds recorded when they open and again when they close, linked: the
+#: operations of the two events. They always need a stated purpose.
+OPENED_KINDS: Final = {
+    "shell": ("db.shell.open", "db.shell.close"),
+    "ports": ("db.ports.open", "db.ports.close"),
+}
+#: The loopback bindings docker/compose.admin.yaml publishes (make up-admin).
+ADMIN_PORTS: Final = ("127.0.0.1:7474", "127.0.0.1:7687", "127.0.0.1:6333")
+#: What ended an admin-ports window: make up, make down, or the failed opening.
+PORT_CLOSERS: Final = ("up", "down", "up-admin")
 #: Where a backup goes, as its record names the recipient.
 BACKUP_RECIPIENT: Final = "file:backup"
 #: The actions ``AUDIT_REQUIRE_PURPOSE`` may list.
@@ -146,14 +157,36 @@ def snapshot_source(text: str) -> str:
     return text
 
 
+def port_closer(text: str) -> str:
+    """Accept what ended an admin-ports window.
+
+    Args:
+        text: ``up`` (make up recreated the stores without the ports),
+            ``down`` (make down removed them) or ``up-admin`` (the opening
+            failed and published nothing).
+
+    Returns:
+        The closer.
+
+    Raises:
+        ValueError: If it is none of them.
+    """
+    if text not in PORT_CLOSERS:
+        raise ValueError("not a closer of the admin ports")
+    return text
+
+
+#: An operation, by kind and store (none for the admin ports).
+OperationKey = tuple[str, str | None]
+
 #: The parameters of an operation: given to ``begin`` and again to ``end``,
 #: and recorded as criteria on each of its events.
-PARAMETERS: Final[Mapping[tuple[str, str], Mapping[str, Parser]]] = {
+PARAMETERS: Final[Mapping[OperationKey, Mapping[str, Parser]]] = {
     ("restore", "neo4j"): {"file": file_name},
     ("restore", "qdrant"): {"collection": store_name, "snapshot": file_name},
 }
 #: The facts an operation reports for its record (``end`` only).
-FACTS: Final[Mapping[tuple[str, str], Mapping[str, Parser]]] = {
+FACTS: Final[Mapping[OperationKey, Mapping[str, Parser]]] = {
     ("backup", "neo4j"): {"file": file_name, "size_bytes": whole_number},
     ("backup", "qdrant"): {
         "collection": store_name,
@@ -163,9 +196,10 @@ FACTS: Final[Mapping[tuple[str, str], Mapping[str, Parser]]] = {
     },
     ("restore", "neo4j"): {"size_bytes": whole_number},
     ("restore", "qdrant"): {"source": snapshot_source},
+    ("ports", None): {"by": port_closer},
 }
 #: The fact that may repeat, once per object of the record's target.
-TARGET_FACTS: Final[Mapping[tuple[str, str], str]] = {("backup", "qdrant"): "collection"}
+TARGET_FACTS: Final[Mapping[OperationKey, str]] = {("backup", "qdrant"): "collection"}
 
 
 def parse_pairs(
@@ -263,33 +297,36 @@ def purpose_required(kind: str, required: frozenset[str]) -> bool:
     """Decide whether an operation needs a stated purpose.
 
     Args:
-        kind: ``shell``, ``backup`` or ``restore``.
+        kind: ``shell``, ``backup``, ``restore`` or ``ports``.
         required: The actions ``AUDIT_REQUIRE_PURPOSE`` lists.
 
     Returns:
-        Always ``True`` for a shell: a session can read and change anything.
-        Otherwise whether the action of the kind's record is listed.
+        Always ``True`` for a shell and the admin ports: both open the stores
+        to anything. Otherwise whether the action of the kind's record is listed.
     """
-    return kind == "shell" or KIND_ACTIONS[kind] in required
+    return kind in OPENED_KINDS or KIND_ACTIONS[kind] in required
 
 
-def operation_of(kind: str, store: str) -> str:
+def operation_of(kind: str, store: str | None) -> str:
     """Name the operation an operation's main record has.
 
     Args:
-        kind: ``shell``, ``backup`` or ``restore``.
-        store: ``neo4j`` or ``qdrant``.
+        kind: ``shell``, ``backup``, ``restore`` or ``ports``.
+        store: ``neo4j`` or ``qdrant``; ``None`` for the admin ports.
 
     Returns:
-        ``db.shell.open`` for a shell (whose close is ``db.shell.close``),
-        else ``backup.<store>`` or ``restore.<store>``.
+        The opening's operation for a shell or the admin ports
+        (``db.shell.open``, ``db.ports.open``; :data:`OPENED_KINDS` names their
+        closes), else ``backup.<store>`` or ``restore.<store>``.
     """
-    return SHELL_OPEN if kind == "shell" else f"{kind}.{store}"
+    if kind in OPENED_KINDS:
+        return OPENED_KINDS[kind][0]
+    return f"{kind}.{store}"
 
 
 def target_of(
     kind: str,
-    store: str,
+    store: str | None,
     parameters: Mapping[str, object],
     ids: Sequence[str] = (),
     total: int | None = None,
@@ -297,8 +334,8 @@ def target_of(
     """Name what an operation touched, by reference.
 
     Args:
-        kind: ``shell``, ``backup`` or ``restore``.
-        store: ``neo4j`` or ``qdrant``.
+        kind: ``shell``, ``backup``, ``restore`` or ``ports``.
+        store: ``neo4j`` or ``qdrant``; ``None`` for the admin ports.
         parameters: The operation's parameters.
         ids: The objects it reported: the collections a Qdrant backup covers,
             at most one event's worth.
@@ -306,11 +343,14 @@ def target_of(
             chunk of a longer list.
 
     Returns:
-        The store for a shell; Neo4j's database ``neo4j`` for a dump or load;
-        the collections snapshotted, or the one recovered, for Qdrant.
+        The store for a shell, both stores for the admin ports; Neo4j's
+        database ``neo4j`` for a dump or load; the collections snapshotted,
+        or the one recovered, for Qdrant.
     """
+    if kind == "ports":
+        return Target(kind="store", ids=list(STORES), count=len(STORES))
     if kind == "shell":
-        return Target(kind="store", ids=[store], count=1)
+        return Target(kind="store", ids=[str(store)], count=1)
     if store == "neo4j":
         return Target(kind="database", ids=["neo4j"], count=1)
     if kind == "backup":
@@ -318,19 +358,20 @@ def target_of(
     return Target(kind="collection", ids=[str(parameters["collection"])], count=1)
 
 
-def check_operation(kind: str, store: str, parameters: Mapping[str, object]) -> None:
+def check_operation(kind: str, store: str | None, parameters: Mapping[str, object]) -> None:
     """Check that an operation is known and has all its parameters.
 
     Args:
-        kind: ``shell``, ``backup`` or ``restore``.
-        store: ``neo4j`` or ``qdrant``.
+        kind: ``shell``, ``backup``, ``restore`` or ``ports``.
+        store: ``neo4j`` or ``qdrant``; ``None`` for the admin ports, which
+            open both.
         parameters: The parsed parameters.
 
     Raises:
         ValueError: If the operation is unknown or a parameter is missing.
     """
-    if kind not in KIND_ACTIONS or store not in STORES:
-        raise ValueError(f"unknown operation {kind} {store}")
+    if kind not in KIND_ACTIONS or (store is not None if kind == "ports" else store not in STORES):
+        raise ValueError(f"unknown operation {kind} {store or ''}".rstrip())
     missing = sorted(set(PARAMETERS.get((kind, store), {})) - set(parameters))
     if missing:
         raise ValueError(f"missing parameter(s): {', '.join(missing)}")
@@ -339,15 +380,17 @@ def check_operation(kind: str, store: str, parameters: Mapping[str, object]) -> 
 class Invocation:
     """What every record of one run shares: who acts, why, and on what."""
 
-    def __init__(self, environ: Mapping[str, str], kind: str, store: str, parameters: Mapping[str, object]) -> None:
+    def __init__(
+        self, environ: Mapping[str, str], kind: str, store: str | None, parameters: Mapping[str, object]
+    ) -> None:
         """Collect the shared parts of a run's records; nothing is written.
 
         Args:
             environ: The process environment: ``AUDIT_CLI_USER`` (the operator),
                 ``AUDIT_CASE_REF``/``AUDIT_REASON`` (the purpose),
                 ``AUDIT_REQUIRE_PURPOSE``, ``AUDIT_OUTPUT``.
-            kind: ``shell``, ``backup`` or ``restore``.
-            store: ``neo4j`` or ``qdrant``.
+            kind: ``shell``, ``backup``, ``restore`` or ``ports``.
+            store: ``neo4j`` or ``qdrant``; ``None`` for the admin ports.
             parameters: The operation's parameters, already parsed.
 
         Raises:
@@ -366,7 +409,7 @@ class Invocation:
         self.actor = Actor(environ.get("AUDIT_CLI_USER") or None, "cli")
 
     def criteria(self, **extra: object) -> dict[str, object]:
-        """Collect an event's criteria: the store for a shell, then the parameters.
+        """Collect an event's criteria: the store for a shell, the bindings for the admin ports, then the parameters.
 
         Args:
             **extra: More criteria.
@@ -374,7 +417,11 @@ class Invocation:
         Returns:
             The criteria.
         """
-        base: dict[str, object] = {"store": self.store} if self.kind == "shell" else {}
+        base: dict[str, object] = {}
+        if self.kind == "shell":
+            base["store"] = self.store
+        elif self.kind == "ports":
+            base["ports"] = list(ADMIN_PORTS)
         return {**base, **self.parameters, **extra}
 
     def open_stream(self) -> tuple[str, TextIO | None]:
@@ -405,22 +452,23 @@ def _refuse(message: str, code: int) -> int:
     return code
 
 
-def begin(environ: Mapping[str, str], kind: str, store: str, pairs: Sequence[str], out: TextIO) -> int:
+def begin(environ: Mapping[str, str], kind: str, store: str | None, pairs: Sequence[str], out: TextIO) -> int:
     """Admit an operation before it runs.
 
-    A shell needs a stated purpose always; a backup or restore when
-    ``AUDIT_REQUIRE_PURPOSE`` lists the action of its record. A refusal is
-    recorded as a ``denied`` event with the operation's criteria and no target.
-    A shell's opening is recorded as ``admin`` / ``db.shell.open``, and its
-    event id printed to ``out`` for :func:`end`. A backup or restore writes
+    A shell and the admin ports need a stated purpose always; a backup or
+    restore when ``AUDIT_REQUIRE_PURPOSE`` lists the action of its record. A
+    refusal is recorded as a ``denied`` event with the operation's criteria
+    and no target. A shell's opening is recorded as ``admin`` /
+    ``db.shell.open``, the admin ports' as ``admin`` / ``db.ports.open``, and
+    the event id printed to ``out`` for :func:`end`. A backup or restore writes
     nothing here: its record is written once it has run.
 
     Args:
         environ: The process environment.
-        kind: ``shell``, ``backup`` or ``restore``.
-        store: ``neo4j`` or ``qdrant``.
+        kind: ``shell``, ``backup``, ``restore`` or ``ports``.
+        store: ``neo4j`` or ``qdrant``; ``None`` for the admin ports.
         pairs: The operation's ``KEY=VALUE`` parameters.
-        out: Where the shell's event id goes.
+        out: Where the opening's event id goes.
 
     Returns:
         0 when the operation may run; 2 when it is refused (or its arguments or
@@ -439,7 +487,7 @@ def begin(environ: Mapping[str, str], kind: str, store: str, pairs: Sequence[str
     except (OSError, ValueError) as exc:
         return _refuse(f"cannot record events ({exc})", 1)
     refused = purpose_required(kind, required) and call.purpose is None
-    if kind != "shell" and not refused:
+    if kind not in OPENED_KINDS and not refused:
         if stream is not None:
             stream.close()
         return 0
@@ -470,7 +518,7 @@ def begin(environ: Mapping[str, str], kind: str, store: str, pairs: Sequence[str
 def end(
     environ: Mapping[str, str],
     kind: str,
-    store: str,
+    store: str | None,
     pairs: Sequence[str],
     *,
     status: int,
@@ -481,14 +529,14 @@ def end(
 
     Args:
         environ: The process environment.
-        kind: ``shell``, ``backup`` or ``restore``.
-        store: ``neo4j`` or ``qdrant``.
+        kind: ``shell``, ``backup``, ``restore`` or ``ports``.
+        store: ``neo4j`` or ``qdrant``; ``None`` for the admin ports.
         pairs: The operation's parameters (as given to :func:`begin`) and the
             facts it reported, as ``KEY=VALUE``.
         status: The operation's exit status; 0 is ``ok``, anything else ``error``
             (it may have run in part).
         duration_s: How long it ran.
-        opened: For a shell, the id of its ``db.shell.open`` event.
+        opened: For a shell or the admin ports, the id of the opening's event.
 
     Returns:
         0 when the record was written, 1 when it was not, 2 on bad arguments.
@@ -499,12 +547,14 @@ def end(
             raise ValueError("the status and the duration must not be negative")
         if opened is not None and _EVENT_ID.fullmatch(opened) is None:
             raise ValueError("--opened is not an event id")
-        if kind == "shell" and opened is None:
-            raise ValueError("a shell's close needs the event id of its opening (--opened)")
+        if kind in OPENED_KINDS and opened is None:
+            raise ValueError("a close needs the event id of its opening (--opened)")
         values, ids = parse_pairs(
             pairs, {**names, **FACTS.get((kind, store), {})}, repeatable=TARGET_FACTS.get((kind, store))
         )
         call = Invocation(environ, kind, store, {key: value for key, value in values.items() if key in names})
+        if kind == "ports" and "by" not in values:
+            raise ValueError(f"the admin ports' close needs by=<{'|'.join(PORT_CLOSERS)}>")
     except PurposeError as exc:
         return _refuse(f"the stated purpose is not accepted ({exc})", 2)
     except ValueError as exc:
@@ -513,7 +563,7 @@ def end(
     facts["exit_status"] = status
     if duration_s is not None:
         facts["duration_s"] = duration_s
-    operation = SHELL_CLOSE if kind == "shell" else call.operation
+    operation = OPENED_KINDS[kind][1] if kind in OPENED_KINDS else call.operation
     chunks = id_chunks(ids) or [[]]
     target = target_of(kind, store, call.parameters, chunks[0], len(ids))
     outcome = "ok" if status == 0 else "error"
@@ -689,12 +739,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     for name, help_text in (("begin", "admit an operation before it runs"), ("end", "record an operation that ran")):
         sub = commands.add_parser(name, help=help_text)
         sub.add_argument("kind", choices=sorted(KIND_ACTIONS))
-        sub.add_argument("store", choices=STORES)
+        sub.add_argument("store", nargs="?", help=f"{', '.join(STORES)}; none for ports")
         sub.add_argument("pairs", nargs="*", metavar="KEY=VALUE", help="the operation's parameters and facts")
         if name == "end":
             sub.add_argument("--status", type=int, required=True, help="the operation's exit status")
             sub.add_argument("--duration-s", type=int, help="how long it ran, in seconds")
-            sub.add_argument("--opened", help="a shell's db.shell.open event id")
+            sub.add_argument("--opened", help="the opening's event id, for a shell or the admin ports")
     args = parser.parse_args(argv)
     command: str = args.command
     if command == "serve":
@@ -706,8 +756,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     if command == "verify":
         return verify(sys.stdin, sys.stdout)
     kind: str = args.kind
-    store: str = args.store
+    store: str | None = args.store
     pairs: list[str] = args.pairs
+    if kind == "ports" and store is not None:
+        store, pairs = None, [store, *pairs]  # the admin ports have no store: it is a pair
     if command == "begin":
         return begin(os.environ, kind, store, pairs, sys.stdout)
     status: int = args.status

@@ -12,3 +12,6 @@ backup/
 
 # Python bytecode (audit/ runs as mounted source)
 __pycache__/
+
+# The open admin-ports window (scripts/admin-ports.sh), host-local state
+.admin-ports*

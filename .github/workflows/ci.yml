@@ -17,12 +17,44 @@ jobs:
   validate:
     # Pinned to an immutable commit SHA (v3.12): infra checks + make/common.mk
     # and bundle-lib drift-checks.
+    #
+    # compose-files is deliberately omitted: the reusable workflow's
+    # compose-config job stubs only NEO4J_PASSWORD and OPENAI_API_KEY, not
+    # this repo's required QDRANT_API_KEY, so it would fail `docker compose
+    # config` here. compose-config below validates the files instead.
     uses: nos-tromo/.github/.github/workflows/infra-validation.yml@44032ac756bd7700ba19fc65e141a5c2f8992416 # v3.20
     with:
-      compose-files: '-f docker/compose.yaml -f docker/compose.override.yaml -f docker/compose.admin.yaml'
-      compose-profiles: '--profile cpu --profile cuda'
       dockerfiles-glob: 'docker/Dockerfile.*'
       shell-scripts-glob: 'scripts/*.sh'
+
+  compose-config:
+    # Every file, overlay and profile combination, seeded from .env.example
+    # with a placeholder for the key it deliberately leaves empty.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: docker compose config
+        run: |
+          grep -q '^QDRANT_API_KEY=$' .env.example
+          sed 's/^QDRANT_API_KEY=$/QDRANT_API_KEY=ci-placeholder-not-a-real-key/' .env.example > .env
+          for overlay in "" docker/compose.override.yaml docker/compose.admin.yaml; do
+            for profile in cpu cuda; do
+              files=(-f docker/compose.yaml)
+              if [ -n "$overlay" ]; then files+=(-f "$overlay"); fi
+              echo "${files[*]} --profile $profile"
+              docker compose --env-file .env "${files[@]}" --profile "$profile" config --quiet
+            done
+          done
+      - name: the Qdrant key is required
+        # .env.example leaves QDRANT_API_KEY empty on purpose: a copy of it
+        # must be refused, with the hint how to generate the key.
+        run: |
+          if docker compose --env-file .env.example -f docker/compose.yaml --profile cpu config --quiet 2> refused.txt; then
+            echo "compose accepted an empty QDRANT_API_KEY" >&2
+            exit 1
+          fi
+          cat refused.txt
+          grep -q 'openssl rand -hex 32' refused.txt
 
   audit-tests:
     # admin-audit (audit/admin_audit.py) and the scripts that run it: stdlib

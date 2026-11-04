@@ -12,6 +12,7 @@ import http.server
 import io
 import json
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -29,6 +30,7 @@ from audit_event import verify_chain
 VERSION = "0.4.0"
 AUDIT_DIR = Path(__file__).resolve().parents[1]
 SCRIPTS = AUDIT_DIR.parent / "scripts"
+ADMIN_OVERLAY = AUDIT_DIR.parent / "docker" / "compose.admin.yaml"
 HAS_SCRIPTS = shutil.which("bash") is not None and (SCRIPTS / "audit-admin.sh").is_file()
 ENVELOPE = frozenset(
     {"stream", "v", "event_id", "ts", "service", "service_version", "instance", "seq", "prev_hash", "hash"}
@@ -37,6 +39,8 @@ ENVELOPE = frozenset(
 OPERATOR = {"user": "ops.example", "via": "cli"}
 PURPOSE = {"case_ref": "case-0001", "reason": "verify a reported duplicate"}
 DUMP = "neo4j-20260131T020000Z.dump"
+LOOPBACK = ["127.0.0.1:7474", "127.0.0.1:7687", "127.0.0.1:6333"]
+BOTH_STORES = {"kind": "store", "ids": ["neo4j", "qdrant"], "count": 2}
 
 
 def lines(stream: io.StringIO) -> list[dict[str, Any]]:
@@ -111,7 +115,7 @@ class Workspace(unittest.TestCase):
         self.streams.append(stream)
 
     def begin(
-        self, environ: dict[str, str], kind: str, store: str, *pairs: str
+        self, environ: dict[str, str], kind: str, store: str | None, *pairs: str
     ) -> tuple[int, str, list[dict[str, Any]]]:
         """Run ``begin``.
 
@@ -133,7 +137,7 @@ class Workspace(unittest.TestCase):
         self,
         environ: dict[str, str],
         kind: str,
-        store: str,
+        store: str | None,
         *pairs: str,
         status: int = 0,
         duration_s: int | None = 7,
@@ -238,12 +242,15 @@ class HelperTest(unittest.TestCase):
         self.assertTrue(admin_audit.purpose_required("backup", frozenset({"disclose"})))
         self.assertFalse(admin_audit.purpose_required("restore", frozenset({"query", "disclose"})))
         self.assertTrue(admin_audit.purpose_required("restore", frozenset({"modify"})))
+        self.assertTrue(admin_audit.purpose_required("ports", none))
 
     def test_operation_names(self) -> None:
         """The operations the records carry."""
         self.assertEqual(admin_audit.operation_of("shell", "neo4j"), "db.shell.open")
         self.assertEqual(admin_audit.operation_of("backup", "qdrant"), "backup.qdrant")
         self.assertEqual(admin_audit.operation_of("restore", "neo4j"), "restore.neo4j")
+        self.assertEqual(admin_audit.operation_of("ports", None), "db.ports.open")
+        self.assertEqual(admin_audit.OPENED_KINDS["ports"][1], "db.ports.close")
 
 
 class BeginTest(Workspace):
@@ -290,6 +297,31 @@ class BeginTest(Workspace):
         self.assertEqual(event["criteria"], {"store": "qdrant"})
         self.assertEqual(set(event), ENVELOPE | {"criteria"})
         self.assertIn("needs a stated purpose", self.stderr.getvalue())
+        self.assert_chains_intact()
+
+    def test_admin_ports_opening_is_recorded(self) -> None:
+        """The opening of make up-admin: both stores, the loopback bindings, the purpose."""
+        status, opened, events = self.begin(self.purposed(), "ports", None)
+        self.assertEqual(status, 0)
+        (event,) = records(events)
+        self.assertEqual(event["event_id"], opened)
+        self.assertEqual((event["action"], event["operation"], event["outcome"]), ("admin", "db.ports.open", "ok"))
+        self.assertEqual(event["actor"], OPERATOR)
+        self.assertEqual(event["purpose"], PURPOSE)
+        self.assertEqual(event["target"], BOTH_STORES)
+        self.assertEqual(event["criteria"], {"ports": LOOPBACK})
+        self.assert_chains_intact()
+
+    def test_admin_ports_always_need_a_purpose(self) -> None:
+        """Like a shell, whatever AUDIT_REQUIRE_PURPOSE says; refused with a denied event."""
+        status, opened, events = self.begin(self.environ(AUDIT_REQUIRE_PURPOSE=""), "ports", None)
+        self.assertEqual((status, opened), (2, ""))
+        (event,) = records(events)
+        self.assertEqual((event["operation"], event["outcome"]), ("db.ports.open", "denied"))
+        self.assertEqual(event["criteria"], {"ports": LOOPBACK})
+        self.assertNotIn("target", event)
+        status, _, events = self.begin(self.purposed(), "ports", "neo4j")
+        self.assertEqual((status, events), (2, []))
         self.assert_chains_intact()
 
     def test_backup_follows_require_purpose(self) -> None:
@@ -387,6 +419,26 @@ class EndTest(Workspace):
         for opened in (None, "not-an-event-id"):
             status, events = self.end(self.purposed(), "shell", "neo4j", opened=opened)
             self.assertEqual((status, events), (2, []), opened)
+
+    def test_admin_ports_close_points_at_the_opening(self) -> None:
+        """The close names what ended the window and how long it was open."""
+        _, opened, _ = self.begin(self.purposed(), "ports", None)
+        status, events = self.end(self.environ(), "ports", None, "by=up", duration_s=600, opened=opened)
+        self.assertEqual(status, 0)
+        (event,) = records(events)
+        self.assertEqual((event["action"], event["operation"], event["outcome"]), ("admin", "db.ports.close", "ok"))
+        self.assertEqual(event["parent_event_id"], opened)
+        self.assertEqual(event["target"], BOTH_STORES)
+        self.assertEqual(event["criteria"], {"ports": LOOPBACK, "by": "up", "exit_status": 0, "duration_s": 600})
+        self.assertNotIn("purpose", event)
+        self.assert_chains_intact()
+
+    def test_admin_ports_close_needs_its_opening_and_closer(self) -> None:
+        """No opening id, no or an unknown closer: exit 2, nothing written."""
+        _, opened, _ = self.begin(self.purposed(), "ports", None)
+        for pairs, opening in ((("by=up",), None), ((), opened), (("by=reboot",), opened)):
+            status, events = self.end(self.environ(), "ports", None, *pairs, opened=opening)
+            self.assertEqual((status, events), (2, []), pairs)
 
     def test_neo4j_backup_is_a_disclosure_to_file_backup(self) -> None:
         """The dump's name and size, the database, the recipient."""
@@ -604,6 +656,16 @@ class CommandLineTest(Workspace):
         self.assertEqual((status, records(events)[0]["criteria"]["size_bytes"]), (0, 10))
         self.assert_chains_intact()
 
+    def test_admin_ports_take_no_store(self) -> None:
+        """`begin ports` and `end ports ... by=up`: the first pair is not taken for a store."""
+        status, events, other = self.run_main(self.purposed(), ["begin", "ports"])
+        self.assertEqual(status, 0)
+        argv = ["end", "ports", "--status", "0", "--duration-s", "9", "--opened", other[0], "by=down"]
+        status, events, _ = self.run_main(self.environ(), argv)
+        self.assertEqual(status, 0)
+        self.assertEqual(records(events)[0]["criteria"]["by"], "down")
+        self.assert_chains_intact()
+
     def test_usage_errors_exit_2(self) -> None:
         """Unknown kinds and a missing status are usage errors."""
         for argv in (["begin", "vacuum", "neo4j"], ["end", "backup", "neo4j"]):
@@ -627,6 +689,10 @@ args = sys.argv[1:]
 with open(os.environ["FAKE_LOG"], "a", encoding="utf-8") as log:
     log.write("compose " + " ".join(args) + "\n")
 sys.stdin.read()
+if "exec" not in args:
+    if "ps" in args:
+        sys.stdout.write(os.environ.get("FAKE_PUBLISHED", ""))
+    sys.exit(0)
 rest = args[args.index("exec") + 1 :]
 env = {
     "PATH": os.environ["PATH"],
@@ -660,9 +726,8 @@ sys.exit(done.returncode)
 """
 
 
-@unittest.skipUnless(HAS_SCRIPTS, "needs bash and the repo's scripts/")
-class WrapperScriptTest(Workspace):
-    """scripts/audit-admin.sh around a command, with admin_audit.py behind a stand-in compose."""
+class ComposeStandIn(Workspace):
+    """A workspace whose `docker compose` is FAKE_COMPOSE, logging every call."""
 
     @override
     def setUp(self) -> None:
@@ -683,6 +748,22 @@ class WrapperScriptTest(Workspace):
             "FAKE_ADMIN_AUDIT": str(AUDIT_DIR / "admin_audit.py"),
             "SUDO_USER": "ops.example",
         }
+
+    def calls_and_events(self) -> tuple[list[str], list[dict[str, Any]]]:
+        """Read the stand-in's call log and the container log.
+
+        Returns:
+            The calls, in order, and the events in the container log.
+        """
+        calls = self.log.read_text(encoding="utf-8").splitlines() if self.log.exists() else []
+        text = self.container_log.read_text(encoding="utf-8") if self.container_log.exists() else ""
+        self.streams = [io.StringIO(text)]
+        return calls, lines(self.streams[0])
+
+
+@unittest.skipUnless(HAS_SCRIPTS, "needs bash and the repo's scripts/")
+class WrapperScriptTest(ComposeStandIn):
+    """scripts/audit-admin.sh around a command, with admin_audit.py behind a stand-in compose."""
 
     def run_wrapper(self, *args: str, stdin: str = "", **env: str) -> tuple[int, list[str], list[dict[str, Any]], str]:
         """Run the wrapper.
@@ -978,6 +1059,204 @@ class StoreScriptTest(unittest.TestCase):
             self.assertEqual((status, calls), (2, []), args)
 
 
+@unittest.skipUnless(ADMIN_OVERLAY.is_file(), "needs the repo's docker/")
+class AdminOverlayTest(unittest.TestCase):
+    """The bindings db.ports.open records are the admin overlay's."""
+
+    def test_recorded_bindings_match_the_overlay(self) -> None:
+        """admin_audit.ADMIN_PORTS lists exactly what docker/compose.admin.yaml publishes."""
+        published = set(re.findall(r'"(127\.0\.0\.1:\d+):\d+"', ADMIN_OVERLAY.read_text(encoding="utf-8")))
+        self.assertEqual(published, set(admin_audit.ADMIN_PORTS))
+
+
+@unittest.skipUnless(HAS_SCRIPTS, "needs bash and the repo's scripts/")
+class AdminPortsTest(ComposeStandIn):
+    """scripts/admin-ports.sh: the admin ports' window, recorded at both ends."""
+
+    @override
+    def setUp(self) -> None:
+        """Point the state file into the workspace."""
+        super().setUp()
+        self.state = self.tmp / "admin-ports-state"
+
+    def run_ports(self, *args: str, **env: str) -> tuple[int, list[str], list[dict[str, Any]], str, str]:
+        """Run the script.
+
+        Args:
+            *args: Its arguments.
+            **env: More environment, e.g. ``REASON``, ``FAKE_PUBLISHED``.
+
+        Returns:
+            The exit status, the calls in order, the events in the container
+            log, and what the script wrote to stderr and stdout.
+        """
+        result = subprocess.run(
+            ["bash", str(SCRIPTS / "admin-ports.sh"), *args],
+            env={**self.base, "ADMIN_PORTS_STATE": str(self.state), **env},
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        calls, events = self.calls_and_events()
+        return result.returncode, calls, events, result.stderr, result.stdout
+
+    def open_window(self, **env: str) -> str:
+        """Open the ports through the script, publishing nothing for real.
+
+        Args:
+            **env: More environment.
+
+        Returns:
+            The open event's id.
+        """
+        status, _, events, stderr, _ = self.run_ports(
+            "open", "--", "sh", "-c", 'echo publish >> "$FAKE_LOG"', REASON="inspect the graph schema", **env
+        )
+        self.assertEqual(status, 0, stderr)
+        return str(records(events)[-1]["event_id"])
+
+    def write_state(self, opened: str, since: int) -> None:
+        """Leave an open window behind, as an earlier make up-admin would.
+
+        Args:
+            opened: The open event's id.
+            since: When it opened, in Unix seconds.
+        """
+        self.state.write_text(f"opened={opened}\nopened_at={since}\n", encoding="utf-8")
+
+    def test_opening_is_recorded_before_anything_is_published(self) -> None:
+        """First the opening's record, then the command; the window is kept, private to the operator."""
+        opened = self.open_window()
+        calls, events = self.calls_and_events()
+        self.assertTrue(calls[0].endswith("admin_audit.py begin ports"), calls[0])
+        self.assertEqual(calls[1], "publish")
+        (event,) = records(events)
+        self.assertEqual((event["operation"], event["outcome"], event["event_id"]), ("db.ports.open", "ok", opened))
+        self.assertEqual(event["purpose"], {"reason": "inspect the graph schema"})
+        self.assertEqual(event["actor"], OPERATOR)
+        self.assertRegex(self.state.read_text(encoding="utf-8"), rf"\Aopened={opened}\nopened_at=\d+\n\Z")
+        self.assertEqual(self.state.stat().st_mode & 0o777, 0o600)
+        self.assert_chains_intact()
+
+    def test_nothing_is_published_without_a_purpose(self) -> None:
+        """No CASE_REF/REASON: refused, recorded as denied, no window."""
+        status, calls, events, stderr, _ = self.run_ports("open", "--", "sh", "-c", 'echo publish >> "$FAKE_LOG"')
+        self.assertEqual(status, 2)
+        self.assertNotIn("publish", calls)
+        self.assertFalse(self.state.exists())
+        (event,) = records(events)
+        self.assertEqual((event["operation"], event["outcome"]), ("db.ports.open", "denied"))
+        self.assertIn("needs a stated purpose", stderr)
+        self.assert_chains_intact()
+
+    def test_nothing_is_published_while_admin_audit_cannot_record(self) -> None:
+        """admin-audit down: exit 1, no window."""
+        status, calls, _, stderr, _ = self.run_ports(
+            "open", "--", "sh", "-c", 'echo publish >> "$FAKE_LOG"', REASON="inspect", FAKE_DOWN="1"
+        )
+        self.assertEqual(status, 1)
+        self.assertNotIn("publish", calls)
+        self.assertFalse(self.state.exists())
+        self.assertIn("No port was published", stderr)
+
+    def test_a_second_window_is_refused(self) -> None:
+        """While one window is open, make up-admin does nothing."""
+        self.write_state("01a1a557-d62a-71a3-b278-0d559f15c636", 1_800_000_000)
+        status, calls, _, stderr, _ = self.run_ports("open", "--", "true", REASON="inspect")
+        self.assertEqual((status, calls), (2, []))
+        self.assertIn("already open", stderr)
+
+    def test_a_failed_opening_that_published_nothing_is_closed_at_once(self) -> None:
+        """The command failed and no port is published: the close follows, as error."""
+        status, _, events, _, _ = self.run_ports("open", "--", "sh", "-c", "exit 3", REASON="inspect")
+        self.assertEqual(status, 3)
+        opening, close = records(events)
+        self.assertEqual((close["operation"], close["outcome"]), ("db.ports.close", "error"))
+        self.assertEqual(close["parent_event_id"], opening["event_id"])
+        self.assertEqual((close["criteria"]["by"], close["criteria"]["exit_status"]), ("up-admin", 3))
+        self.assertFalse(self.state.exists())
+        self.assert_chains_intact()
+
+    def test_a_failed_opening_with_ports_up_stays_open(self) -> None:
+        """Some port is published after all: the window stays for make up to close."""
+        status, _, events, _, _ = self.run_ports(
+            "open", "--", "sh", "-c", "exit 3", REASON="inspect", FAKE_PUBLISHED="127.0.0.1:7474 \n"
+        )
+        self.assertEqual(status, 3)
+        self.assertEqual([event["operation"] for event in records(events)], ["db.ports.open"])
+        self.assertTrue(self.state.exists())
+
+    def test_make_up_closes_the_window(self) -> None:
+        """Closing by make up: linked to the opening, with the window's length; the state goes."""
+        opened = self.open_window()
+        since = int(time.time()) - 90
+        self.write_state(opened, since)
+        status, calls, events, _, _ = self.run_ports("close", "up", SUDO_USER="ops2.example")
+        self.assertEqual(status, 0)
+        self.assertIn(" end ports --status 0 --duration-s ", calls[-1])
+        close = records(events)[-1]
+        self.assertEqual(
+            (close["operation"], close["outcome"], close["parent_event_id"]), ("db.ports.close", "ok", opened)
+        )
+        self.assertEqual(close["actor"], {"user": "ops2.example", "via": "cli"})
+        self.assertEqual(close["criteria"]["by"], "up")
+        self.assertGreaterEqual(close["criteria"]["duration_s"], 90)
+        self.assertLess(close["criteria"]["duration_s"], 120)
+        self.assertFalse(self.state.exists())
+        self.assert_chains_intact()
+
+    def test_make_down_closes_it_too(self) -> None:
+        """Closing by make down records `down` as what ended the window."""
+        self.open_window()
+        status, _, events, _, _ = self.run_ports("close", "down")
+        self.assertEqual(status, 0)
+        self.assertEqual(records(events)[-1]["criteria"]["by"], "down")
+        self.assertFalse(self.state.exists())
+        self.assert_chains_intact()
+
+    def test_no_window_nothing_to_close(self) -> None:
+        """Without a state file close does nothing at all."""
+        status, calls, _, _, _ = self.run_ports("close", "up")
+        self.assertEqual((status, calls), (0, []))
+
+    def test_an_unrecorded_close_keeps_the_window(self) -> None:
+        """The close could not be written: exit 1, the state stays for the next make up."""
+        self.open_window()
+        status, _, _, stderr, _ = self.run_ports("close", "up", FAKE_FAIL="end")
+        self.assertEqual(status, 1)
+        self.assertTrue(self.state.exists())
+        self.assertIn("could not be recorded", stderr)
+
+    def test_status(self) -> None:
+        """The line make health prints: closed, open, open without a record, or a close still owed."""
+        published = "127.0.0.1:7474 127.0.0.1:7687 \n127.0.0.1:6333 \n"
+        self.assertEqual(self.run_ports("status")[4], "admin ports: closed\n")
+        self.assertIn("without an open record", self.run_ports("status", FAKE_PUBLISHED=published)[4])
+        self.write_state("01a1a557-d62a-71a3-b278-0d559f15c636", 1_800_000_000)
+        out = self.run_ports("status", FAKE_PUBLISHED=published)[4]
+        self.assertEqual(
+            out,
+            "admin ports: OPEN since 2027-01-15T08:00:00Z (127.0.0.1:6333 127.0.0.1:7474 127.0.0.1:7687); "
+            "make up closes them\n",
+        )
+        self.assertIn("no close record yet", self.run_ports("status")[4])
+
+    def test_a_damaged_state_is_refused(self) -> None:
+        """A state file that is not one: neither open nor close guesses."""
+        self.state.write_text("opened=somewhere\n", encoding="utf-8")
+        for args in (("open", "--", "true"), ("close", "up")):
+            status, calls, _, stderr, _ = self.run_ports(*args, REASON="inspect")
+            self.assertEqual((status, calls), (2, []), args)
+            self.assertIn("damaged", stderr)
+
+    def test_usage(self) -> None:
+        """Wrong arguments: exit 2, nothing called."""
+        for args in (("open",), ("open", "--"), ("open", "true"), ("close",), ("close", "sideways"), ("bogus",)):
+            status, calls, _, _, _ = self.run_ports(*args)
+            self.assertEqual((status, calls), (2, []), args)
+
+
 class FakeQdrant:
     """A stand-in for Qdrant's HTTP API: answers with a set status, keeps each request."""
 
@@ -1076,16 +1355,22 @@ class QdrantApiTest(unittest.TestCase):
         self.assertEqual(result.stderr, "")
 
     def test_an_empty_key_is_explained(self) -> None:
-        """An empty key gets 401 for everything: the shell says so up front and with the answer."""
+        """A Qdrant with an empty key refuses the request: the 401 comes with how to fix it."""
         self.qdrant.status = 401
         result = self.shell("qdrant GET /collections\n", QDRANT__SERVICE__API_KEY="")
         self.assertEqual(result.returncode, 1)
         self.assertEqual(result.stdout.splitlines()[0], "HTTP/1.0 401 Unauthorized")
         ((_, _, headers, _),) = self.qdrant.requests
         self.assertNotIn("api-key", {name.lower() for name in headers})
-        self.assertEqual(result.stderr.count("started with an empty API key"), 2)
-        self.assertEqual(result.stderr.count("NOTE: 401 because"), 1)
-        self.assertIn("without an api-key header with 401 Unauthorized", result.stderr)
+        note = "NOTE: 401: this Qdrant has no API key to send. Set QDRANT_API_KEY in .env and run make up again.\n"
+        self.assertEqual(result.stderr, note)
+
+    def test_a_refusal_with_a_key_has_no_note(self) -> None:
+        """A 401 although the key was sent is not about the key's absence."""
+        self.qdrant.status = 401
+        result = self.shell("qdrant GET /collections\n", QDRANT__SERVICE__API_KEY="zz-test-key")
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(result.stderr, "")
 
     def test_the_body_length_is_counted_in_bytes(self) -> None:
         """A JSON body with non-ASCII text is sent whole."""

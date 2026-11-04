@@ -77,9 +77,9 @@ deploy and bring the schema forward if needed.
 
 Validate after restore: run `MATCH (n) RETURN count(n);` in
 `make db-shell REASON="validate restore"` (recorded), or in the Neo4j Browser
-(dev: `make up-dev`; production: `make up-admin` + SSH tunnel, see README
-§ Admin access), and spot-check entity counts against the record kept at
-backup time.
+(dev: `make up-dev`; production: `make up-admin REASON="validate restore"`
++ SSH tunnel, recorded, see README § Admin access; `make up` closes the ports
+again), and spot-check entity counts against the record kept at backup time.
 
 ### Cadence
 
@@ -119,15 +119,15 @@ loudly), use the API from the host instead while `make up-dev` is active
 (not recorded: record it by other means):
 
 ```bash
-curl -X POST http://localhost:6333/collections/<collection>/snapshots
+curl -X POST -H 'api-key: <QDRANT_API_KEY>' http://localhost:6333/collections/<collection>/snapshots
 ```
 
-With `QDRANT_API_KEY` set in `.env`, `make backup-qdrant` keeps working
-unchanged — the script runs inside the container and reads the server's own
-key from its environment, where compose passes it as
-`QDRANT__SERVICE__API_KEY`. Every host-side call above needs the header added
-instead, `-H 'api-key: <value>'`, including the `curl` fallback and anything
-you run over the admin SSH tunnel.
+`make backup-qdrant` needs no key on the command line: the script runs
+inside the container and reads the server's own key (`QDRANT_API_KEY` in
+`.env`, required) from its environment, where compose passes it as
+`QDRANT__SERVICE__API_KEY`. Every host-side call needs the header,
+`-H 'api-key: <value>'`, as in the `curl` fallback above and anything you run
+over the admin SSH tunnel.
 
 ### Restore
 
