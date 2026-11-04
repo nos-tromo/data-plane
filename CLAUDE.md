@@ -30,7 +30,7 @@ The **state tier** of the nos-tromo federation: a Docker Compose project that ow
 - **Qdrant** (1.18, `cpu`/`cuda` profile variants) — vector store for docint
 - **admin-audit** (stdlib Python on the pinned python image) — records direct database access, backups and restores in the data-protection audit trail (README § Audit trail)
 
-No application code and no Python venv. The whole repo is a `Makefile`, a `VERSION` file, three compose files under `docker/`, admin-audit's stdlib Python under `audit/` (`admin_audit.py`, the two audit modules vendored from `nos-tromo/.github`, and a `unittest` suite), the shell scripts under `scripts/` (the airgap bundler and its vendored `bundle-lib.sh`; `audit-admin.sh`, which records an operation through admin-audit; `neo4j_admin.sh` and `qdrant_admin.sh`, the operator commands it wraps; `qdrant_api.sh` and `qdrant_snapshot.sh`, which run inside the Qdrant container), a backup runbook under `backup/`, and CI under `.github/`. For how this tier slots into the wider workspace (inference vs state vs apps, the three external network seams `inference-net` / `data-net` / `edge-net`, bring-up order), see the parent `../CLAUDE.md`.
+No application code and no Python venv. The whole repo is a `Makefile`, a `VERSION` file, three compose files under `docker/`, admin-audit's stdlib Python under `audit/` (`admin_audit.py`, the two audit modules vendored from `nos-tromo/.github`, and a `unittest` suite), the shell scripts under `scripts/` (the airgap bundler and its vendored `bundle-lib.sh`; `audit-admin.sh`, which records an operation through admin-audit; `admin-ports.sh`, which opens and closes the admin overlay's ports, recorded; `neo4j_admin.sh` and `qdrant_admin.sh`, the operator commands `audit-admin.sh` wraps; `qdrant_api.sh` and `qdrant_snapshot.sh`, which run inside the Qdrant container), a backup runbook under `backup/`, and CI under `.github/`. For how this tier slots into the wider workspace (inference vs state vs apps, the three external network seams `inference-net` / `data-net` / `edge-net`, bring-up order), see the parent `../CLAUDE.md`.
 
 ## Common commands
 
@@ -39,10 +39,10 @@ No application code and no Python venv. The whole repo is a `Makefile`, a `VERSI
 ```bash
 make network                  # create external data-net (idempotent; required once per host)
 make volumes                  # create external data volumes (idempotent; required once per host)
-make up                       # production shape — services on data-net only, NO host ports
+make up                       # production shape — services on data-net only, NO host ports; closes an open admin-ports window (recorded)
 make up-dev                   # layers docker/compose.override.yaml — publishes 7474/7687/6333/6334
-make up-admin                 # layers docker/compose.admin.yaml — binds 7474/7687/6333 to 127.0.0.1 only (SSH tunnel)
-make down                     # stop; volumes preserved
+make up-admin REASON="..."    # layers docker/compose.admin.yaml — 127.0.0.1:7474/7687/6333 on demand (SSH tunnel); needs a purpose, recorded
+make down                     # stop; volumes preserved; closes an open admin-ports window (recorded)
 make restart                  # down + up
 
 make ps / make health         # service state / state + uptime, and whether admin-audit can record
@@ -80,7 +80,7 @@ App compose files (`chorus/`, `docint/`) declare zero data-plane volumes, so the
 
 `docker/compose.override.yaml` is the dev overlay that publishes 7474/7687/6333/6334. **It is not auto-loaded** — it lives under `docker/` (not at the project root, where compose would pick it up implicitly), and the Makefile passes explicit `-f` flags. Only `make up-dev` layers it. The placement is intentional: in airgap production the host must not expose data-plane ports, and an override file at the default location would breach that boundary on a plain `compose up`.
 
-`docker/compose.admin.yaml` is the only other port-publishing file. It binds 7474/7687/6333 to `127.0.0.1` only, is likewise not auto-loaded (`make up-admin`), and exists because edge-plane deliberately does not route the Neo4j Browser or Qdrant dashboard — admins reach them over an SSH tunnel to those loopback ports (README § Admin access).
+`docker/compose.admin.yaml` is the only other port-publishing file. It binds 7474/7687/6333 to `127.0.0.1` only, is likewise not auto-loaded (`make up-admin`), and exists because edge-plane deliberately does not route the Neo4j Browser or Qdrant dashboard — admins reach them over an SSH tunnel to those loopback ports (README § Admin access). It is layered **on demand only**: production runs plain `make up` (deploy's bring-up too), and `make up-admin` needs a stated purpose and is recorded (invariant 4). `admin_audit.ADMIN_PORTS` lists its bindings for the record; a test keeps the two in step.
 
 ### 3. Airgap-first; no runtime fetches
 
@@ -96,6 +96,7 @@ Neo4j Community keeps no query log and Qdrant no access log, so the make targets
 - **Purpose rules.** The shells always need one. Backups (`disclose`) and restores (`modify`) follow admin-audit's `AUDIT_REQUIRE_PURPOSE`, whose compose default is `${AUDIT_REQUIRE_PURPOSE-query,disclose}` — deliberately without the colon: `:-` would substitute the default for an explicit empty value too, so `AUDIT_REQUIRE_PURPOSE=` could not turn the requirement off. An unknown action fails admin-audit closed.
 - **The audit calls read no stdin** (`</dev/null`): `docker compose exec` forwards stdin and would swallow a piped session's input. The purpose reaches them through valueless `-e` variables, never on a command line.
 - **Only names and counts are recorded** — file names (never paths: a path can name a user), collection names, sizes, durations — never session content, file contents or credentials. `admin_audit.py` checks every key and value it accepts per operation.
+- **The admin ports are a window, recorded at both ends** (`scripts/admin-ports.sh`). `make up-admin` writes `admin` / `db.ports.open` (`admin_audit.py begin ports`, no store; a purpose always required) before the overlay publishes anything, and refuses while that cannot be written or a window is already open. The open event's id and Unix time go to `.admin-ports` (gitignored, `0600`, `ADMIN_PORTS_STATE` overrides the path) — the only way to carry them to the close, which runs in a later make invocation. `make up` (after recreating the stores without ports) and `make down` (before removing them, never blocking the stop) write `admin` / `db.ports.close` with `parent_event_id` = the open event, `duration_s` from the stored time and `by=up|down`, then remove the file; a failed opening that published nothing closes at once with `by=up-admin`. When the close cannot be written the file stays, and the next `make up` records it (its duration then runs to that later close: an overstatement, never an understatement). `make health` reports from the containers' actual bindings, so ports published by hand show as open without an open record. The purpose is not stored: the close links to the opening instead.
 - `audit/audit_event.py` and `audit/audit_runtime.py` are byte-identical copies of the hub's `configs/audit/`, checked by its `validate_audit_lib.py`: never edit them, never let a formatter touch them; re-vendor instead. `admin_audit.py` and its tests are clean under the hub's strict ruff (`configs/python-strict/ruff.toml`, pinned version) and strict pyrefly.
 
 ### 5. `data-net` is external and shared across compose projects

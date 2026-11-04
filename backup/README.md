@@ -77,9 +77,9 @@ deploy and bring the schema forward if needed.
 
 Validate after restore: run `MATCH (n) RETURN count(n);` in
 `make db-shell REASON="validate restore"` (recorded), or in the Neo4j Browser
-(dev: `make up-dev`; production: `make up-admin` + SSH tunnel, see README
-§ Admin access), and spot-check entity counts against the record kept at
-backup time.
+(dev: `make up-dev`; production: `make up-admin REASON="validate restore"`
++ SSH tunnel, recorded, see README § Admin access; `make up` closes the ports
+again), and spot-check entity counts against the record kept at backup time.
 
 ### Cadence
 

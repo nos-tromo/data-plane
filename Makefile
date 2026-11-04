@@ -40,6 +40,10 @@ BACKUP_DIR     ?= ./backup/snapshots
 # sudo user, else the login user, e.g.
 #   make db-shell CASE_REF=case-0001 REASON="verify a reported duplicate"
 AUDITED = COMPOSE='$(COMPOSE)' PROFILE='$(PROFILE)' BACKUP_DIR='$(BACKUP_DIR)' ./scripts/audit-admin.sh
+# The admin overlay's loopback ports open only on demand, and both their
+# opening and their close are recorded (scripts/admin-ports.sh, README: Admin
+# access). The open window is kept in .admin-ports between the two.
+PORTS = COMPOSE='$(COMPOSE)' ./scripts/admin-ports.sh
 
 .PHONY: help network volumes pull bundle up up-dev up-admin stop down restart logs ps \
         health nuke db-shell qdrant-shell backup backup-neo4j backup-qdrant restore-neo4j restore-qdrant
@@ -52,9 +56,10 @@ help:
 	@echo "  make volumes         create the external data volumes if missing"
 	@echo "  make pull            pull all images from the registry"
 	@echo "  make bundle          save images as a versioned airgap tarball ($(PROFILE))"
-	@echo "  make up              start neo4j + qdrant ($(PROFILE) profile) + admin-audit"
+	@echo "  make up              start neo4j + qdrant ($(PROFILE) profile) + admin-audit; closes the admin ports"
 	@echo "  make up-dev          like 'up', but publishes ports on the host"
-	@echo "  make up-admin        like 'up', but binds 7474/7687/6333 to 127.0.0.1 for SSH-tunnelled admin access"
+	@echo "  make up-admin        like 'up', plus 127.0.0.1:7474/7687/6333 for SSH-tunnelled dashboards;"
+	@echo "                       needs CASE_REF= or REASON=, recorded until make up (or down) closes them"
 	@echo "  make stop            stop containers (keep them)"
 	@echo "  make down            stop + remove containers (volumes preserved)"
 	@echo "  make restart         down + up"
@@ -62,7 +67,7 @@ help:
 	@echo
 	@echo "Observability:"
 	@echo "  make ps              service status"
-	@echo "  make health          show health + uptime of each service; admin-audit can record"
+	@echo "  make health          show health + uptime of each service, the admin ports; admin-audit can record"
 	@echo "  make logs S=neo4j  tail logs for one service"
 	@echo
 	@echo "Direct access (recorded in the audit trail; always needs CASE_REF= or REASON=):"
@@ -98,22 +103,31 @@ pull:
 bundle:
 	./scripts/bundle_images.sh $(PROFILE)
 
+# Production shape. Recreating the stores without the admin ports ends an
+# open admin-ports window, which is then recorded as closed.
 up: network volumes
 	$(COMPOSE) $(PROFILE_FLAG) up --no-build -d
+	@$(PORTS) close up
 
 up-dev: network volumes
 	$(COMPOSE_DEV) $(PROFILE_FLAG) up --no-build -d
 
 # Loopback-only dashboard ports for SSH-tunnelled admin access (see
-# docker/compose.admin.yaml). A later plain `make up` recreates the
-# containers without the ports — brief restart, volumes untouched.
+# docker/compose.admin.yaml), on demand: always needs a stated purpose, and
+# admin / db.ports.open is recorded before anything is published. A later
+# plain `make up` recreates the containers without the ports (brief restart,
+# volumes untouched) and records the close.
 up-admin: network volumes
-	$(COMPOSE_ADMIN) $(PROFILE_FLAG) up --no-build -d
+	@$(PORTS) open -- $(COMPOSE_ADMIN) $(PROFILE_FLAG) up --no-build -d
 
 stop:
 	$(COMPOSE) $(PROFILE_FLAG) stop
 
+# An open admin-ports window ends with the containers: its close is recorded
+# first, while admin-audit still runs. That never holds up the stop; if it
+# cannot be recorded, the next make up records it.
 down:
+	-@$(PORTS) close down
 	$(COMPOSE) $(PROFILE_FLAG) down
 
 restart: down up
@@ -138,6 +152,7 @@ ps:
 health:
 	@$(COMPOSE) $(PROFILE_FLAG) ps --format '{{.Name}}\t{{.State}}\t{{.Status}}'
 	@echo
+	@$(PORTS) status
 	@$(COMPOSE) exec -T admin-audit python /app/admin_audit.py check && echo "admin-audit: can record"
 
 logs:

@@ -39,7 +39,7 @@ make volumes                  # create the external data volumes (idempotent)
 make up                       # start with the CPU Qdrant profile (default), plus admin-audit
 make up PROFILE=cuda          # GPU profile
 make up-dev                   # publish ports on the host (Neo4j Browser, Qdrant UI)
-make up-admin                 # production + loopback-only dashboard ports (see Admin access)
+make up-admin REASON="..."    # production + loopback-only dashboard ports, recorded (see Admin access)
 ```
 
 `make network` creates the external `data-net` if it does not exist; the
@@ -64,17 +64,29 @@ Production shape publishes no ports, and the edge-plane gateway deliberately
 does not route Neo4j Browser or the Qdrant dashboard (see
 [`../edge-plane/README.md`](../edge-plane/README.md), "What is deliberately
 NOT routed") — the SSH tunnel is their access model. `make up-admin` gives
-that tunnel a target: it layers `docker/compose.admin.yaml`, which binds
-7474/7687 (Neo4j http + bolt) and 6333 (Qdrant http) to `127.0.0.1` only.
-Nothing becomes reachable from the network.
+that tunnel a target, on demand: it layers `docker/compose.admin.yaml`, which
+binds 7474/7687 (Neo4j http + bolt) and 6333 (Qdrant http) to `127.0.0.1`
+only. Nothing becomes reachable from the network. Production runs plain
+`make up` (deploy's bring-up too); the ports are open only between a
+`make up-admin` and the next `make up` or `make down`.
 
 ```bash
-make up-admin                 # on the host
+make up-admin CASE_REF=case-0001 REASON="inspect the graph schema"   # on the host
 ssh -L 7474:localhost:7474 -L 7687:localhost:7687 -L 6333:localhost:6333 <host>   # from your machine
 # Neo4j Browser:    http://localhost:7474   (connects to bolt://localhost:7687)
 # Qdrant dashboard: http://localhost:6333/dashboard
 make up                       # drop the loopback ports again (brief container restart)
 ```
+
+Opening the ports always needs `CASE_REF=` or `REASON=`, and is recorded
+before anything is published (`admin` / `db.ports.open`; refused while that
+cannot be written, or while a window is already open). Closing them — `make
+up`, or `make down` — records `admin` / `db.ports.close`, linked to the
+opening, with how long the ports were open ([Audit trail](#audit-trail)). Between
+the two, the open window is kept in `.admin-ports`, a host-local file only
+the operator can read. `make health` says whether the ports are open, and
+since when. `make stop` does not close them (a start brings them back), and
+`make nuke` does not record the close; the next `make up` does.
 
 Neo4j Browser always asks for the `NEO4J_USER` / `NEO4J_PASSWORD` login, and
 the Qdrant dashboard for the `QDRANT_API_KEY` from `.env`. Every Qdrant API
@@ -82,16 +94,16 @@ call needs that key as the `api-key` header — docint's, and yours over the
 tunnel; `make backup-qdrant`, `make qdrant-shell` and `make restore-qdrant`
 send the server's own key themselves.
 
-**Not recorded.** What is done over these ports bypasses the audit trail:
-neither store logs it, and admin-audit only sees the make targets. For access
-that is recorded, use `make db-shell` / `make qdrant-shell` ([Audit
-trail](#audit-trail)).
+**What is done over these ports is not recorded**, only that they were open,
+by whom, why and for how long: neither store logs it, and admin-audit only
+sees the make targets. For access that is recorded session by session, use
+`make db-shell` / `make qdrant-shell` ([Audit trail](#audit-trail)).
 
 ## Operating
 
 ```bash
 make ps                       # service state
-make health                   # health + uptime; fails while admin-audit cannot record
+make health                   # health + uptime, the admin ports; fails while admin-audit cannot record
 make logs S=neo4j             # tail logs for one service
 make db-shell REASON="..."    # cypher-shell on Neo4j — recorded, needs a purpose
 make qdrant-shell REASON="..." # shell with Qdrant's HTTP API — recorded, needs a purpose
@@ -157,7 +169,9 @@ source obs-plane's verifier binds data-plane's chains to: the emitter
 `data-plane/admin-audit`. The compose service is therefore named exactly
 `admin-audit`.
 
-The make targets run their operation through `scripts/audit-admin.sh`:
+The make targets run their operation through `scripts/audit-admin.sh` (the
+admin ports through `scripts/admin-ports.sh`, which records their opening
+and close the same way, [Admin access](#admin-access-production)):
 
 1. It asks admin-audit to admit the operation. It refuses with exit 2 when a
    purpose is required and none is stated (the refusal is recorded as
@@ -177,6 +191,7 @@ loudly: record it by other means.
 |---|---|---|---|---|
 | `make db-shell` | `admin` / `db.shell.open`, then `db.shell.close` | open before the session, close after it (its `parent_event_id` is the open) | `store`: `neo4j` | always required |
 | `make qdrant-shell` | `admin` / `db.shell.open`, then `db.shell.close` | as above | `store`: `qdrant` | always required |
+| `make up-admin`, then `make up` or `make down` | `admin` / `db.ports.open`, then `db.ports.close` | open before the ports are published, close when `make up` has removed them or before `make down` does (its `parent_event_id` is the open) | `store`: `neo4j`, `qdrant` | always required (for the opening) |
 | `make backup-neo4j`, `make backup` | `disclose` / `backup.neo4j`, `recipient: file:backup` | after the dump | `database`: `neo4j` | when `AUDIT_REQUIRE_PURPOSE` lists `disclose` (the default) |
 | `make backup-qdrant`, `make backup` | `disclose` / `backup.qdrant`, `recipient: file:backup` | after the snapshots | `collection`: each one snapshotted; beyond 200, `backup.qdrant.ids` events continue the list | as above |
 | `make restore-neo4j DUMP=…` | `modify` / `restore.neo4j` | after the load | `database`: `neo4j` | when it lists `modify` (not by default) |
@@ -190,6 +205,8 @@ stated. The `criteria`:
 |---|---|
 | `db.shell.open` | `store` |
 | `db.shell.close` | `store`, `exit_status`, `duration_s` |
+| `db.ports.open` | `ports` (the loopback bindings) |
+| `db.ports.close` | `ports`, `by` (`up`, `down`, or `up-admin` when the opening failed and published nothing), `exit_status`, `duration_s` (how long they were open) |
 | `backup.neo4j` | `file` (the dump's name), `size_bytes`, `exit_status`, `duration_s` |
 | `backup.qdrant` | `snapshots`, `size_bytes` (their total, as Qdrant reports it), `failed` (collections not snapshotted), `exit_status`, `duration_s` |
 | `restore.neo4j` | `file`, `size_bytes`, `exit_status`, `duration_s` |
@@ -215,22 +232,23 @@ recipe's environment, quotes included (a `$` is expanded by make).
 whose records need a stated purpose. Unset, it is `query,disclose`: backups
 need one, restores do not. `AUDIT_REQUIRE_PURPOSE=` (empty) requires none;
 `query,disclose,modify` requires one for restores too. The shells need one
-whatever it says. An unknown action stops admin-audit, and every target
-refuses until it is fixed: a typo never switches the requirement off.
+whatever it says, and so does opening the admin ports. An unknown action
+stops admin-audit, and every target refuses until it is fixed: a typo never
+switches the requirement off.
 
 ### What it does not cover
 
 The records cover the make targets. Whoever can use the Docker daemon can
-reach the stores without them: `docker exec`, and the loopback ports of
-`make up-admin` (the Neo4j Browser and the Qdrant dashboard over the SSH
-tunnel, [Admin access](#admin-access-production)). That access is
-root-equivalent and is the host's to audit. Inside a shell session, nothing
-the session does is recorded; its opening and close are.
+reach the stores without them (`docker exec`, or publishing ports by hand,
+which `make health` then reports as open without an open record). That
+access is root-equivalent and is the host's to audit. Inside a shell session,
+nothing the session does is recorded, nor what is done over the admin ports
+while they are open; their opening and close are.
 
 ### Checking it
 
 ```bash
-make health                     # ends with "admin-audit: can record"
+make health                     # the admin ports' state, then "admin-audit: can record"
 make logs S=admin-audit         # the events (stdout) and operational messages (stderr)
 docker compose --env-file .env -f docker/compose.yaml logs --no-log-prefix admin-audit \
   | docker compose --env-file .env -f docker/compose.yaml exec -T admin-audit python /app/admin_audit.py verify
@@ -252,6 +270,7 @@ data-plane/
     tests/                unittest suite (synthetic data)
   scripts/
     audit-admin.sh        runs an operation and records it through admin-audit
+    admin-ports.sh        opens and closes the admin overlay's ports, recorded
     neo4j_admin.sh        cypher-shell session, offline dump and load
     qdrant_admin.sh       API shell, snapshot of every collection, recovery of one
     qdrant_api.sh         Qdrant's HTTP API over /dev/tcp, run inside the container
