@@ -28,8 +28,9 @@ The **state tier** of the nos-tromo federation: a Docker Compose project that ow
 
 - **Neo4j** (community 5.x) — graph + native vector index for chorus
 - **Qdrant** (1.18, `cpu`/`cuda` profile variants) — vector store for docint
+- **admin-audit** (stdlib Python on the pinned python image) — records direct database access, backups and restores in the data-protection audit trail (README § Audit trail)
 
-No application code. No Python venv, no test suite, no linter. The whole repo is a `Makefile`, a `VERSION` file, two compose files under `docker/`, three shell scripts under `scripts/` (the airgap bundler, its vendored `bundle-lib.sh`, and `qdrant_snapshot.sh`), a backup runbook under `backup/`, and CI under `.github/`. For how this tier slots into the wider workspace (inference vs state vs apps, the three external network seams `inference-net` / `data-net` / `edge-net`, bring-up order), see the parent `../CLAUDE.md`.
+No application code and no Python venv. The whole repo is a `Makefile`, a `VERSION` file, three compose files under `docker/`, admin-audit's stdlib Python under `audit/` (`admin_audit.py`, the two audit modules vendored from `nos-tromo/.github`, and a `unittest` suite), the shell scripts under `scripts/` (the airgap bundler and its vendored `bundle-lib.sh`; `audit-admin.sh`, which records an operation through admin-audit; `neo4j_admin.sh` and `qdrant_admin.sh`, the operator commands it wraps; `qdrant_api.sh` and `qdrant_snapshot.sh`, which run inside the Qdrant container), a backup runbook under `backup/`, and CI under `.github/`. For how this tier slots into the wider workspace (inference vs state vs apps, the three external network seams `inference-net` / `data-net` / `edge-net`, bring-up order), see the parent `../CLAUDE.md`.
 
 ## Common commands
 
@@ -44,16 +45,23 @@ make up-admin                 # layers docker/compose.admin.yaml — binds 7474/
 make down                     # stop; volumes preserved
 make restart                  # down + up
 
-make ps / make health         # service state / state + uptime
+make ps / make health         # service state / state + uptime, and whether admin-audit can record
 make logs                     # tail all
 make logs S=neo4j             # tail one service
+
+make db-shell CASE_REF=case-0001 REASON="..."   # cypher-shell on Neo4j — recorded; always needs a purpose
+make qdrant-shell REASON="..."                  # bash with `qdrant METHOD /path [JSON]` — recorded; always needs a purpose
 
 make pull                     # pull images for BOTH profiles (cpu + cuda)
 make bundle                   # airgap tarball from the latest release tag (current PROFILE)
 
-make backup                   # neo4j (offline dump) + qdrant (online snapshot)
+make backup REASON="..."      # neo4j (offline dump) + qdrant (online snapshot) — recorded; purpose needed by default
 make backup-neo4j             # neo4j only — briefly STOPS the service
 make backup-qdrant            # qdrant only — online, no downtime
+make restore-neo4j DUMP=<file>                     # REPLACE the neo4j database from a dump in backup/snapshots (asks)
+make restore-qdrant COLLECTION=<c> SNAPSHOT=<file> # REPLACE one collection from a snapshot (asks)
+
+python3 -m unittest discover -s audit/tests -t audit   # admin-audit and its scripts (synthetic data)
 
 make nuke                     # DESTROY all volumes (interactive: type 'nuke' to confirm)
 ```
@@ -76,28 +84,40 @@ App compose files (`chorus/`, `docint/`) declare zero data-plane volumes, so the
 
 ### 3. Airgap-first; no runtime fetches
 
-- Both service images are **digest-pinned** in `compose.yaml`. Do not bump versions without also updating the digest.
+- Every image is **digest-pinned** in `compose.yaml` — the two databases' and the python image admin-audit runs on (the same pin as edge-plane's auth-audit). Do not bump versions without also updating the digest.
 - `NEO4J_PLUGINS` is empty in `.env.example` by design — populating it makes Neo4j pull plugin jars from the public CDN on first boot. Mirror plugin jars into the `neo4j-plugins` volume out-of-band instead.
 - `scripts/bundle_images.sh` re-tags pulled-by-digest images (`docker tag name@digest name:tag`) before `docker save`, because Docker sometimes drops the `name:tag` binding when an image is pulled as `name:tag@digest` — and compose's `image: name:tag@digest` reference needs both to resolve from a loaded tarball.
 
-### 4. `data-net` is external and shared across compose projects
+### 4. Access that bypasses the apps is recorded by admin-audit
+
+Neo4j Community keeps no query log and Qdrant no access log, so the make targets that open the stores directly (`db-shell`, `qdrant-shell`), copy their data out (`backup*`) or write it back (`restore-*`) are the only record of such access. Each runs its operation through `scripts/audit-admin.sh`: `admin_audit.py begin` admits it (exit 2 = refused: a missing purpose, recorded as `denied`, or a malformed one, unrecorded; exit 1 = cannot record), the operation runs, `admin_audit.py end` records the outcome (`ok`/`error`, exit status, duration, the facts the operation wrote to `$AUDIT_FACTS`). Fail closed: no record, no operation; a final record that cannot be written fails the target loudly. The operator is `$SUDO_USER`, else the login user; the purpose comes from `CASE_REF` / `REASON`.
+
+- **Every record is a chain of its own, written by `docker compose exec` into the long-running `admin-audit`** (`AUDIT_OUTPUT=container`), never by a one-off container that could exit before the log collector sees it. obs-plane's verifier accepts data-plane's chains only from the emitter `data-plane/admin-audit` and only with `service: data-plane` (the compose project name, `SERVICE` in `admin_audit.py`). Renaming the service or the project means changing obs-plane's emitter list in the same change.
+- **Purpose rules.** The shells always need one. Backups (`disclose`) and restores (`modify`) follow admin-audit's `AUDIT_REQUIRE_PURPOSE`, whose compose default is `${AUDIT_REQUIRE_PURPOSE-query,disclose}` — deliberately without the colon: `:-` would substitute the default for an explicit empty value too, so `AUDIT_REQUIRE_PURPOSE=` could not turn the requirement off. An unknown action fails admin-audit closed.
+- **The audit calls read no stdin** (`</dev/null`): `docker compose exec` forwards stdin and would swallow a piped session's input. The purpose reaches them through valueless `-e` variables, never on a command line.
+- **Only names and counts are recorded** — file names (never paths: a path can name a user), collection names, sizes, durations — never session content, file contents or credentials. `admin_audit.py` checks every key and value it accepts per operation.
+- `audit/audit_event.py` and `audit/audit_runtime.py` are byte-identical copies of the hub's `configs/audit/`, checked by its `validate_audit_lib.py`: never edit them, never let a formatter touch them; re-vendor instead. `admin_audit.py` and its tests are clean under the hub's strict ruff (`configs/python-strict/ruff.toml`, pinned version) and strict pyrefly.
+
+### 5. `data-net` is external and shared across compose projects
 
 `data-net` is declared `external: true` (`name: ${DATA_NET:-data-net}`). `make network` creates it once per host; the app backends attach to the same network when they come up. The aliases `neo4j` and `qdrant` are how apps find these services across compose projects. It is the only network this project joins: the federation's other two seams — `inference-net` (apps ↔ vllm-service) and `edge-net` (gateway ↔ app frontends) — are **not** touched here.
 
 ## When editing the compose files
 
-- The Neo4j healthcheck uses `cypher-shell` with parameter expansion on `$NEO4J_AUTH`. The `$$` is compose escaping — keep both `$$` so the container shell does the expansion, not compose itself.
+- The Neo4j healthcheck uses `cypher-shell` with parameter expansion on `$NEO4J_AUTH`. The `$$` is compose escaping — keep both `$$` so the container shell does the expansion, not compose itself. `make db-shell` takes the login from the same variable, handing it to cypher-shell through `NEO4J_USERNAME`/`NEO4J_PASSWORD` rather than its command line.
+- Neo4j's `cap_add` ends with `KILL`: PID 1 is tini (root), the server runs as the `neo4j` user, and without `CAP_KILL` tini cannot forward `docker stop`'s SIGTERM — it dies with EPERM, the server is killed, and the offline dump after every stop refuses the store ("Active logical log detected"). With it the shutdown runs, and takes about 10 s even on a small store (the databases checkpoint within a second; stopping the Bolt server takes the rest), which is past Docker's default 10 s grace: hence `stop_grace_period: 2m`. At the deadline Docker SIGKILLs the server (exit 137), so do not shorten it.
 - Qdrant's `expose:` and `volumes:` are YAML anchors (`&qdrant-ports`, `&qdrant-volumes`) shared by the `qdrant-cpu` and `qdrant-cuda` services. Edit one set; both consume it. Both write to the same `qdrant-storage` + `qdrant-snapshots` volumes, so switching `PROFILE` preserves data, but only one Qdrant runs at a time.
-- Qdrant's `environment:` is the `&qdrant-env` anchor, shared by `qdrant-cpu` and `qdrant-cuda` the same way the ports and volumes are. It carries the optional `QDRANT__SERVICE__API_KEY` in compose's valueless pass-through form, which leaves the variable *absent* when `.env` does not set it. Keep that form: an empty value is not "no auth" — Qdrant then answers every request with 401, so `${QDRANT_API_KEY:-}` interpolation would break unauthenticated deployments. `/readyz` is exempt from the key, so the healthcheck never needs it; `scripts/qdrant_snapshot.sh` reads the key from the container's own environment, so rename the variable in both places or neither.
-- The Qdrant images ship no `curl`/`wget`/`python3` (the slim cpu variant especially), but both do ship `bash` with `/dev/tcp` enabled. Everything that probes Qdrant therefore speaks raw HTTP over bash's built-in socket redirection: the shared `&qdrant-healthcheck` anchor (HTTP/1.0 `GET /readyz`, consumed by both variants) and `scripts/qdrant_snapshot.sh` (piped into the container's `bash` by `make backup-qdrant`). Don't switch these to an HTTP client without verifying it exists in the image first.
+- Qdrant's `environment:` is the `&qdrant-env` anchor, shared by `qdrant-cpu` and `qdrant-cuda` the same way the ports and volumes are. It carries the optional `QDRANT__SERVICE__API_KEY` in compose's valueless pass-through form, which leaves the variable *absent* when `.env` does not set it. Keep that form: an empty value is not "no auth" — Qdrant then answers every request with 401, so `${QDRANT_API_KEY:-}` interpolation would break unauthenticated deployments. `/readyz` is exempt from the key, so the healthcheck never needs it; `scripts/qdrant_snapshot.sh` and `scripts/qdrant_api.sh` read the key from the container's own environment, as `QDRANT__SERVICE__API_KEY` (the only name Qdrant reads), so rename the variable in both places or neither.
+- The Qdrant images ship no `curl`/`wget`/`python3` (the slim cpu variant especially), but both do ship `bash` with `/dev/tcp` enabled. Everything that probes Qdrant therefore speaks raw HTTP over bash's built-in socket redirection: the shared `&qdrant-healthcheck` anchor (HTTP/1.0 `GET /readyz`, consumed by both variants), `scripts/qdrant_snapshot.sh` (piped into the container's `bash` by `make backup-qdrant`) and `scripts/qdrant_api.sh` (run with `bash -c` in the container: the `qdrant` helper of `make qdrant-shell`, and the recovery of `make restore-qdrant`). Don't switch these to an HTTP client without verifying it exists in the image first.
+- `admin-audit` runs as `nobody` (65534) with a read-only root, no network and no volumes: it mounts `../audit` and `../VERSION` read-only and writes only its stdout. Every `docker compose exec` into it runs as the same user, which is what lets an exec'd process write to PID 1's stdout (`/proc/1/fd/1`) under the shared lock on its tmpfs `/tmp`.
 - The `volumes:` block in `compose.yaml` declares its six named volumes `external`, so compose neither creates nor destroys them — `make volumes` creates them and `make nuke` deletes them by name. Those names must stay in sync with the `VOLUMES` list in the `Makefile`; adding or renaming a volume means editing both files.
 
 ## Backups: what the runbook assumes
 
 Full procedure in `backup/README.md`. The constraints to know when touching the Makefile:
 
-- **Neo4j community edition has no online backup.** `backup-neo4j` stops Neo4j, runs `neo4j-admin database dump` in a one-shot container with `backup/snapshots/` mounted, restarts. Downtime scales with dataset size. Adding online backup means switching to Enterprise — that is an ADR-level decision, not a Makefile tweak.
-- **Qdrant snapshots are online**, via `POST /collections/<name>/snapshots`. The script iterates `GET /collections`. Snapshots land *inside* the `qdrant-snapshots` volume — copying them off-host is a separate step (`docker compose cp`), documented in `backup/README.md`.
+- **Neo4j community edition has no online backup.** `scripts/neo4j_admin.sh dump` (`backup-neo4j`) stops Neo4j, runs `neo4j-admin database dump` in a one-shot container with `backup/snapshots/` mounted, and starts it again — also when the dump failed. Downtime scales with dataset size. Adding online backup means switching to Enterprise — that is an ADR-level decision, not a Makefile tweak. `load` (`restore-neo4j`) mounts the chosen dump as `/backup/neo4j.dump`, because `neo4j-admin database load` reads `<database>.dump` from `--from-path`.
+- **Qdrant snapshots are online**, via `POST /collections/<name>/snapshots`. The script iterates `GET /collections` and reports what it wrote (collection names, total size) on stdout for the audit record; its progress goes to stderr. Snapshots land *inside* the `qdrant-snapshots` volume — copying them off-host is a separate step (`docker compose cp`), documented in `backup/README.md`. `restore-qdrant` streams a host copy back in through `docker compose exec` instead of `docker compose cp`, which keeps the host file's owner and mode: Qdrant runs as root without capabilities and cannot open a file it does not own.
 
 ## Git & PR Workflow
 
