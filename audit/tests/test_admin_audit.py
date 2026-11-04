@@ -1,6 +1,8 @@
-"""Tests for admin_audit.py.
+"""Tests for admin_audit.py and the scripts that run it.
 
 Run from the repo root: ``python3 -m unittest discover -s audit/tests -t audit``.
+The script tests need bash and the repo's ``scripts/``; they are skipped where
+either is missing, e.g. in the pinned python image, which mounts only ``audit/``.
 """
 
 from __future__ import annotations
@@ -10,6 +12,7 @@ import io
 import json
 import os
 import shutil
+import subprocess
 import tempfile
 import threading
 import time
@@ -23,6 +26,9 @@ import admin_audit
 from audit_event import verify_chain
 
 VERSION = "0.4.0"
+AUDIT_DIR = Path(__file__).resolve().parents[1]
+SCRIPTS = AUDIT_DIR.parent / "scripts"
+HAS_SCRIPTS = shutil.which("bash") is not None and (SCRIPTS / "audit-admin.sh").is_file()
 ENVELOPE = frozenset(
     {"stream", "v", "event_id", "ts", "service", "service_version", "instance", "seq", "prev_hash", "hash"}
     | {"action", "operation", "outcome", "actor"}
@@ -603,6 +609,372 @@ class CommandLineTest(Workspace):
             with self.assertRaises(SystemExit) as raised:
                 self.run_main(self.purposed(), argv)
             self.assertEqual(raised.exception.code, 2)
+
+
+# A stand-in for `docker compose`, run by scripts/audit-admin.sh. For
+# `exec ... admin-audit python /app/admin_audit.py ...` it runs the real module
+# with the container's environment (FAKE_REQUIRE_PURPOSE) plus the -e
+# variables, taken from its own environment like compose does. Audit lines go to
+# the "container log" (as AUDIT_OUTPUT=container would put them); anything else
+# on stdout to the caller. Like the docker CLI, it reads all of its stdin.
+FAKE_COMPOSE = r"""#!/usr/bin/env python3
+import os
+import subprocess
+import sys
+
+args = sys.argv[1:]
+with open(os.environ["FAKE_LOG"], "a", encoding="utf-8") as log:
+    log.write("compose " + " ".join(args) + "\n")
+sys.stdin.read()
+rest = args[args.index("exec") + 1 :]
+env = {
+    "PATH": os.environ["PATH"],
+    "PYTHONDONTWRITEBYTECODE": "1",
+    "AUDIT_VERSION_FILE": os.environ["FAKE_VERSION_FILE"],
+    "AUDIT_REQUIRE_PURPOSE": os.environ.get("FAKE_REQUIRE_PURPOSE", "query,disclose"),
+}
+while rest[0].startswith("-"):
+    if rest.pop(0) == "-e":
+        name = rest.pop(0)
+        if "=" in name:
+            sys.exit("the purpose must not be passed on the command line: " + name)
+        if name in os.environ:
+            env[name] = os.environ[name]
+service, program, script, *command = rest
+if service != "admin-audit" or (program, script) != ("python", "/app/admin_audit.py"):
+    sys.exit("unexpected exec: " + " ".join(rest))
+if os.environ.get("FAKE_DOWN") or command[0] == os.environ.get("FAKE_FAIL"):
+    sys.exit(1)
+done = subprocess.run(
+    [sys.executable, os.environ["FAKE_ADMIN_AUDIT"], *command], env=env, capture_output=True, text=True, check=False
+)
+with open(os.environ["FAKE_CONTAINER_LOG"], "a", encoding="utf-8") as container:
+    for line in done.stdout.splitlines():
+        if '"stream":"audit"' in line:
+            container.write(line + "\n")
+        else:
+            print(line)
+sys.stderr.write(done.stderr)
+sys.exit(done.returncode)
+"""
+
+
+@unittest.skipUnless(HAS_SCRIPTS, "needs bash and the repo's scripts/")
+class WrapperScriptTest(Workspace):
+    """scripts/audit-admin.sh around a command, with admin_audit.py behind a stand-in compose."""
+
+    @override
+    def setUp(self) -> None:
+        """Create the stand-in, its logs and the base environment."""
+        super().setUp()
+        self.log = self.tmp / "calls.log"
+        self.container_log = self.tmp / "container.log"
+        compose = self.tmp / "fake-compose"
+        compose.write_text(FAKE_COMPOSE, encoding="utf-8")
+        compose.chmod(0o755)
+        self.base = {
+            "PATH": os.environ["PATH"],
+            "TMPDIR": str(self.tmp),
+            "COMPOSE": f"{compose} --env-file .env -f docker/compose.yaml",
+            "FAKE_LOG": str(self.log),
+            "FAKE_CONTAINER_LOG": str(self.container_log),
+            "FAKE_VERSION_FILE": str(self.version_file),
+            "FAKE_ADMIN_AUDIT": str(AUDIT_DIR / "admin_audit.py"),
+            "SUDO_USER": "ops.example",
+        }
+
+    def run_wrapper(self, *args: str, stdin: str = "", **env: str) -> tuple[int, list[str], list[dict[str, Any]], str]:
+        """Run the wrapper.
+
+        Args:
+            *args: Its arguments, ``--`` and the command included.
+            stdin: What the wrapper reads on stdin.
+            **env: More environment, e.g. ``REASON``, ``FAKE_DOWN``.
+
+        Returns:
+            The exit status, the calls in order, the events in the container
+            log, and what the wrapper wrote to stderr.
+        """
+        result = subprocess.run(
+            ["bash", str(SCRIPTS / "audit-admin.sh"), *args],
+            env={**self.base, **env},
+            input=stdin,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        calls = self.log.read_text(encoding="utf-8").splitlines() if self.log.exists() else []
+        text = self.container_log.read_text(encoding="utf-8") if self.container_log.exists() else ""
+        self.streams = [io.StringIO(text)]
+        return result.returncode, calls, lines(self.streams[0]), result.stderr
+
+    def test_shell_session_is_recorded_open_and_close(self) -> None:
+        """begin, the session, end: the close points at the opening; both by the sudo user."""
+        status, calls, events, _ = self.run_wrapper(
+            "shell", "neo4j", "--", "sh", "-c", 'echo session >> "$FAKE_LOG"', CASE_REF="case-0001", REASON="review"
+        )
+        self.assertEqual(status, 0)
+        self.assertEqual(len(calls), 3)
+        self.assertIn(" exec -T -e AUDIT_CLI_USER -e AUDIT_CASE_REF -e AUDIT_REASON admin-audit ", calls[0])
+        self.assertTrue(calls[0].endswith("admin_audit.py begin shell neo4j"), calls[0])
+        self.assertEqual(calls[1], "session")
+        self.assertIn(" end shell neo4j --status 0 --duration-s ", calls[2])
+        opening, close = records(events)
+        self.assertEqual(opening["operation"], "db.shell.open")
+        self.assertEqual(close["operation"], "db.shell.close")
+        self.assertEqual(close["parent_event_id"], opening["event_id"])
+        self.assertEqual(opening["actor"], OPERATOR)
+        self.assertEqual(close["purpose"], {"case_ref": "case-0001", "reason": "review"})
+        self.assertEqual(close["criteria"]["exit_status"], 0)
+        self.assert_chains_intact()
+
+    def test_refused_operation_runs_nothing(self) -> None:
+        """No purpose for a shell: exit 2, the refusal recorded, the command never run."""
+        status, calls, events, stderr = self.run_wrapper(
+            "shell", "qdrant", "--", "sh", "-c", 'echo session >> "$FAKE_LOG"'
+        )
+        self.assertEqual(status, 2)
+        self.assertNotIn("session", calls)
+        (event,) = records(events)
+        self.assertEqual(event["outcome"], "denied")
+        self.assertIn("needs a stated purpose", stderr)
+        self.assert_chains_intact()
+
+    def test_nothing_runs_while_admin_audit_cannot_record(self) -> None:
+        """admin-audit down: exit 1 before the command."""
+        status, calls, events, stderr = self.run_wrapper(
+            "backup", "neo4j", "--", "sh", "-c", 'echo dump >> "$FAKE_LOG"', REASON="nightly backup", FAKE_DOWN="1"
+        )
+        self.assertEqual((status, len(calls), events), (1, 1, []))
+        self.assertIn("Nothing was done", stderr)
+
+    def test_reported_facts_reach_the_record(self) -> None:
+        """What the command writes to AUDIT_FACTS is recorded; its status is passed on."""
+        command = f'printf "file={DUMP}\\nsize_bytes=2048\\n" >> "$AUDIT_FACTS"; exit 3'
+        status, _, events, _ = self.run_wrapper("backup", "neo4j", "--", "sh", "-c", command, REASON="nightly backup")
+        self.assertEqual(status, 3)
+        (event,) = records(events)
+        self.assertEqual((event["operation"], event["outcome"]), ("backup.neo4j", "error"))
+        self.assertEqual(event["criteria"]["file"], DUMP)
+        self.assertEqual(event["criteria"]["size_bytes"], 2048)
+        self.assertEqual(event["criteria"]["exit_status"], 3)
+        self.assertEqual(event["purpose"], {"reason": "nightly backup"})
+        self.assertFalse(list(self.tmp.glob("data-plane-audit.*")), "the facts file is removed")
+        self.assert_chains_intact()
+
+    def test_parameters_reach_both_calls(self) -> None:
+        """A restore's parameters are checked at begin and recorded at end."""
+        status, calls, events, _ = self.run_wrapper(
+            "restore", "neo4j", f"file={DUMP}", "--", "sh", "-c", 'echo "size_bytes=10" >> "$AUDIT_FACTS"'
+        )
+        self.assertEqual(status, 0)
+        self.assertTrue(calls[0].endswith(f"begin restore neo4j file={DUMP}"), calls[0])
+        (event,) = records(events)
+        self.assertEqual(event["criteria"], {"file": DUMP, "size_bytes": 10, "exit_status": 0, "duration_s": 0})
+        self.assert_chains_intact()
+
+    def test_piped_input_reaches_the_command(self) -> None:
+        """The records read no stdin, so a piped session gets all of it."""
+        status, calls, _, _ = self.run_wrapper(
+            "shell",
+            "neo4j",
+            "--",
+            "sh",
+            "-c",
+            'cat >> "$FAKE_LOG"',
+            stdin="MATCH (n) RETURN count(n);\n",
+            REASON="count",
+        )
+        self.assertEqual(status, 0)
+        self.assertIn("MATCH (n) RETURN count(n);", calls)
+
+    def test_interrupted_operation_is_recorded(self) -> None:
+        """An interrupt during the command is recorded as error, status 130."""
+        status, _, events, _ = self.run_wrapper("shell", "neo4j", "--", "sh", "-c", "kill -INT $PPID", REASON="review")
+        self.assertEqual(status, 130)
+        close = records(events)[-1]
+        self.assertEqual((close["operation"], close["outcome"]), ("db.shell.close", "error"))
+        self.assertEqual(close["criteria"]["exit_status"], 130)
+        self.assert_chains_intact()
+
+    def test_unrecorded_operation_fails_loudly(self) -> None:
+        """When the final record cannot be written, the wrapper fails after a good command."""
+        status, calls, _, stderr = self.run_wrapper(
+            "backup", "qdrant", "--", "sh", "-c", 'echo snapshot >> "$FAKE_LOG"', REASON="nightly", FAKE_FAIL="end"
+        )
+        self.assertEqual(status, 1)
+        self.assertEqual(calls[1], "snapshot")
+        self.assertIn("could not be written", stderr)
+
+    def test_usage(self) -> None:
+        """Too few arguments or no command: exit 2, nothing called."""
+        for args in (("shell",), ("shell", "neo4j", "--"), ("shell", "neo4j", "true")):
+            status, calls, _, _ = self.run_wrapper(*args)
+            self.assertEqual((status, calls), (2, []), args)
+
+
+# A stand-in for `docker compose` for the store scripts: logs every call and
+# plays the part of neo4j-admin and of the Qdrant container.
+FAKE_STORE_COMPOSE = r"""#!/usr/bin/env bash
+call="$*"
+printf 'compose %s\n' "${call//$'\n'/\\n}" >> "$FAKE_LOG"
+args=("$@")
+case " $* " in
+  *" stop neo4j "*) exit "${FAKE_STOP:-0}" ;;
+  *" start neo4j "*) exit "${FAKE_START:-0}" ;;
+  *" run --rm "*)
+    for ((i = 0; i < ${#args[@]}; i++)); do
+      [[ ${args[i]} == -v ]] && mount=${args[i + 1]}
+      [[ ${args[i]} == -c ]] && command=${args[i + 1]}
+    done
+    if [[ ${FAKE_RUN:-0} == 0 && $command == *"database dump"* ]]; then
+      head -c 1234 /dev/zero > "${mount%%:*}/${command##*/backup/}"
+    fi
+    exit "${FAKE_RUN:-0}" ;;
+  *" sh -c command -v bash"*) exit "${FAKE_NO_BASH:-0}" ;;
+  *" bash -s "*) cat > /dev/null; printf 'collection=docs\nsnapshots=1\nsize_bytes=2048\nfailed=0\n' ;;
+  *" sh -c "*"cat >"*) cat > "${FAKE_LOG%/*}/streamed" ;;
+esac
+"""
+
+
+@unittest.skipUnless(HAS_SCRIPTS, "needs bash and the repo's scripts/")
+class StoreScriptTest(unittest.TestCase):
+    """scripts/neo4j_admin.sh and scripts/qdrant_admin.sh with a stand-in compose."""
+
+    @override
+    def setUp(self) -> None:
+        """Create the stand-in, a backup directory and the facts file."""
+        self.tmp = Path(tempfile.mkdtemp(prefix="admin-audit-store-"))
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.log = self.tmp / "calls.log"
+        self.facts = self.tmp / "facts"
+        self.backup_dir = self.tmp / "snapshots"
+        compose = self.tmp / "fake-compose"
+        compose.write_text(FAKE_STORE_COMPOSE, encoding="utf-8")
+        compose.chmod(0o755)
+        self.compose = f"{compose} --env-file .env -f docker/compose.yaml"
+
+    def run_script(self, script: str, *args: str, **env: str) -> tuple[int, list[str], list[str]]:
+        """Run a store script.
+
+        Args:
+            script: ``neo4j_admin.sh`` or ``qdrant_admin.sh``.
+            *args: Its arguments.
+            **env: More environment.
+
+        Returns:
+            The exit status, the compose calls in order, and the facts reported.
+        """
+        result = subprocess.run(
+            ["bash", str(SCRIPTS / script), *args],
+            env={
+                "PATH": os.environ["PATH"],
+                "COMPOSE": self.compose,
+                "BACKUP_DIR": str(self.backup_dir),
+                "AUDIT_FACTS": str(self.facts),
+                "FAKE_LOG": str(self.log),
+                **env,
+            },
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        calls = [line.split(" -f docker/compose.yaml ", 1)[-1] for line in self.read(self.log)]
+        return result.returncode, calls, self.read(self.facts)
+
+    @staticmethod
+    def read(path: Path) -> list[str]:
+        """Read a file's lines, if it exists.
+
+        Args:
+            path: The file.
+
+        Returns:
+            Its lines; none when it does not exist.
+        """
+        return path.read_text(encoding="utf-8").splitlines() if path.exists() else []
+
+    def test_dump_stops_dumps_starts_and_reports_the_file(self) -> None:
+        """Neo4j is stopped for the dump and started again; the file is reported."""
+        status, calls, facts = self.run_script("neo4j_admin.sh", "dump")
+        self.assertEqual(status, 0)
+        self.assertEqual([call.split()[0] for call in calls], ["stop", "run", "start"])
+        self.assertIn(f"-v {self.backup_dir}:/backup --entrypoint /bin/bash neo4j -c", calls[1])
+        self.assertRegex(facts[0], r"^file=neo4j-\d{8}T\d{6}Z\.dump$")
+        self.assertEqual(facts[1], "size_bytes=1234")
+        self.assertTrue((self.backup_dir / facts[0].removeprefix("file=")).is_file())
+
+    def test_failed_dump_still_starts_neo4j(self) -> None:
+        """A failing neo4j-admin never leaves Neo4j down; nothing is reported."""
+        status, calls, facts = self.run_script("neo4j_admin.sh", "dump", FAKE_RUN="1")
+        self.assertEqual(status, 1)
+        self.assertEqual([call.split()[0] for call in calls], ["stop", "run", "start"])
+        self.assertEqual(facts, [])
+
+    def test_nothing_runs_when_neo4j_cannot_be_stopped(self) -> None:
+        """No dump against a running database."""
+        status, calls, _ = self.run_script("neo4j_admin.sh", "dump", FAKE_STOP="1")
+        self.assertNotEqual(status, 0)
+        self.assertEqual([call.split()[0] for call in calls], ["stop"])
+
+    def test_load_mounts_the_dump_as_neo4j_dump(self) -> None:
+        """The chosen dump is loaded read-only under the name neo4j-admin expects."""
+        self.backup_dir.mkdir()
+        (self.backup_dir / DUMP).write_bytes(b"x" * 99)
+        status, calls, facts = self.run_script("neo4j_admin.sh", "load", DUMP)
+        self.assertEqual(status, 0)
+        self.assertEqual([call.split()[0] for call in calls], ["stop", "run", "start"])
+        self.assertIn(f"-v {self.backup_dir}/{DUMP}:/backup/neo4j.dump:ro", calls[1])
+        self.assertIn("neo4j-admin database load neo4j --from-path=/backup --overwrite-destination=true", calls[1])
+        self.assertEqual(facts, ["size_bytes=99"])
+
+    def test_load_refuses_a_missing_or_odd_dump(self) -> None:
+        """No such dump, or a name with a path in it: exit 2, Neo4j untouched."""
+        for name in (DUMP, "../neo4j.dump", "a:b.dump"):
+            status, calls, _ = self.run_script("neo4j_admin.sh", "load", name)
+            self.assertEqual((status, calls), (2, []), name)
+
+    def test_snapshot_reports_what_the_container_script_wrote(self) -> None:
+        """The snapshot script's stdout becomes the facts."""
+        status, calls, facts = self.run_script("qdrant_admin.sh", "snapshot", PROFILE="cpu")
+        self.assertEqual(status, 0)
+        self.assertEqual(calls[-1], "exec -T qdrant-cpu bash -s")
+        self.assertEqual(facts, ["collection=docs", "snapshots=1", "size_bytes=2048", "failed=0"])
+
+    def test_snapshot_needs_bash_in_the_image(self) -> None:
+        """Without bash in the image no snapshot is attempted."""
+        status, calls, facts = self.run_script("qdrant_admin.sh", "snapshot", FAKE_NO_BASH="1")
+        self.assertEqual((status, len(calls), facts), (1, 1, []))
+
+    def test_recover_copies_a_host_snapshot_in_first(self) -> None:
+        """A snapshot in the backup directory is streamed into the container, then recovered."""
+        self.backup_dir.mkdir()
+        snapshot = "docs-1-2026-01-31-02-00-00.snapshot"
+        (self.backup_dir / snapshot).write_bytes(b"snapshot bytes")
+        status, calls, facts = self.run_script("qdrant_admin.sh", "recover", "docs", snapshot, PROFILE="cuda")
+        self.assertEqual(status, 0)
+        path = f"/qdrant/snapshots/docs/{snapshot}"
+        self.assertTrue(calls[0].startswith("exec -T qdrant-cuda sh -c "), calls[0])
+        self.assertTrue(calls[0].endswith(f" _ {path}"), calls[0])
+        self.assertEqual((self.tmp / "streamed").read_bytes(), b"snapshot bytes")
+        self.assertTrue(calls[1].startswith("exec -T qdrant-cuda bash -c "), calls[1])
+        self.assertTrue(calls[1].endswith(f"qdrant_api recover docs {path}"), calls[1])
+        self.assertEqual(facts, ["source=host"])
+
+    def test_recover_from_the_volume(self) -> None:
+        """Without a host copy, the snapshot is taken from Qdrant's volume."""
+        status, calls, facts = self.run_script("qdrant_admin.sh", "recover", "docs", "docs-1.snapshot")
+        self.assertEqual(status, 0)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(facts, ["source=volume"])
+
+    def test_recover_refuses_odd_names(self) -> None:
+        """Names that could leave the snapshot directory are refused before anything runs."""
+        for args in (("../docs", "x.snapshot"), ("docs", "../x.snapshot"), ("docs", "a..b"), ("docs files", "x")):
+            status, calls, _ = self.run_script("qdrant_admin.sh", "recover", *args)
+            self.assertEqual((status, calls), (2, []), args)
 
 
 if __name__ == "__main__":

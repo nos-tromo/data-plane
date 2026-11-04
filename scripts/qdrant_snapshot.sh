@@ -1,11 +1,17 @@
 #!/usr/bin/env bash
 # Trigger an online snapshot for every Qdrant collection via the local API.
 #
-# Runs INSIDE the Qdrant container (piped over stdin by `make backup-qdrant`).
+# Runs INSIDE the Qdrant container (piped over stdin by scripts/qdrant_admin.sh
+# for `make backup-qdrant`).
 # The slim image ships no curl/wget/python3, so this speaks HTTP/1.0 over
 # bash's built-in /dev/tcp redirection. HTTP/1.0 on purpose: the server then
 # closes the connection and never chunk-encodes the body, so the response can
 # be read with a plain `cat` and split on the blank line.
+#
+# Progress goes to stderr. stdout carries the facts for the backup's audit
+# record (scripts/audit-admin.sh), as key=value lines: collection=<name> per
+# snapshot written, then snapshots=, size_bytes= (their total, as Qdrant
+# reports each snapshot's size) and failed= (collections not snapshotted).
 #
 # Exits non-zero if listing collections fails or any snapshot POST fails.
 set -euo pipefail
@@ -36,6 +42,8 @@ http() {
 }
 
 fail=0
+written=0
+total=0
 
 list=$(http GET /collections)
 if [[ $(head -n1 <<<"$list") != 200 ]]; then
@@ -45,20 +53,26 @@ fi
 
 collections=$(sed 1d <<<"$list" | grep -oE '"name":"[^"]+"' | cut -d'"' -f4 || true)
 if [[ -z "$collections" ]]; then
-  echo "  no collections to snapshot"
+  echo "  no collections to snapshot" >&2
 fi
 
 while IFS= read -r col; do
   [[ -z "$col" ]] && continue
-  echo "  snapshotting $col"
+  echo "  snapshotting $col" >&2
   out=$(http POST "/collections/${col}/snapshots")
   status=$(head -n1 <<<"$out")
   if [[ $status == 200 ]]; then
-    echo "    -> $(sed 1d <<<"$out" | grep -oE '"name":"[^"]+"' | cut -d'"' -f4)"
+    body=$(sed 1d <<<"$out")
+    size=$(grep -oE '"size":[0-9]+' <<<"$body" | head -n1 | cut -d: -f2 || true)
+    echo "    -> $(grep -oE '"name":"[^"]+"' <<<"$body" | cut -d'"' -f4)" >&2
+    printf 'collection=%s\n' "$col"
+    written=$((written + 1))
+    total=$((total + ${size:-0}))
   else
     echo "    ERROR: HTTP $status snapshotting $col" >&2
-    fail=1
+    fail=$((fail + 1))
   fi
 done <<<"$collections"
 
-exit "$fail"
+printf 'snapshots=%s\nsize_bytes=%s\nfailed=%s\n' "$written" "$total" "$fail"
+[[ $fail -eq 0 ]]
