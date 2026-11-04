@@ -32,7 +32,7 @@ behind an interactive confirmation, can wipe the data set. Backups
 
 ```bash
 cp .env.example .env
-$EDITOR .env                  # set NEO4J_PASSWORD at minimum
+$EDITOR .env                  # set NEO4J_PASSWORD and QDRANT_API_KEY (openssl rand -hex 32)
 
 make network                  # create the external data-net (idempotent)
 make volumes                  # create the external data volumes (idempotent)
@@ -48,6 +48,15 @@ pre-creates the named data volumes — they are declared `external`, so
 compose will not create them itself. Both targets are idempotent and run
 automatically as prerequisites of `make up`, so a fresh host can also just
 run `make up`.
+
+`NEO4J_PASSWORD` and `QDRANT_API_KEY` are both required: compose refuses
+every command without them. docint must be given the same `QDRANT_API_KEY`
+in its own `.env`.
+
+**Upgrading an existing deployment to 0.5.0:** set `QDRANT_API_KEY` in
+data-plane's `.env` and the same value in docint's `.env` (docint >= v2.5.0)
+before running `make up` here, then `make up` in docint. Until docint has
+the key, Qdrant refuses its requests (401).
 
 ## Admin access (production)
 
@@ -67,16 +76,11 @@ ssh -L 7474:localhost:7474 -L 7687:localhost:7687 -L 6333:localhost:6333 <host> 
 make up                       # drop the loopback ports again (brief container restart)
 ```
 
-Neo4j Browser always asks for the `NEO4J_USER` / `NEO4J_PASSWORD` login. The
-Qdrant dashboard has no login unless `QDRANT_API_KEY` is set in
-`.env`: uncomment it there (see `.env.example` — an *empty* value is not "no
-auth", it makes Qdrant 401 everything) and the dashboard prompts for the key,
-while every API call needs an `api-key` header — docint's, and yours over
-the tunnel (`make backup-qdrant`, `make qdrant-shell` and `make
-restore-qdrant` send the server's own key themselves; the shell warns when
-Qdrant was started with an empty one). Without it, anyone who can reach the
-loopback ports, and every service on `data-net`, has unauthenticated read and
-write access to the vector store.
+Neo4j Browser always asks for the `NEO4J_USER` / `NEO4J_PASSWORD` login, and
+the Qdrant dashboard for the `QDRANT_API_KEY` from `.env`. Every Qdrant API
+call needs that key as the `api-key` header — docint's, and yours over the
+tunnel; `make backup-qdrant`, `make qdrant-shell` and `make restore-qdrant`
+send the server's own key themselves.
 
 **Not recorded.** What is done over these ports bypasses the audit trail:
 neither store logs it, and admin-audit only sees the make targets. For access

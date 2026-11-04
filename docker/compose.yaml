@@ -127,8 +127,13 @@ services:
     <<: *hardened
     image: docker.io/qdrant/qdrant:v1.18.3@sha256:0bd98fa7977f1e75694779359ca4e212822e5a71334e28421182f72f209d5286
     logging: *default-logging
+    # The API key is required, like NEO4J_PASSWORD: an empty value is not "no
+    # auth" — Qdrant then answers every request that carries no key with 401,
+    # docint's included. /readyz is exempt, so the healthcheck never needs it;
+    # the scripts that talk to Qdrant read it from the container's own
+    # environment (QDRANT__SERVICE__API_KEY).
     environment: &qdrant-env
-      QDRANT__SERVICE__API_KEY: ${QDRANT_API_KEY:-}
+      QDRANT__SERVICE__API_KEY: ${QDRANT_API_KEY:?QDRANT_API_KEY must be set in .env (generate one with openssl rand -hex 32; docint's QDRANT_API_KEY takes the same value)}
       QDRANT__TELEMETRY_DISABLED: "true"
     expose: &qdrant-ports
       - "6333"   # http

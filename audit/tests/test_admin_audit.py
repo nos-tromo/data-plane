@@ -1076,16 +1076,22 @@ class QdrantApiTest(unittest.TestCase):
         self.assertEqual(result.stderr, "")
 
     def test_an_empty_key_is_explained(self) -> None:
-        """An empty key gets 401 for everything: the shell says so up front and with the answer."""
+        """A Qdrant with an empty key refuses the request: the 401 comes with how to fix it."""
         self.qdrant.status = 401
         result = self.shell("qdrant GET /collections\n", QDRANT__SERVICE__API_KEY="")
         self.assertEqual(result.returncode, 1)
         self.assertEqual(result.stdout.splitlines()[0], "HTTP/1.0 401 Unauthorized")
         ((_, _, headers, _),) = self.qdrant.requests
         self.assertNotIn("api-key", {name.lower() for name in headers})
-        self.assertEqual(result.stderr.count("started with an empty API key"), 2)
-        self.assertEqual(result.stderr.count("NOTE: 401 because"), 1)
-        self.assertIn("without an api-key header with 401 Unauthorized", result.stderr)
+        note = "NOTE: 401: this Qdrant has no API key to send. Set QDRANT_API_KEY in .env and run make up again.\n"
+        self.assertEqual(result.stderr, note)
+
+    def test_a_refusal_with_a_key_has_no_note(self) -> None:
+        """A 401 although the key was sent is not about the key's absence."""
+        self.qdrant.status = 401
+        result = self.shell("qdrant GET /collections\n", QDRANT__SERVICE__API_KEY="zz-test-key")
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(result.stderr, "")
 
     def test_the_body_length_is_counted_in_bytes(self) -> None:
         """A JSON body with non-ASCII text is sent whole."""
