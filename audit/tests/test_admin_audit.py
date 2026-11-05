@@ -1762,21 +1762,25 @@ class BackupPruneTest(unittest.TestCase):
         for name in names:
             (self.dir / name).write_bytes(b"x")
 
-    def since(self, days_ago: float) -> None:
-        """Record that pruning took effect ``days_ago`` before the clock.
+    def since(self, days_ago: float, days: int = 30) -> None:
+        """Record that a period took effect ``days_ago`` before the clock.
 
         Args:
             days_ago: Days before :data:`PRUNE_NOW`.
+            days: The period that took effect then.
         """
-        (self.dir / ".prune-since").write_text(f"{int(PRUNE_NOW - days_ago * DAY_S)}\n", encoding="utf-8")
+        (self.dir / ".prune-since").write_text(f"{int(PRUNE_NOW - days_ago * DAY_S)} {days}\n", encoding="utf-8")
 
-    def prune(self, store: str, days: str = "30", now: int = PRUNE_NOW) -> tuple[int, dict[str, list[str]]]:
+    def prune(
+        self, store: str, days: str = "30", now: int = PRUNE_NOW, notice: str | None = None
+    ) -> tuple[int, dict[str, list[str]]]:
         """Run the pruning of one store.
 
         Args:
             store: ``neo4j`` or ``qdrant``.
             days: ``BACKUP_RETENTION_DAYS``.
             now: The clock.
+            notice: ``RETENTION_NOTICE_DAYS``; unset by default.
 
         Returns:
             The exit status and the reported facts, each key with its values in order.
@@ -1789,6 +1793,7 @@ class BackupPruneTest(unittest.TestCase):
                 "BACKUP_RETENTION_DAYS": days,
                 "BACKUP_DIR": str(self.dir),
                 "AUDIT_FACTS": str(self.facts),
+                **({} if notice is None else {"RETENTION_NOTICE_DAYS": notice}),
             },
             stdin=subprocess.DEVNULL,
             capture_output=True,
@@ -1865,13 +1870,69 @@ class BackupPruneTest(unittest.TestCase):
         self.backups(f"neo4j-{stamp(100)}.dump.age")
         status, facts = self.prune("neo4j")
         self.assertEqual((status, self.left(), facts["deleted"]), (0, [f"neo4j-{stamp(100)}.dump.age"], ["0"]))
-        self.assertEqual((self.dir / ".prune-since").read_text(encoding="utf-8").strip(), str(PRUNE_NOW))
-        self.assertEqual((self.dir / ".prune-since").stat().st_mode & 0o777, 0o600)
+        self.assertEqual((self.dir / ".prune-since").read_text(encoding="utf-8").strip(), f"{PRUNE_NOW} 30")
+        self.assertEqual((self.dir / ".prune-since").stat().st_mode & 0o777, 0o644)
         self.assertIn("2026-03-31", self.stderr)
         status, _ = self.prune("neo4j", now=PRUNE_NOW + 29 * DAY_S)
         self.assertEqual(len(self.left()), 1)
         status, facts = self.prune("neo4j", now=PRUNE_NOW + 30 * DAY_S)
         self.assertEqual((status, self.left(), facts["deleted"][-1]), (0, [], "1"))
+
+    def test_the_grace_lasts_the_notice_period_not_the_retention_period(self) -> None:
+        """A one-day retention still waits the notice period (RETENTION_NOTICE_DAYS, default 30) at first."""
+        self.backups(f"neo4j-{stamp(100)}.dump.age")
+        self.prune("neo4j", days="1")
+        self.prune("neo4j", days="1", now=PRUNE_NOW + 29 * DAY_S)
+        self.assertEqual(len(self.left()), 1)
+        self.prune("neo4j", days="1", now=PRUNE_NOW + 30 * DAY_S)
+        self.assertEqual(self.left(), [])
+        (self.dir / ".prune-since").unlink()
+        self.backups(f"neo4j-{stamp(100)}.dump.age")
+        self.prune("neo4j", days="1", notice="7")
+        status, _ = self.prune("neo4j", days="1", notice="7", now=PRUNE_NOW + 7 * DAY_S)
+        self.assertEqual((status, self.left()), (0, []))
+
+    def test_a_changed_period_restarts_the_grace(self) -> None:
+        """Lowering the period takes effect anew: nothing more is deleted before its notice has passed."""
+        self.since(400, days=30)
+        name = f"neo4j-{stamp(10)}.dump.age"
+        self.backups(name)
+        status, facts = self.prune("neo4j", days="7")
+        self.assertEqual((status, self.left(), facts["deleted"]), (0, [name], ["0"]))
+        self.assertEqual((self.dir / ".prune-since").read_text(encoding="utf-8").strip(), f"{PRUNE_NOW} 7")
+        status, _ = self.prune("neo4j", days="7", now=PRUNE_NOW + 30 * DAY_S)
+        self.assertEqual((status, self.left()), (0, []))
+
+    def test_bad_notice_refuses(self) -> None:
+        """RETENTION_NOTICE_DAYS takes whole days from 1 to 365 only."""
+        self.since(400)
+        self.backups(f"neo4j-{stamp(90)}.dump.age")
+        for notice in ("0", "366", "off"):
+            status, facts = self.prune("neo4j", notice=notice)
+            self.assertEqual((status, facts), (2, {}), notice)
+
+    @unittest.skipIf(os.geteuid() == 0, "root reads anything")
+    def test_an_unreadable_state_says_so(self) -> None:
+        """A state file this account cannot read refuses without telling anyone to delete it."""
+        self.since(400)
+        self.backups(f"neo4j-{stamp(90)}.dump.age")
+        (self.dir / ".prune-since").chmod(0)
+        self.addCleanup((self.dir / ".prune-since").chmod, 0o644)
+        status, facts = self.prune("neo4j")
+        self.assertEqual((status, facts), (2, {}))
+        self.assertIn("cannot read", self.stderr)
+        self.assertNotIn("Delete it", self.stderr)
+        self.assertEqual(len(self.left()), 1)
+
+    def test_a_name_the_record_cannot_carry_is_left_alone(self) -> None:
+        """A backup renamed by hand to a name the record cannot hold is never deleted, only named."""
+        self.since(400)
+        odd = [f"qdrant-my docs-{stamp(60)}.snapshot.age", f"qdrant-\u00fcn\u00ef-{stamp(60)}.snapshot.age"]
+        self.backups(*odd)
+        status, facts = self.prune("qdrant")
+        self.assertEqual((status, self.left(), facts["deleted"]), (0, sorted(odd), ["0"]))
+        for name in odd:
+            self.assertIn(name, self.stderr)
 
     def test_a_damaged_state_is_refused(self) -> None:
         """A state file that holds no time refuses, deleting nothing."""
@@ -2334,7 +2395,7 @@ class MakefileTest(AgeStandIn):
         """
         self.backup_dir.mkdir(exist_ok=True)
         now = int(time.time())
-        (self.backup_dir / ".prune-since").write_text(f"{now - 400 * DAY_S}\n", encoding="utf-8")
+        (self.backup_dir / ".prune-since").write_text(f"{now - 400 * DAY_S} 30\n", encoding="utf-8")
         name = f"neo4j-{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime(now - 40 * DAY_S))}.dump.age"
         (self.backup_dir / name).write_bytes(AGE_HEADER + b"old")
         return name

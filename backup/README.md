@@ -287,20 +287,27 @@ stores has a retention period of its own, and a backup kept longer would keep
 what the stores have already deleted. After every backup that succeeded,
 `make backup-neo4j` / `make backup-qdrant` delete that store's backups older
 than `BACKUP_RETENTION_DAYS` days (default `30`, whole days from 1 to 365,
-in `.env` or on the command line); `make backup-prune` does it on its own,
-e.g. after lowering the period. A backup that failed prunes nothing.
+in `.env` or on the command line); `make backup-prune` does it on its own. A
+backup that failed prunes nothing, and so does a Qdrant backup in which a
+collection failed: the old snapshots stay the last restore point of that
+collection until a backup succeeds again.
 
 - **Which files.** A backup's age is the UTC time in its name.
   - Encrypted backups (`*.age`) and unencrypted ones from earlier versions
     follow the same rule.
   - Never deleted, only named on the terminal: unfinished files (`.part`),
-    names without a time, and times in the future (check the host's clock).
+    names without a time or that the record cannot carry (anything but
+    letters, digits and `._-`), and times in the future (check the host's
+    clock).
   - A file the backup account cannot delete (an unencrypted dump an earlier
     version wrote as root) is named and counted as not deleted; remove it as
     root.
-- **Grace.** The first pruning on a host writes `snapshots/.prune-since` and
-  deletes nothing for one period, so nothing an earlier version left is
-  deleted without notice. Deleting the file restarts that grace period.
+- **Grace.** A period that is new on the host, or changed, takes effect when a
+  pruning first sees it: `snapshots/.prune-since` records when, and which
+  period (mode `0644`, so every account that backs up can read it). Nothing is
+  deleted for `RETENTION_NOTICE_DAYS` (default 30) after that, so nothing an
+  earlier version left is deleted without notice. Deleting the file restarts
+  the grace period.
 - **Off-host copies** are backups too. This repo cannot reach them: prune them
   at the same age, on the medium they are kept on.
 - **Recorded.** Each pruning is `delete` / `backup.prune.<store>` in the audit

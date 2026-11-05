@@ -14,10 +14,13 @@
 # neo4j-<YYYYmmddTHHMMSSZ>.dump[.age], qdrant-<collection>-<stamp>[-n].snapshot[.age].
 # Encrypted backups and the plaintext ones of earlier versions follow the same
 # rule. Never deleted, only named: unfinished files (.part), names without a
-# stamp, and stamps in the future (a clock set back).
+# stamp or that the audit record cannot carry (only letters, digits and ._-),
+# and stamps in the future (a clock set back).
 #
-# The first run on a host records when pruning took effect
-# ($BACKUP_DIR/.prune-since) and deletes nothing for one period, so nothing an
+# A period that is new on this host, or changed, takes effect when a run first
+# sees it ($BACKUP_DIR/.prune-since: "<epoch> <days>", mode 0644 so every
+# account that backs up can read it) and deletes nothing for the notice period
+# after that (RETENTION_NOTICE_DAYS, 1 to 365, default 30), so nothing an
 # earlier version left is deleted without notice. A file this account cannot
 # delete is named and counted as not deleted; it does not fail the run.
 #
@@ -49,6 +52,12 @@ if [[ ! $days =~ ^[0-9]{1,3}$ ]] || ((10#$days < 1 || 10#$days > 365)); then
   exit 2
 fi
 days=$((10#$days))
+notice=${RETENTION_NOTICE_DAYS:-30}
+if [[ ! $notice =~ ^[0-9]{1,3}$ ]] || ((10#$notice < 1 || 10#$notice > 365)); then
+  echo "ERROR: RETENTION_NOTICE_DAYS must be whole days from 1 to 365, not '$notice'. Nothing was deleted." >&2
+  exit 2
+fi
+notice=$((10#$notice))
 [[ $store != check ]] || exit 0
 facts=${AUDIT_FACTS:-/dev/null}
 period=$((days * 86400))
@@ -74,13 +83,31 @@ _utc() {
 
 dir=$(backup_dir)
 state="$dir/.prune-since"
+
+# _record_period: record that the period in force takes effect now.
+_record_period() {
+  if ! (umask 022 && printf '%s %s\n' "$now" "$days" >"$state.tmp" && mv -f "$state.tmp" "$state"); then
+    rm -f "$state.tmp"
+    echo "ERROR: cannot write $state with this account. Nothing was deleted." >&2
+    exit 2
+  fi
+}
 if [[ ! -e $state ]]; then
-  (umask 077 && printf '%s\n' "$now" >"$state")
+  _record_period
 fi
-since=$(head -n 1 "$state" 2>/dev/null || true)
-if [[ ! $since =~ ^[0-9]+$ ]]; then
-  echo "ERROR: $state holds no time. Delete it to restart the grace period. Nothing was deleted." >&2
+if [[ ! -r $state ]]; then
+  echo "ERROR: this account cannot read $state: make it readable (chmod 644), or run the backups as its owner. Nothing was deleted." >&2
   exit 2
+fi
+read -r since recorded _ <"$state" || true
+if [[ ! $since =~ ^[0-9]+$ || ! ${recorded:-} =~ ^[0-9]+$ ]]; then
+  echo "ERROR: $state holds no time and period. Delete it to restart the grace period. Nothing was deleted." >&2
+  exit 2
+fi
+if ((10#$recorded != days)); then
+  echo ">> BACKUP_RETENTION_DAYS changed from $((10#$recorded)) to $days: the new period takes effect now" >&2
+  _record_period
+  since=$now
 fi
 
 cutoff=$((now - period))
@@ -88,8 +115,8 @@ printf 'period_days=%s\ncutoff=%s\n' "$days" "$(_utc "$cutoff")" >>"$facts"
 deleted=0
 not_deleted=0
 
-if ((now < since + period)); then
-  echo ">> pruning takes effect on $(_utc $((since + period))): until then no backup is deleted" >&2
+if ((now < since + notice * 86400)); then
+  echo ">> pruning takes effect on $(_utc $((since + notice * 86400))): until then no backup is deleted" >&2
   printf 'deleted=0\nnot_deleted=0\n' >>"$facts"
   exit 0
 fi
@@ -97,7 +124,7 @@ fi
 if [[ $store == neo4j ]]; then
   pattern='^neo4j-([0-9]{8}T[0-9]{6}Z)\.dump(\.age)?$'
 else
-  pattern='^qdrant-.+-([0-9]{8}T[0-9]{6}Z)(-[0-9]+)?\.snapshot(\.age)?$'
+  pattern='^qdrant-[A-Za-z0-9._-]+-([0-9]{8}T[0-9]{6}Z)(-[0-9]+)?\.snapshot(\.age)?$'
 fi
 shopt -s nullglob
 for path in "$dir/$store"-*; do
@@ -107,8 +134,8 @@ for path in "$dir/$store"-*; do
     echo ">> left alone: $name (an unfinished backup)" >&2
     continue
   fi
-  if [[ ! $name =~ $pattern ]] || ! written=$(_epoch "${BASH_REMATCH[1]}"); then
-    echo ">> left alone: $name (no time in its name)" >&2
+  if ((${#name} > 255)) || [[ ! $name =~ $pattern ]] || ! written=$(_epoch "${BASH_REMATCH[1]}"); then
+    echo ">> left alone: $name (no time in its name, or a name the record cannot carry)" >&2
     continue
   fi
   if ((written > now)); then

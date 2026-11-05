@@ -66,7 +66,8 @@ backups earlier versions left (same file, Plaintext from earlier versions).
 
 **Upgrading to 0.7.0:** every backup deletes the store's backups older than
 `BACKUP_RETENTION_DAYS` (default 30) afterwards, recorded. The first run only
-records when pruning took effect; nothing is deleted for one period after it
+records when pruning took effect; nothing is deleted for `RETENTION_NOTICE_DAYS`
+(default 30) after it, nor after a change of the period
 ([`backup/README.md`](backup/README.md), Retention). Prune the off-host copies
 at the same age.
 
