@@ -111,13 +111,15 @@ backup/
   snapshots/           the encrypted backups (gitignored; created on demand)
     neo4j-<ISO8601-utc>.dump.age
     qdrant-<collection>-<ISO8601-utc>.snapshot.age
+    .prune-since         when pruning took effect on this host (Retention, below)
 ```
 
 The files belong to whoever ran the backup, mode `0600`. Copy `snapshots/`
 off-host as soon as the backup finishes: this directory is *staging*, not
 durable storage. The copies stay encrypted; keep the identity apart from them.
-Nothing prunes `snapshots/`: remove what is older than the local retention
-once it is copied ([Cadence](#cadence)).
+Every backup deletes the store's backups older than the retention period
+afterwards ([Retention](#retention)); the off-host copies are pruned at the
+same age by the operator.
 
 ## Neo4j (community edition)
 
@@ -190,9 +192,10 @@ again), and spot-check entity counts against the record kept at backup time.
 
 ### Cadence
 
-Default suggestion: **nightly** dumps with **14-day** local retention,
-**90-day** retention on off-host storage. Tighten if the data justifies
-it; the offline dump window is the binding constraint.
+Default suggestion: **nightly** dumps. Each one deletes the dumps older than
+`BACKUP_RETENTION_DAYS` (default 30) in `backup/snapshots/`; keep the off-host
+copies no longer ([Retention](#retention)). The offline dump window is the
+binding constraint.
 
 ## Qdrant
 
@@ -272,9 +275,47 @@ with "Permission denied".
 
 ### Cadence
 
-Default suggestion: **hourly** snapshots (cheap, online) with **24-hour**
-local retention in `backup/snapshots/`, **30-day** retention off-host. The
-volume keeps no snapshots; `backup/snapshots/` grows until you prune it.
+Default suggestion: **hourly** snapshots (cheap, online). Each run deletes the
+snapshots older than `BACKUP_RETENTION_DAYS` (default 30) in
+`backup/snapshots/`; keep the off-host copies no longer
+([Retention](#retention)). The volume keeps no snapshots.
+
+## Retention
+
+Backups are short-lived restore points, not an archive: the data in the
+stores has a retention period of its own, and a backup kept longer would keep
+what the stores have already deleted. After every backup that succeeded,
+`make backup-neo4j` / `make backup-qdrant` delete that store's backups older
+than `BACKUP_RETENTION_DAYS` days (default `30`, whole days from 1 to 365,
+in `.env` or on the command line); `make backup-prune` does it on its own. A
+backup that failed prunes nothing, and so does a Qdrant backup in which a
+collection failed: the old snapshots stay the last restore point of that
+collection until a backup succeeds again.
+
+- **Which files.** A backup's age is the UTC time in its name.
+  - Encrypted backups (`*.age`) and unencrypted ones from earlier versions
+    follow the same rule.
+  - Never deleted, only named on the terminal: unfinished files (`.part`),
+    names without a time or that the record cannot carry (anything but
+    letters, digits and `._-`), and times in the future (check the host's
+    clock).
+  - A file the backup account cannot delete (an unencrypted dump an earlier
+    version wrote as root) is named and counted as not deleted; remove it as
+    root.
+- **Grace.** A period that is new on the host, or changed, takes effect when a
+  pruning first sees it: `snapshots/.prune-since` records when, and which
+  period (mode `0644`, so every account that backs up can read it). Nothing is
+  deleted for `RETENTION_NOTICE_DAYS` (default 30) after that, so nothing an
+  earlier version left is deleted without notice. Deleting the file restarts
+  the grace period.
+- **Off-host copies** are backups too. This repo cannot reach them: prune them
+  at the same age, on the medium they are kept on.
+- **Recorded.** Each pruning is `delete` / `backup.prune.<store>` in the audit
+  trail, attributed like the backup that ran it, with the files deleted (by
+  name), the period, the cutoff and the counts (README: Audit trail).
+- **After a restore,** the restored data still carries its own deadlines: let
+  docint's daily retention sweep run (it starts a few minutes after docint's
+  backend starts) before users work on restored collections.
 
 ## Scheduling
 
