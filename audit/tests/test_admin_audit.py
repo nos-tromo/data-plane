@@ -8,6 +8,7 @@ either is missing, e.g. in the pinned python image, which mounts only ``audit/``
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import http.server
 import io
 import json
@@ -32,6 +33,7 @@ AUDIT_DIR = Path(__file__).resolve().parents[1]
 SCRIPTS = AUDIT_DIR.parent / "scripts"
 ADMIN_OVERLAY = AUDIT_DIR.parent / "docker" / "compose.admin.yaml"
 HAS_SCRIPTS = shutil.which("bash") is not None and (SCRIPTS / "audit-admin.sh").is_file()
+HAS_MAKE = HAS_SCRIPTS and shutil.which("make") is not None and (AUDIT_DIR.parent / "Makefile").is_file()
 ENVELOPE = frozenset(
     {"stream", "v", "event_id", "ts", "service", "service_version", "instance", "seq", "prev_hash", "hash"}
     | {"action", "operation", "outcome", "actor"}
@@ -41,6 +43,10 @@ PURPOSE = {"case_ref": "case-0001", "reason": "verify a reported duplicate"}
 DUMP = "neo4j-20260131T020000Z.dump"
 LOOPBACK = ["127.0.0.1:7474", "127.0.0.1:7687", "127.0.0.1:6333"]
 BOTH_STORES = {"kind": "store", "ids": ["neo4j", "qdrant"], "count": 2}
+FINGERPRINT = hashlib.sha256(b"age1synthetic0recipient\n").hexdigest()
+# What a backup reports about its encryption, and how its record shows it.
+ENCRYPTED = ("encryption=age", "recipients=2", f"recipients_sha256={FINGERPRINT}")
+ENCRYPTED_CRITERIA = {"encryption": "age", "recipients": 2, "recipients_sha256": FINGERPRINT}
 
 
 def lines(stream: io.StringIO) -> list[dict[str, Any]]:
@@ -182,6 +188,28 @@ class HelperTest(unittest.TestCase):
         for bad in ("", "-1", "1.5", "1e3", " 1", chr(0x0661), "1" * 19):
             with self.assertRaises(ValueError, msg=bad):
                 admin_audit.whole_number(bad)
+
+    def test_positive_number(self) -> None:
+        """A backup has at least one recipient: zero is refused like a non-number."""
+        self.assertEqual(admin_audit.positive_number("1"), 1)
+        self.assertEqual(admin_audit.positive_number("12"), 12)
+        for bad in ("0", "", "-2", "two"):
+            with self.assertRaises(ValueError, msg=bad):
+                admin_audit.positive_number(bad)
+
+    def test_sha256_hex(self) -> None:
+        """A fingerprint is 64 lowercase hex digits, nothing else."""
+        self.assertEqual(admin_audit.sha256_hex(FINGERPRINT), FINGERPRINT)
+        for bad in ("", FINGERPRINT[:-1], FINGERPRINT.upper(), FINGERPRINT + "0", "g" * 64):
+            with self.assertRaises(ValueError, msg=bad):
+                admin_audit.sha256_hex(bad)
+
+    def test_encryption(self) -> None:
+        """The only encryption a backup can report is age."""
+        self.assertEqual(admin_audit.encryption("age"), "age")
+        for bad in ("", "none", "gpg", "AGE"):
+            with self.assertRaises(ValueError, msg=bad):
+                admin_audit.encryption(bad)
 
     def test_file_name(self) -> None:
         """Only a base name is accepted: a path could name a user."""
@@ -441,16 +469,54 @@ class EndTest(Workspace):
             self.assertEqual((status, events), (2, []), pairs)
 
     def test_neo4j_backup_is_a_disclosure_to_file_backup(self) -> None:
-        """The dump's name and size, the database, the recipient."""
-        status, events = self.end(self.purposed(), "backup", "neo4j", f"file={DUMP}", "size_bytes=22430")
+        """The dump's name and size, its encryption, the database, the recipient."""
+        status, events = self.end(self.purposed(), "backup", "neo4j", f"file={DUMP}", "size_bytes=22430", *ENCRYPTED)
         self.assertEqual(status, 0)
         (event,) = records(events)
         self.assertEqual((event["action"], event["operation"], event["outcome"]), ("disclose", "backup.neo4j", "ok"))
         self.assertEqual(event["recipient"], "file:backup")
         self.assertEqual(event["target"], {"kind": "database", "ids": ["neo4j"], "count": 1})
-        self.assertEqual(event["criteria"], {"file": DUMP, "size_bytes": 22430, "exit_status": 0, "duration_s": 7})
+        self.assertEqual(
+            event["criteria"],
+            {"file": DUMP, "size_bytes": 22430, **ENCRYPTED_CRITERIA, "exit_status": 0, "duration_s": 7},
+        )
         self.assertEqual(event["purpose"], PURPOSE)
         self.assertNotIn("parent_event_id", event)
+        self.assert_chains_intact()
+
+    def test_backup_records_its_encryption(self) -> None:
+        """The record names the encryption, how many recipients and their set's fingerprint; never a key."""
+        pairs = (f"file={DUMP}.age", "size_bytes=22512", *ENCRYPTED)
+        status, events = self.end(self.purposed(), "backup", "neo4j", *pairs)
+        self.assertEqual(status, 0)
+        (event,) = records(events)
+        self.assertEqual(
+            event["criteria"],
+            {"file": f"{DUMP}.age", "size_bytes": 22512, **ENCRYPTED_CRITERIA, "exit_status": 0, "duration_s": 7},
+        )
+        facts = ["collection=docs", "snapshots=1", "size_bytes=4096", "failed=0", *ENCRYPTED]
+        _, events = self.end(self.purposed(), "backup", "qdrant", *facts)
+        (event,) = records(events)
+        self.assertEqual(event["criteria"]["recipients"], 2)
+        self.assertEqual(event["criteria"]["recipients_sha256"], FINGERPRINT)
+        self.assertNotIn("age1", json.dumps(event))
+        self.assert_chains_intact()
+
+    def test_success_must_state_the_encryption(self) -> None:
+        """An ok backup without its encryption facts, or an ok restore without its: exit 2, nothing written."""
+        restore_qdrant = ("collection=docs", "snapshot=qdrant-docs-1.snapshot.age")
+        for kind, store, pairs in (
+            ("backup", "neo4j", (f"file={DUMP}.age", "size_bytes=1")),
+            ("backup", "neo4j", (f"file={DUMP}.age", "encryption=age", "recipients=2")),
+            ("backup", "qdrant", ("collection=docs", "snapshots=1", "size_bytes=1", "failed=0")),
+            ("restore", "neo4j", (f"file={DUMP}.age", "size_bytes=1")),
+            ("restore", "qdrant", restore_qdrant),
+        ):
+            status, events = self.end(self.purposed(), kind, store, *pairs)
+            self.assertEqual((status, events), (2, []), (kind, store, pairs))
+        self.assertIn("succeeded without reporting", self.stderr.getvalue())
+        status, events = self.end(self.purposed(), "restore", "qdrant", *restore_qdrant, status=1)
+        self.assertEqual((status, records(events)[0]["outcome"]), (0, "error"))
         self.assert_chains_intact()
 
     def test_failed_backup_is_an_error(self) -> None:
@@ -477,7 +543,7 @@ class EndTest(Workspace):
     def test_long_collection_list_continues_in_id_events(self) -> None:
         """More than 200 collections are not cut: continuation events carry the rest."""
         names = [f"collection-{n:03d}" for n in range(450)]
-        _, events = self.end(self.purposed(), "backup", "qdrant", *[f"collection={name}" for name in names])
+        _, events = self.end(self.purposed(), "backup", "qdrant", *[f"collection={name}" for name in names], *ENCRYPTED)
         primary, *more = records(events)
         self.assertEqual(primary["operation"], "backup.qdrant")
         self.assertEqual(primary["target"]["count"], 450)
@@ -492,17 +558,21 @@ class EndTest(Workspace):
 
     def test_neo4j_restore_is_a_modification(self) -> None:
         """The dump loaded, by name and size; no recipient."""
-        _, events = self.end(self.environ(), "restore", "neo4j", f"file={DUMP}", "size_bytes=22430")
+        pairs = (f"file={DUMP}.age", "size_bytes=22512", "encryption=age")
+        _, events = self.end(self.environ(), "restore", "neo4j", *pairs)
         (event,) = records(events)
         self.assertEqual((event["action"], event["operation"], event["outcome"]), ("modify", "restore.neo4j", "ok"))
         self.assertEqual(event["target"], {"kind": "database", "ids": ["neo4j"], "count": 1})
-        self.assertEqual(event["criteria"], {"file": DUMP, "size_bytes": 22430, "exit_status": 0, "duration_s": 7})
+        self.assertEqual(
+            event["criteria"],
+            {"file": f"{DUMP}.age", "size_bytes": 22512, "encryption": "age", "exit_status": 0, "duration_s": 7},
+        )
         self.assertNotIn("recipient", event)
         self.assert_chains_intact()
 
     def test_qdrant_restore_names_its_collection(self) -> None:
-        """The collection replaced is the target; the snapshot and its source are criteria."""
-        pairs = ["collection=docs", "snapshot=docs-1-2026-01-31-02-00-00.snapshot", "source=host"]
+        """The collection replaced is the target; the snapshot and its encryption are criteria."""
+        pairs = ["collection=docs", "snapshot=qdrant-docs-20260131T020000Z.snapshot.age", "encryption=age"]
         _, events = self.end(self.purposed(), "restore", "qdrant", *pairs)
         (event,) = records(events)
         self.assertEqual(event["target"], {"kind": "collection", "ids": ["docs"], "count": 1})
@@ -510,8 +580,8 @@ class EndTest(Workspace):
             event["criteria"],
             {
                 "collection": "docs",
-                "snapshot": "docs-1-2026-01-31-02-00-00.snapshot",
-                "source": "host",
+                "snapshot": "qdrant-docs-20260131T020000Z.snapshot.age",
+                "encryption": "age",
                 "exit_status": 0,
                 "duration_s": 7,
             },
@@ -525,7 +595,13 @@ class EndTest(Workspace):
             ("backup", "neo4j", "size_bytes=ten"),
             ("backup", "neo4j", "path=/srv/backup/neo4j.dump"),
             ("backup", "neo4j", f"file={DUMP}", f"file={DUMP}"),
-            ("restore", "qdrant", "collection=docs", "snapshot=x.snapshot", "source=usb"),
+            ("restore", "qdrant", "collection=docs", "snapshot=x.snapshot.age", "source=host"),
+            ("backup", "neo4j", "encryption=none"),
+            ("backup", "neo4j", "recipients=0"),
+            ("backup", "qdrant", "recipients_sha256=0123"),
+            ("backup", "neo4j", "recipient=age1synthetic0recipient"),
+            ("restore", "neo4j", f"file={DUMP}", "encryption=gpg"),
+            ("restore", "neo4j", f"file={DUMP}", "recipients=2"),
         ]
         for args in bad:
             status, events = self.end(self.purposed(), *args)
@@ -544,10 +620,10 @@ class EndTest(Workspace):
             def write(self, s: str) -> int:
                 raise OSError("disk full")
 
-        code, events = self.end(self.purposed(AUDIT_OUTPUT="nowhere"), "backup", "neo4j")
+        code, events = self.end(self.purposed(AUDIT_OUTPUT="nowhere"), "backup", "neo4j", *ENCRYPTED)
         self.assertEqual((code, events), (1, []))
         with contextlib.redirect_stdout(Broken()), contextlib.redirect_stderr(self.stderr):
-            code = admin_audit.end(self.purposed(), "backup", "neo4j", [], status=0)
+            code = admin_audit.end(self.purposed(), "backup", "neo4j", list(ENCRYPTED), status=0)
         self.assertEqual(code, 1)
         self.assertIn("could not write the record", self.stderr.getvalue())
 
@@ -651,7 +727,18 @@ class CommandLineTest(Workspace):
         status, events, _ = self.run_main(self.purposed(), argv)
         self.assertEqual(status, 0)
         self.assertEqual(records(events)[0]["parent_event_id"], other[0])
-        argv = ["end", "backup", "neo4j", "--status", "0", "--duration-s", "3", f"file={DUMP}", "size_bytes=10"]
+        argv = [
+            "end",
+            "backup",
+            "neo4j",
+            "--status",
+            "0",
+            "--duration-s",
+            "3",
+            f"file={DUMP}",
+            "size_bytes=10",
+            *ENCRYPTED,
+        ]
         status, events, _ = self.run_main(self.purposed(), argv)
         self.assertEqual((status, records(events)[0]["criteria"]["size_bytes"]), (0, 10))
         self.assert_chains_intact()
@@ -847,12 +934,21 @@ class WrapperScriptTest(ComposeStandIn):
     def test_parameters_reach_both_calls(self) -> None:
         """A restore's parameters are checked at begin and recorded at end."""
         status, calls, events, _ = self.run_wrapper(
-            "restore", "neo4j", f"file={DUMP}", "--", "sh", "-c", 'echo "size_bytes=10" >> "$AUDIT_FACTS"'
+            "restore",
+            "neo4j",
+            f"file={DUMP}",
+            "--",
+            "sh",
+            "-c",
+            'printf "size_bytes=10\\nencryption=age\\n" >> "$AUDIT_FACTS"',
         )
         self.assertEqual(status, 0)
         self.assertTrue(calls[0].endswith(f"begin restore neo4j file={DUMP}"), calls[0])
         (event,) = records(events)
-        self.assertEqual(event["criteria"], {"file": DUMP, "size_bytes": 10, "exit_status": 0, "duration_s": 0})
+        self.assertEqual(
+            event["criteria"],
+            {"file": DUMP, "size_bytes": 10, "encryption": "age", "exit_status": 0, "duration_s": 0},
+        )
         self.assert_chains_intact()
 
     def test_piped_input_reaches_the_command(self) -> None:
@@ -895,40 +991,181 @@ class WrapperScriptTest(ComposeStandIn):
             self.assertEqual((status, calls), (2, []), args)
 
 
+# A stand-in for age with its command line (-R/-i/-o/-d, one input file or
+# stdin) and a readable "ciphertext": its header, then the plaintext. It
+# refuses recipients that are not age1... keys and identities without the
+# stand-in's secret, and logs every call. FAKE_AGE_FAIL=encrypt|decrypt fails
+# that direction once it has written (a decryption after FAKE_AGE_PASS_BYTES
+# bytes, and only from its FAKE_AGE_FAIL_FROM-th call on), except into
+# /dev/null; FAKE_AGE_WARN warns like age about a key it skips.
+FAKE_AGE = r"""#!/usr/bin/env python3
+import os
+import sys
+
+HEADER = b"age-encryption.org/v1\n-> X25519 stand-in\n--- stand-in\n"
+SECRET = "AGE-SECRET-KEY-1ZZSTANDIN"
+args = sys.argv[1:]
+with open(os.environ["FAKE_AGE_LOG"], "a", encoding="utf-8") as log:
+    log.write("age " + " ".join(args) + "\n")
+
+
+def fail(message):
+    sys.stderr.write(f"age: error: {message}\n")
+    sys.exit(1)
+
+
+options, inputs, decrypt, i = {}, [], False, 0
+while i < len(args):
+    if args[i] in ("-R", "-i", "-o"):
+        options[args[i]] = args[i + 1]
+        i += 2
+    elif args[i] == "-d":
+        decrypt, i = True, i + 1
+    else:
+        inputs.append(args[i])
+        i += 1
+data = open(inputs[0], "rb").read() if inputs else sys.stdin.buffer.read()
+if decrypt:
+    try:
+        identity = open(options["-i"], encoding="utf-8").read()
+    except OSError:
+        fail("failed to open the identity file")
+    if SECRET not in identity:
+        fail("no identity matched any of the recipients")
+    if not data.startswith(HEADER):
+        fail("failed to read header")
+    out = data[len(HEADER):]
+    with open(os.environ["FAKE_AGE_LOG"], encoding="utf-8") as log:
+        decryptions = sum(line.startswith("age -d ") for line in log)
+    if decryptions < int(os.environ.get("FAKE_AGE_FAIL_FROM", "1")):
+        os.environ.pop("FAKE_AGE_FAIL", None)
+    if os.environ.get("FAKE_AGE_FAIL") == "decrypt":
+        out = out[: int(os.environ.get("FAKE_AGE_PASS_BYTES", "0"))]
+else:
+    try:
+        lines = open(options["-R"], encoding="utf-8").read().replace("\r", "").split("\n")
+    except OSError:
+        fail("failed to open recipient file")
+    keys = [line for line in lines if line and not line.startswith("#")]
+    for number, line in enumerate(lines, 1):
+        if line in keys and not line.startswith("age1"):
+            fail(f"malformed recipient at line {number}")
+    if not keys:
+        fail("no recipients found")
+    if os.environ.get("FAKE_AGE_WARN"):
+        sys.stderr.write("age: warning: ignoring unsupported SSH key\n")
+    out = HEADER + data
+if out:
+    if "-o" in options:
+        with open(options["-o"], "wb") as sink:
+            sink.write(out)
+    else:
+        sys.stdout.buffer.write(out)
+elif "-o" in options and not decrypt:
+    open(options["-o"], "wb").close()
+if os.environ.get("FAKE_AGE_FAIL") == ("decrypt" if decrypt else "encrypt") and options.get("-o") != "/dev/null":
+    fail("stand-in failure")
+"""
+AGE_HEADER = b"age-encryption.org/v1\n-> X25519 stand-in\n--- stand-in\n"
+AGE_SECRET = "AGE-SECRET-KEY-1ZZSTANDIN"
+# Two synthetic public keys, as a recipients file lists them.
+RECIPIENT_KEYS = ("age1zzsyntheticrecipient0aaaa", "age1zzsyntheticrecipient0bbbb")
+
+
+def recipients_fingerprint(keys: tuple[str, ...]) -> str:
+    """Compute the fingerprint a backup records for a set of public keys.
+
+    Args:
+        keys: The keys, in any order, repeats allowed.
+
+    Returns:
+        The SHA-256 of the distinct keys, sorted, one per line.
+    """
+    return hashlib.sha256("".join(f"{key}\n" for key in sorted(set(keys))).encode()).hexdigest()
+
+
+class AgeStandIn(unittest.TestCase):
+    """A temporary directory with the age stand-in first on PATH and a recipients file."""
+
+    @override
+    def setUp(self) -> None:
+        """Create the stand-in, its log and a recipients file with two keys."""
+        self.tmp = Path(tempfile.mkdtemp(prefix="admin-audit-age-"))
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.bin = self.tmp / "bin"
+        self.bin.mkdir()
+        age = self.bin / "age"
+        age.write_text(FAKE_AGE, encoding="utf-8")
+        age.chmod(0o755)
+        self.age_log = self.tmp / "age.log"
+        self.recipients = self.tmp / "recipients.txt"
+        self.recipients.write_text(f"# keyholder one\n{RECIPIENT_KEYS[0]}\n{RECIPIENT_KEYS[1]}\n", encoding="utf-8")
+        self.recipients.chmod(0o644)
+        self.env = {
+            "PATH": f"{self.bin}{os.pathsep}{os.environ['PATH']}",
+            "FAKE_AGE_LOG": str(self.age_log),
+            "BACKUP_RECIPIENTS": str(self.recipients),
+        }
+
+    def age_calls(self) -> list[str]:
+        """Read the stand-in's log.
+
+        Returns:
+            Its calls, in order.
+        """
+        return self.age_log.read_text(encoding="utf-8").splitlines() if self.age_log.exists() else []
+
+
 # A stand-in for `docker compose` for the store scripts: logs every call and
-# plays the part of neo4j-admin and of the Qdrant container.
+# plays the part of neo4j-admin and of the Qdrant container. FAKE_INTERRUPT
+# names a call that is interrupted like ^C: SIGINT to the whole process group.
 FAKE_STORE_COMPOSE = r"""#!/usr/bin/env bash
 call="$*"
 printf 'compose %s\n' "${call//$'\n'/\\n}" >> "$FAKE_LOG"
 args=("$@")
+api=""
+for ((i = 0; i < ${#args[@]}; i++)); do
+  [[ ${args[i]} == qdrant_api ]] && api=${args[i + 1]}
+done
+last=${args[${#args[@]} - 1]}
+interrupt() { [[ ${FAKE_INTERRUPT:-} != "$1" ]] || kill -INT 0; }
 case " $* " in
   *" stop neo4j "*) exit "${FAKE_STOP:-0}" ;;
   *" start neo4j "*) exit "${FAKE_START:-0}" ;;
-  *" run --rm "*)
-    for ((i = 0; i < ${#args[@]}; i++)); do
-      [[ ${args[i]} == -v ]] && mount=${args[i + 1]}
-      [[ ${args[i]} == -c ]] && command=${args[i + 1]}
-    done
-    if [[ ${FAKE_RUN:-0} == 0 && $command == *"database dump"* ]]; then
-      head -c 1234 /dev/zero > "${mount%%:*}/${command##*/backup/}"
-    fi
+  *" run --rm -T --entrypoint neo4j-admin neo4j database dump neo4j --to-stdout "*)
+    printf 'DZV1 synthetic dump of Alice Example'
+    interrupt dump
     exit "${FAKE_RUN:-0}" ;;
+  *" run --rm -T --entrypoint neo4j-admin neo4j database load "*)
+    cat > "${FAKE_LOG%/*}/loaded"
+    exit "${FAKE_LOAD:-0}" ;;
+  *" run --rm "*) exit "${FAKE_RUN:-0}" ;;
   *" sh -c command -v bash"*) exit "${FAKE_NO_BASH:-0}" ;;
-  *" bash -s "*) cat > /dev/null; printf 'collection=docs\nsnapshots=1\nsize_bytes=2048\nfailed=0\n' ;;
+  *"shopt -s globstar"*) echo "${FAKE_LEFTOVERS:-0}" ;;
+  *" cat /qdrant/snapshots/"*)
+    printf 'snapshot bytes of %s' "$last"
+    interrupt cat
+    [[ $last != */"${FAKE_CAT_FAIL:-none}"-* ]] || exit 1 ;;
   *" sh -c "*"cat >"*) cat > "${FAKE_LOG%/*}/streamed" ;;
 esac
+case $api in
+  collections) printf '%b' "${FAKE_COLLECTIONS-docs\n}" ;;
+  snapshot) [[ $last != "${FAKE_SNAPSHOT_FAIL:-}" ]] || exit 1; printf '%s-1-2026-11-04-02-00-00.snapshot\n' "$last" ;;
+  drop-snapshot) exit "${FAKE_DROP:-0}" ;;
+  recover) exit "${FAKE_RECOVER:-0}" ;;
+esac
+exit 0
 """
 
 
 @unittest.skipUnless(HAS_SCRIPTS, "needs bash and the repo's scripts/")
-class StoreScriptTest(unittest.TestCase):
-    """scripts/neo4j_admin.sh and scripts/qdrant_admin.sh with a stand-in compose."""
+class StoreScriptTest(AgeStandIn):
+    """scripts/neo4j_admin.sh and scripts/qdrant_admin.sh with a stand-in compose and age."""
 
     @override
     def setUp(self) -> None:
-        """Create the stand-in, a backup directory and the facts file."""
-        self.tmp = Path(tempfile.mkdtemp(prefix="admin-audit-store-"))
-        self.addCleanup(shutil.rmtree, self.tmp, True)
+        """Create the stand-ins, a backup directory and the facts file."""
+        super().setUp()
         self.log = self.tmp / "calls.log"
         self.facts = self.tmp / "facts"
         self.backup_dir = self.tmp / "snapshots"
@@ -936,9 +1173,10 @@ class StoreScriptTest(unittest.TestCase):
         compose.write_text(FAKE_STORE_COMPOSE, encoding="utf-8")
         compose.chmod(0o755)
         self.compose = f"{compose} --env-file .env -f docker/compose.yaml"
+        self.stderr = ""
 
     def run_script(self, script: str, *args: str, **env: str) -> tuple[int, list[str], list[str]]:
-        """Run a store script.
+        """Run a store script, in a process group of its own (as a terminal would).
 
         Args:
             script: ``neo4j_admin.sh`` or ``qdrant_admin.sh``.
@@ -947,11 +1185,12 @@ class StoreScriptTest(unittest.TestCase):
 
         Returns:
             The exit status, the compose calls in order, and the facts reported.
+            What it wrote to stderr is kept in ``self.stderr``.
         """
         result = subprocess.run(
             ["bash", str(SCRIPTS / script), *args],
             env={
-                "PATH": os.environ["PATH"],
+                **self.env,
                 "COMPOSE": self.compose,
                 "BACKUP_DIR": str(self.backup_dir),
                 "AUDIT_FACTS": str(self.facts),
@@ -962,9 +1201,29 @@ class StoreScriptTest(unittest.TestCase):
             capture_output=True,
             text=True,
             check=False,
+            start_new_session=True,
         )
+        self.stderr = result.stderr
         calls = [line.split(" -f docker/compose.yaml ", 1)[-1] for line in self.read(self.log)]
         return result.returncode, calls, self.read(self.facts)
+
+    def backups(self) -> dict[str, bytes]:
+        """Read every file the backup directory holds.
+
+        Returns:
+            Their contents by name.
+        """
+        if not self.backup_dir.is_dir():
+            return {}
+        return {path.name: path.read_bytes() for path in sorted(self.backup_dir.iterdir())}
+
+    def encryption_facts(self) -> list[str]:
+        """Build the encryption facts a backup to the two stand-in keys reports.
+
+        Returns:
+            The key=value lines.
+        """
+        return ["encryption=age", "recipients=2", f"recipients_sha256={recipients_fingerprint(RECIPIENT_KEYS)}"]
 
     @staticmethod
     def read(path: Path) -> list[str]:
@@ -978,22 +1237,71 @@ class StoreScriptTest(unittest.TestCase):
         """
         return path.read_text(encoding="utf-8").splitlines() if path.exists() else []
 
-    def test_dump_stops_dumps_starts_and_reports_the_file(self) -> None:
-        """Neo4j is stopped for the dump and started again; the file is reported."""
+    @staticmethod
+    def qdrant_steps(calls: list[str]) -> list[str]:
+        """Shorten the calls into the Qdrant container to what they do.
+
+        Args:
+            calls: The compose calls.
+
+        Returns:
+            ``api <command>`` for scripts/qdrant_api.sh, ``leftovers`` for the
+            count of files in the snapshot volume, other calls as they are.
+        """
+        steps = []
+        for call in calls:
+            if " qdrant_api " in call:
+                steps.append("api " + call.rsplit(" qdrant_api ", 1)[1])
+            else:
+                steps.append("leftovers" if "shopt -s globstar" in call else call)
+        return steps
+
+    def test_dump_streams_through_age_into_the_backup_directory(self) -> None:
+        """Stopped, dumped to stdout, encrypted on the way, started again: one encrypted file, nothing else."""
         status, calls, facts = self.run_script("neo4j_admin.sh", "dump")
-        self.assertEqual(status, 0)
+        self.assertEqual(status, 0, self.stderr)
         self.assertEqual([call.split()[0] for call in calls], ["stop", "run", "start"])
-        self.assertIn(f"-v {self.backup_dir}:/backup --entrypoint /bin/bash neo4j -c", calls[1])
-        self.assertRegex(facts[0], r"^file=neo4j-\d{8}T\d{6}Z\.dump$")
-        self.assertEqual(facts[1], "size_bytes=1234")
-        self.assertTrue((self.backup_dir / facts[0].removeprefix("file=")).is_file())
+        self.assertEqual(calls[1], "run --rm -T --entrypoint neo4j-admin neo4j database dump neo4j --to-stdout")
+        ((name, content),) = self.backups().items()
+        self.assertRegex(name, r"^neo4j-\d{8}T\d{6}Z\.dump\.age$")
+        self.assertEqual(content, AGE_HEADER + b"DZV1 synthetic dump of Alice Example")
+        self.assertEqual(
+            self.age_calls(),
+            [f"age -R {self.recipients} -o /dev/null", f"age -R {self.recipients} -o {self.backup_dir}/{name}.part"],
+        )
+        self.assertEqual(facts, [*self.encryption_facts(), f"file={name}", f"size_bytes={len(content)}"])
+        self.assertEqual((self.backup_dir / name).stat().st_mode & 0o777, 0o600)
+
+    def test_dump_refuses_without_recipients(self) -> None:
+        """No recipients file: refused before Neo4j is touched, saying how to make a key pair."""
+        for recipients in ("", str(self.tmp / "missing.txt")):
+            status, calls, facts = self.run_script("neo4j_admin.sh", "dump", BACKUP_RECIPIENTS=recipients)
+            self.assertEqual((status, calls, facts), (2, [], []), recipients)
+            self.assertIn("age-keygen -o", self.stderr)
+        self.assertEqual(self.backups(), {})
 
     def test_failed_dump_still_starts_neo4j(self) -> None:
-        """A failing neo4j-admin never leaves Neo4j down; nothing is reported."""
+        """A failing neo4j-admin never leaves Neo4j down; no file is kept or reported."""
         status, calls, facts = self.run_script("neo4j_admin.sh", "dump", FAKE_RUN="1")
         self.assertEqual(status, 1)
         self.assertEqual([call.split()[0] for call in calls], ["stop", "run", "start"])
-        self.assertEqual(facts, [])
+        self.assertEqual(facts, self.encryption_facts())
+        self.assertEqual(self.backups(), {})
+
+    def test_failed_encryption_keeps_nothing(self) -> None:
+        """Age failing after it wrote part of the file leaves no file, not even the part."""
+        status, calls, facts = self.run_script("neo4j_admin.sh", "dump", FAKE_AGE_FAIL="encrypt")
+        self.assertEqual(status, 1)
+        self.assertEqual(calls[-1], "start neo4j")
+        self.assertEqual(self.backups(), {})
+        self.assertEqual(facts, self.encryption_facts())
+
+    def test_interrupted_dump_starts_neo4j_again(self) -> None:
+        """^C during the dump: the unfinished file goes, Neo4j starts again, exit 130."""
+        status, calls, _ = self.run_script("neo4j_admin.sh", "dump", FAKE_INTERRUPT="dump")
+        self.assertEqual(status, 130)
+        self.assertEqual([call.split()[0] for call in calls], ["stop", "run", "start"])
+        self.assertEqual(self.backups(), {})
 
     def test_nothing_runs_when_neo4j_cannot_be_stopped(self) -> None:
         """No dump against a running database."""
@@ -1001,62 +1309,540 @@ class StoreScriptTest(unittest.TestCase):
         self.assertNotEqual(status, 0)
         self.assertEqual([call.split()[0] for call in calls], ["stop"])
 
-    def test_load_mounts_the_dump_as_neo4j_dump(self) -> None:
-        """The chosen dump is loaded read-only under the name neo4j-admin expects."""
-        self.backup_dir.mkdir()
-        (self.backup_dir / DUMP).write_bytes(b"x" * 99)
-        status, calls, facts = self.run_script("neo4j_admin.sh", "load", DUMP)
-        self.assertEqual(status, 0)
+    def encrypted(self, name: str, plaintext: bytes) -> Path:
+        """Put a backup encrypted by the stand-in into the backup directory.
+
+        Args:
+            name: Its file name.
+            plaintext: What it decrypts to.
+
+        Returns:
+            Its path.
+        """
+        self.backup_dir.mkdir(exist_ok=True)
+        path = self.backup_dir / name
+        path.write_bytes(AGE_HEADER + plaintext)
+        return path
+
+    def identity(self, secret: str = AGE_SECRET) -> str:
+        """Write an identity file, as an operator brings one for a restore.
+
+        Args:
+            secret: Its key; the stand-in's own unless another is wanted.
+
+        Returns:
+            Its path.
+        """
+        path = self.tmp / "offline" / "backup-identity.txt"
+        path.parent.mkdir(exist_ok=True)
+        path.write_text(f"# created offline\n{secret}\n", encoding="utf-8")
+        return str(path)
+
+    def test_load_checks_the_whole_file_then_streams_it_in(self) -> None:
+        """Decrypted whole while Neo4j runs, then stopped, decrypted into neo4j-admin, started again."""
+        dump = self.encrypted(f"{DUMP}.age", b"DZV1 synthetic dump of Alice Example")
+        identity = self.identity()
+        status, calls, facts = self.run_script("neo4j_admin.sh", "load", dump.name, IDENTITY=identity)
+        self.assertEqual(status, 0, self.stderr)
+        self.assertEqual(self.age_calls(), [f"age -d -i {identity} {dump}"] * 2)
+        self.assertEqual(
+            calls,
+            [
+                "stop neo4j",
+                "run --rm -T --entrypoint neo4j-admin neo4j"
+                " database load neo4j --from-stdin --overwrite-destination=true",
+                "start neo4j",
+            ],
+        )
+        self.assertEqual((self.tmp / "loaded").read_bytes(), b"DZV1 synthetic dump of Alice Example")
+        self.assertEqual(facts, [f"size_bytes={dump.stat().st_size}", "encryption=age"])
+        self.assertEqual(sorted(path.name for path in self.backup_dir.iterdir()), [dump.name])
+
+    def test_load_refuses_before_anything_without_a_usable_identity_or_file(self) -> None:
+        """No identity, an unreadable one, a plaintext dump, a missing or odd name: exit 2, nothing run."""
+        dump = self.encrypted(f"{DUMP}.age", b"DZV1 synthetic dump")
+        (self.backup_dir / DUMP).write_bytes(b"DZV1 an earlier, unencrypted dump")
+        cases: list[tuple[str, dict[str, str]]] = [
+            (dump.name, {}),
+            (dump.name, {"IDENTITY": str(self.tmp / "missing.key")}),
+            (DUMP, {"IDENTITY": self.identity()}),
+            ("neo4j-20260101T000000Z.dump.age", {"IDENTITY": self.identity()}),
+            ("../neo4j.dump", {"IDENTITY": self.identity()}),
+            ("a:b.dump", {"IDENTITY": self.identity()}),
+        ]
+        for name, env in cases:
+            status, calls, _ = self.run_script("neo4j_admin.sh", "load", name, **env)
+            self.assertEqual((status, calls), (2, []), (name, env))
+        self.assertEqual(self.age_calls(), [])
+
+    def test_another_identity_never_stops_neo4j(self) -> None:
+        """The whole-file check fails: Neo4j keeps running untouched."""
+        dump = self.encrypted(f"{DUMP}.age", b"DZV1 synthetic dump")
+        status, calls, facts = self.run_script(
+            "neo4j_admin.sh", "load", dump.name, IDENTITY=self.identity("AGE-SECRET-KEY-1ZZOTHER")
+        )
+        self.assertEqual((status, calls), (1, []))
+        self.assertIn("does not decrypt with this identity", self.stderr)
+        self.assertIn("encryption=age", facts)
+
+    def test_a_file_that_holds_no_dump_never_stops_neo4j(self) -> None:
+        """An encrypted Qdrant snapshot given as a dump decrypts, but is refused before the stop."""
+        snapshot = self.encrypted("qdrant-docs-20260131T020000Z.snapshot.age", b"a tar archive, not a dump")
+        status, calls, _ = self.run_script("neo4j_admin.sh", "load", snapshot.name, IDENTITY=self.identity())
+        self.assertEqual((status, calls), (1, []))
+        self.assertIn("holds no Neo4j dump", self.stderr)
+
+    def test_a_decryption_that_fails_at_once_never_starts_the_load(self) -> None:
+        """The second decryption fails before any byte (a mistyped passphrase): neo4j-admin never runs."""
+        dump = self.encrypted(f"{DUMP}.age", b"DZV1 synthetic dump")
+        second_fails = {"FAKE_AGE_FAIL": "decrypt", "FAKE_AGE_FAIL_FROM": "2"}
+        status, calls, _ = self.run_script(
+            "neo4j_admin.sh", "load", dump.name, IDENTITY=self.identity(), **second_fails
+        )
+        self.assertEqual(status, 1)
+        self.assertEqual(calls, ["stop neo4j", "start neo4j"])
+        self.assertFalse((self.tmp / "loaded").exists())
+        self.assertIn("the database was not touched", self.stderr)
+
+    def test_a_failed_load_still_starts_neo4j(self) -> None:
+        """neo4j-admin failing never leaves Neo4j down."""
+        dump = self.encrypted(f"{DUMP}.age", b"DZV1 synthetic dump")
+        status, calls, _ = self.run_script("neo4j_admin.sh", "load", dump.name, IDENTITY=self.identity(), FAKE_LOAD="1")
+        self.assertEqual(status, 1)
         self.assertEqual([call.split()[0] for call in calls], ["stop", "run", "start"])
-        self.assertIn(f"-v {self.backup_dir}/{DUMP}:/backup/neo4j.dump:ro", calls[1])
-        self.assertIn("neo4j-admin database load neo4j --from-path=/backup --overwrite-destination=true", calls[1])
-        self.assertEqual(facts, ["size_bytes=99"])
 
-    def test_load_refuses_a_missing_or_odd_dump(self) -> None:
-        """No such dump, or a name with a path in it: exit 2, Neo4j untouched."""
-        for name in (DUMP, "../neo4j.dump", "a:b.dump"):
-            status, calls, _ = self.run_script("neo4j_admin.sh", "load", name)
-            self.assertEqual((status, calls), (2, []), name)
+    def test_snapshots_leave_the_volume_encrypted(self) -> None:
+        """Per collection: snapshot, copy out through age, delete in the volume; a file and a fact each."""
+        docs = "docs-1-2026-11-04-02-00-00.snapshot"
+        cases = "case files 2026-1-2026-11-04-02-00-00.snapshot"
+        status, calls, facts = self.run_script(
+            "qdrant_admin.sh", "snapshot", PROFILE="cpu", FAKE_COLLECTIONS="docs\ncase files 2026\n"
+        )
+        self.assertEqual(status, 0, self.stderr)
+        self.assertEqual(
+            self.qdrant_steps(calls),
+            [
+                "exec -T qdrant-cpu sh -c command -v bash >/dev/null 2>&1",
+                "api collections",
+                "api snapshot docs",
+                f"exec -T qdrant-cpu cat /qdrant/snapshots/docs/{docs}",
+                f"api drop-snapshot docs {docs}",
+                "api snapshot case files 2026",
+                f"exec -T qdrant-cpu cat /qdrant/snapshots/case files 2026/{cases}",
+                f"api drop-snapshot case files 2026 {cases}",
+                "leftovers",
+            ],
+        )
+        files = self.backups()
+        cases_file, docs_file = sorted(files)
+        self.assertRegex(cases_file, r"^qdrant-case_files_2026-\d{8}T\d{6}Z\.snapshot\.age$")
+        self.assertRegex(docs_file, r"^qdrant-docs-\d{8}T\d{6}Z\.snapshot\.age$")
+        self.assertEqual(files[docs_file], AGE_HEADER + f"snapshot bytes of /qdrant/snapshots/docs/{docs}".encode())
+        total = sum(len(content) for content in files.values())
+        self.assertEqual(
+            facts,
+            [
+                *self.encryption_facts(),
+                "collection=docs",
+                "collection=case files 2026",
+                "snapshots=2",
+                f"size_bytes={total}",
+                "failed=0",
+            ],
+        )
 
-    def test_snapshot_reports_what_the_container_script_wrote(self) -> None:
-        """The snapshot script's stdout becomes the facts."""
-        status, calls, facts = self.run_script("qdrant_admin.sh", "snapshot", PROFILE="cpu")
-        self.assertEqual(status, 0)
-        self.assertEqual(calls[-1], "exec -T qdrant-cpu bash -s")
-        self.assertEqual(facts, ["collection=docs", "snapshots=1", "size_bytes=2048", "failed=0"])
+    def test_a_failed_copy_still_leaves_the_volume(self) -> None:
+        """One copy fails: its snapshot is deleted all the same and counted; the others go on."""
+        status, calls, facts = self.run_script(
+            "qdrant_admin.sh", "snapshot", FAKE_COLLECTIONS="docs\nnotes\n", FAKE_CAT_FAIL="docs"
+        )
+        self.assertEqual(status, 1)
+        self.assertIn("api drop-snapshot docs docs-1-2026-11-04-02-00-00.snapshot", self.qdrant_steps(calls))
+        (name,) = self.backups()
+        self.assertTrue(name.startswith("qdrant-notes-"), name)
+        size = len(self.backups()[name])
+        self.assertEqual(facts[3:], ["collection=notes", "snapshots=1", f"size_bytes={size}", "failed=1"])
+
+    def test_a_snapshot_left_in_the_volume_fails_the_backup(self) -> None:
+        """A snapshot that cannot be deleted is an error, though its encrypted copy is kept."""
+        status, _, facts = self.run_script("qdrant_admin.sh", "snapshot", FAKE_DROP="1")
+        self.assertEqual(status, 1)
+        self.assertEqual(len(self.backups()), 1)
+        self.assertIn("collection=docs", facts)
+        self.assertIn("still in the qdrant-snapshots volume", self.stderr)
+
+    def test_an_interrupted_copy_still_leaves_the_volume(self) -> None:
+        """^C while a snapshot is copied out: it is deleted in the volume, the unfinished file goes, exit 130."""
+        status, calls, _ = self.run_script("qdrant_admin.sh", "snapshot", FAKE_INTERRUPT="cat")
+        self.assertEqual(status, 130)
+        self.assertEqual(self.qdrant_steps(calls)[-1], "api drop-snapshot docs docs-1-2026-11-04-02-00-00.snapshot")
+        self.assertEqual(self.backups(), {})
+
+    def test_snapshot_refuses_without_recipients(self) -> None:
+        """No recipients: nothing is asked of Qdrant at all."""
+        status, calls, facts = self.run_script("qdrant_admin.sh", "snapshot", BACKUP_RECIPIENTS="")
+        self.assertEqual((status, calls, facts), (2, [], []))
 
     def test_snapshot_needs_bash_in_the_image(self) -> None:
         """Without bash in the image no snapshot is attempted."""
         status, calls, facts = self.run_script("qdrant_admin.sh", "snapshot", FAKE_NO_BASH="1")
         self.assertEqual((status, len(calls), facts), (1, 1, []))
 
-    def test_recover_copies_a_host_snapshot_in_first(self) -> None:
-        """A snapshot in the backup directory is streamed into the container, then recovered."""
+    def test_unencrypted_leftovers_are_reported(self) -> None:
+        """Plaintext an earlier version left, in the volume or the backup directory, is named, never touched."""
         self.backup_dir.mkdir()
-        snapshot = "docs-1-2026-01-31-02-00-00.snapshot"
-        (self.backup_dir / snapshot).write_bytes(b"snapshot bytes")
-        status, calls, facts = self.run_script("qdrant_admin.sh", "recover", "docs", snapshot, PROFILE="cuda")
-        self.assertEqual(status, 0)
-        path = f"/qdrant/snapshots/docs/{snapshot}"
-        self.assertTrue(calls[0].startswith("exec -T qdrant-cuda sh -c "), calls[0])
-        self.assertTrue(calls[0].endswith(f" _ {path}"), calls[0])
-        self.assertEqual((self.tmp / "streamed").read_bytes(), b"snapshot bytes")
-        self.assertTrue(calls[1].startswith("exec -T qdrant-cuda bash -c "), calls[1])
-        self.assertTrue(calls[1].endswith(f"qdrant_api recover docs {path}"), calls[1])
-        self.assertEqual(facts, ["source=host"])
+        (self.backup_dir / DUMP).write_bytes(b"an earlier, unencrypted dump")
+        status, _, _ = self.run_script("qdrant_admin.sh", "snapshot", FAKE_LEFTOVERS="3")
+        self.assertEqual(status, 0, self.stderr)
+        self.assertIn("1 unencrypted backup file(s)", self.stderr)
+        self.assertIn("3 unencrypted file(s) remain in the qdrant-snapshots volume", self.stderr)
+        self.assertTrue((self.backup_dir / DUMP).is_file())
 
-    def test_recover_from_the_volume(self) -> None:
-        """Without a host copy, the snapshot is taken from Qdrant's volume."""
-        status, calls, facts = self.run_script("qdrant_admin.sh", "recover", "docs", "docs-1.snapshot")
-        self.assertEqual(status, 0)
-        self.assertEqual(len(calls), 1)
-        self.assertEqual(facts, ["source=volume"])
+    def test_recover_decrypts_into_the_volume_and_cleans_up(self) -> None:
+        """Decrypted into a private .part, renamed, recovered from, then deleted from the volume."""
+        snapshot = self.encrypted("qdrant-docs-20260131T020000Z.snapshot.age", b"synthetic snapshot tar")
+        identity = self.identity()
+        status, calls, facts = self.run_script(
+            "qdrant_admin.sh", "recover", "docs", snapshot.name, PROFILE="cuda", IDENTITY=identity
+        )
+        self.assertEqual(status, 0, self.stderr)
+        path = "/qdrant/snapshots/docs/qdrant-docs-20260131T020000Z.snapshot"
+        steps = self.qdrant_steps(calls)
+        self.assertTrue(steps[0].startswith("exec -T qdrant-cuda sh -c umask 077 && "), steps[0])
+        self.assertTrue(steps[0].endswith(f' && cat >"$1.part" _ {path}'), steps[0])
+        self.assertEqual(
+            steps[1:],
+            [
+                f"exec -T qdrant-cuda mv {path}.part {path}",
+                f"api recover docs {path}",
+                f"exec -T qdrant-cuda rm -f {path} {path}.part",
+            ],
+        )
+        self.assertEqual((self.tmp / "streamed").read_bytes(), b"synthetic snapshot tar")
+        self.assertEqual(self.age_calls(), [f"age -d -i {identity} {snapshot}"])
+        self.assertEqual(facts, ["encryption=age"])
 
-    def test_recover_refuses_odd_names(self) -> None:
-        """Names that could leave the snapshot directory are refused before anything runs."""
-        for args in (("../docs", "x.snapshot"), ("docs", "../x.snapshot"), ("docs", "a..b"), ("docs files", "x")):
-            status, calls, _ = self.run_script("qdrant_admin.sh", "recover", *args)
-            self.assertEqual((status, calls), (2, []), args)
+    def test_a_failed_decryption_recovers_nothing(self) -> None:
+        """Age fails part-way: the part is never renamed or recovered from, and is deleted."""
+        snapshot = self.encrypted("qdrant-docs-20260131T020000Z.snapshot.age", b"synthetic snapshot tar")
+        status, calls, _ = self.run_script(
+            "qdrant_admin.sh",
+            "recover",
+            "docs",
+            snapshot.name,
+            IDENTITY=self.identity(),
+            FAKE_AGE_FAIL="decrypt",
+            FAKE_AGE_PASS_BYTES="9",
+        )
+        self.assertEqual(status, 1)
+        steps = self.qdrant_steps(calls)
+        self.assertEqual(len(steps), 2, steps)
+        self.assertTrue(steps[1].startswith("exec -T qdrant-cpu rm -f "), steps[1])
+        self.assertEqual((self.tmp / "streamed").read_bytes(), b"synthetic")
+        self.assertIn("The collection was not touched", self.stderr)
+
+    def test_a_failed_recovery_still_cleans_up(self) -> None:
+        """Qdrant refusing the snapshot: exit 1, the decrypted copy is deleted all the same."""
+        snapshot = self.encrypted("qdrant-docs-20260131T020000Z.snapshot.age", b"synthetic snapshot tar")
+        status, calls, _ = self.run_script(
+            "qdrant_admin.sh", "recover", "docs", snapshot.name, IDENTITY=self.identity(), FAKE_RECOVER="1"
+        )
+        self.assertEqual(status, 1)
+        self.assertTrue(self.qdrant_steps(calls)[-1].startswith("exec -T qdrant-cpu rm -f "))
+
+    def test_recover_refuses_before_anything(self) -> None:
+        """Odd names, a missing or plaintext snapshot, no identity: exit 2, nothing run."""
+        snapshot = self.encrypted("qdrant-docs-20260131T020000Z.snapshot.age", b"synthetic snapshot tar")
+        (self.backup_dir / "docs-1.snapshot").write_bytes(b"an earlier, unencrypted snapshot")
+        identity = {"IDENTITY": self.identity()}
+        cases: list[tuple[tuple[str, str], dict[str, str]]] = [
+            (("../docs", snapshot.name), identity),
+            (("docs", "../x.snapshot"), identity),
+            (("docs", "a..b"), identity),
+            (("docs files", snapshot.name), identity),
+            (("docs", "missing.snapshot.age"), identity),
+            (("docs", "docs-1.snapshot"), identity),
+            (("docs", snapshot.name), {}),
+        ]
+        for args, env in cases:
+            status, calls, _ = self.run_script("qdrant_admin.sh", "recover", *args, **env)
+            self.assertEqual((status, calls), (2, []), (args, env))
+
+
+@unittest.skipUnless(HAS_SCRIPTS, "needs bash and the repo's scripts/")
+class BackupAgeTest(AgeStandIn):
+    """scripts/backup_age.sh: whether a backup can be encrypted, and what its record says about it."""
+
+    def check(self, **env: str) -> subprocess.CompletedProcess[str]:
+        """Run ``backup_age.sh recipients``, as make does before a backup.
+
+        Args:
+            **env: More environment, e.g. ``BACKUP_RECIPIENTS``.
+
+        Returns:
+            The finished process.
+        """
+        return subprocess.run(
+            ["bash", str(SCRIPTS / "backup_age.sh"), "recipients"],
+            env={**self.env, **env},
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+    def sourced(self, commands: str, *args: str) -> subprocess.CompletedProcess[str]:
+        """Run shell commands with the file sourced, as the store scripts use it.
+
+        Args:
+            commands: The commands.
+            *args: Their positional parameters.
+
+        Returns:
+            The finished process.
+        """
+        script = f'set -euo pipefail; . "{SCRIPTS / "backup_age.sh"}"; {commands}'
+        return subprocess.run(
+            ["bash", "-c", script, "backup_age", *args],
+            env=self.env,
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+    def test_public_keys_are_accepted(self) -> None:
+        """Age installed, every line a public key: exit 0, silent, nothing encrypted for real."""
+        result = self.check()
+        self.assertEqual((result.returncode, result.stdout, result.stderr), (0, "", ""))
+        self.assertEqual(self.age_calls(), [f"age -R {self.recipients} -o /dev/null"])
+
+    def test_no_recipients_file_is_refused_with_how_to_make_one(self) -> None:
+        """Unset, missing or unreadable: exit 2, with the offline age-keygen steps."""
+        for recipients in ("", str(self.tmp / "missing.txt"), str(self.tmp)):
+            result = self.check(BACKUP_RECIPIENTS=recipients)
+            self.assertEqual(result.returncode, 2, recipients)
+            self.assertIn("age-keygen -o data-plane-backup.key", result.stderr)
+            self.assertIn("stays offline", result.stderr)
+            self.assertIn("Nothing was done", result.stderr)
+        self.assertEqual(self.age_calls(), [])
+
+    def test_a_private_key_is_refused(self) -> None:
+        """An identity or an SSH private key in the file: refused, it must not be on the host."""
+        for line in (AGE_SECRET, "AGE-PLUGIN-YUBIKEY-1ZZSTANDIN", "-----BEGIN OPENSSH PRIVATE KEY-----"):
+            self.recipients.write_text(f"{RECIPIENT_KEYS[0]}\n{line}\n", encoding="utf-8")
+            result = self.check()
+            self.assertEqual(result.returncode, 2, line)
+            self.assertIn("holds a private key", result.stderr)
+        self.assertEqual(self.age_calls(), [])
+
+    def test_a_file_anyone_can_change_is_refused(self) -> None:
+        """World-writable recipients would let anyone choose who reads the next backup."""
+        self.recipients.chmod(0o666)
+        result = self.check()
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("chmod o-w", result.stderr)
+
+    def test_age_must_be_installed(self) -> None:
+        """Without age on PATH: exit 2, pointing at how to install it."""
+        path = os.pathsep.join(("/usr/bin", "/bin"))
+        if shutil.which("age", path=path):
+            self.skipTest("age is installed system-wide")
+        result = self.check(PATH=path)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("age is not installed", result.stderr)
+
+    def test_a_line_age_does_not_take_is_refused(self) -> None:
+        """Age's own parse decides; its message is shown."""
+        self.recipients.write_text(f"{RECIPIENT_KEYS[0]}\nnot-a-public-key\n", encoding="utf-8")
+        result = self.check()
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("malformed recipient at line 2", result.stderr)
+
+    def test_a_warning_from_age_is_refused(self) -> None:
+        """A key age skips with a warning would make the recipient count wrong."""
+        result = self.check(FAKE_AGE_WARN="1")
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("ignoring unsupported SSH key", result.stderr)
+
+    def test_the_count_and_fingerprint_follow_ages_reading(self) -> None:
+        """Comments, empty lines, CRs and repeats do not count; the order does not matter."""
+        keys = (RECIPIENT_KEYS[1], RECIPIENT_KEYS[0])
+        self.recipients.write_bytes(
+            f"# created offline\r\n{keys[0]}\r\n\r\n{keys[1]}\n{keys[0]}\n#{RECIPIENT_KEYS[1]}x\n".encode()
+        )
+        result = self.sourced('age_recipients; age_facts /dev/stdout; echo "$AGE_RECIPIENTS"')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            result.stdout.splitlines(),
+            [
+                "encryption=age",
+                "recipients=2",
+                f"recipients_sha256={recipients_fingerprint(RECIPIENT_KEYS)}",
+                str(self.recipients),
+            ],
+        )
+
+    def test_unencrypted_backups_are_warned_about(self) -> None:
+        """Dumps and snapshots without .age in the backup directory: counted, left alone."""
+        backups = self.tmp / "snapshots"
+        backups.mkdir()
+        for name in (DUMP, "docs-1.snapshot", f"{DUMP}.age", "qdrant-docs-1.snapshot.age.part"):
+            (backups / name).write_bytes(b"x")
+        result = self.sourced('warn_plaintext "$1"', str(backups))
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("2 unencrypted backup file(s)", result.stderr)
+        self.assertEqual(len(list(backups.iterdir())), 4)
+        self.assertEqual(self.sourced('warn_plaintext "$1"', str(self.tmp / "bin")).stderr, "")
+
+    def test_a_restore_needs_an_identity_and_an_encrypted_file(self) -> None:
+        """IDENTITY unset or unreadable, the file missing or unencrypted: exit 2. Binary and armored age files pass."""
+        identity = self.tmp / "backup-identity.txt"
+        identity.write_text(f"{AGE_SECRET}\n", encoding="utf-8")
+        files = {
+            "binary": AGE_HEADER + b"DZV1",
+            "armored": b"-----BEGIN AGE ENCRYPTED FILE-----\r\nYWdl\r\n-----END AGE ENCRYPTED FILE-----\r\n",
+            "plaintext": b"DZV1 an earlier, unencrypted dump",
+        }
+        for name, content in files.items():
+            (self.tmp / name).write_bytes(content)
+
+        def identity_check(name: str, **env: str) -> subprocess.CompletedProcess[str]:
+            return subprocess.run(
+                ["bash", str(SCRIPTS / "backup_age.sh"), "identity", str(self.tmp / name)],
+                env={**self.env, **env},
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+        for name in ("binary", "armored"):
+            result = identity_check(name, IDENTITY=str(identity))
+            self.assertEqual((result.returncode, result.stderr), (0, ""), name)
+        result = identity_check("binary")
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("IDENTITY=<file>", result.stderr)
+        self.assertEqual(identity_check("binary", IDENTITY=str(self.tmp / "missing.key")).returncode, 2)
+        result = identity_check("plaintext", IDENTITY=str(identity))
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("plaintext is not age-encrypted", result.stderr)
+        self.assertEqual(identity_check("missing", IDENTITY=str(identity)).returncode, 2)
+        self.assertEqual(self.age_calls(), [])
+
+    def test_usage(self) -> None:
+        """Anything but `recipients` or `identity <file>`: exit 2."""
+        for args in ((), ("identity",), ("identity", "a", "b"), ("recipients", "extra"), ("encrypt",)):
+            result = subprocess.run(
+                ["bash", str(SCRIPTS / "backup_age.sh"), *args],
+                env=self.env,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 2, args)
+
+
+@unittest.skipUnless(HAS_MAKE, "needs make, bash and the repo's Makefile")
+class MakefileTest(AgeStandIn):
+    """The backup and restore targets, end to end through the scripts, with stand-in compose and age."""
+
+    @override
+    def setUp(self) -> None:
+        """Create the compose stand-in and its log."""
+        super().setUp()
+        self.log = self.tmp / "calls.log"
+        self.backup_dir = self.tmp / "snapshots"
+        compose = self.tmp / "fake-compose"
+        compose.write_text(FAKE_STORE_COMPOSE, encoding="utf-8")
+        compose.chmod(0o755)
+        self.compose = f"{compose} --env-file .env -f docker/compose.yaml"
+
+    def make(self, *args: str, stdin: str = "") -> tuple[subprocess.CompletedProcess[str], list[str]]:
+        """Run make in the repo with the stand-ins.
+
+        Args:
+            *args: Targets and variables.
+            stdin: What make reads, e.g. a restore's confirmation.
+
+        Returns:
+            The finished process, and the compose calls in order.
+        """
+        command = ["make", "-s", "-C", str(AUDIT_DIR.parent), *args, f"COMPOSE={self.compose}"]
+        result = subprocess.run(
+            [*command, f"BACKUP_DIR={self.backup_dir}"],
+            env={**self.env, "FAKE_LOG": str(self.log), "SUDO_USER": "ops.example"},
+            input=stdin,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        lines: list[str] = self.log.read_text(encoding="utf-8").splitlines() if self.log.exists() else []
+        return result, [line.split(" -f docker/compose.yaml ", 1)[-1] for line in lines]
+
+    def test_a_backup_that_cannot_be_encrypted_does_nothing(self) -> None:
+        """No recipients file: every backup target refuses before admin-audit or a store is asked."""
+        for target in ("backup", "backup-neo4j", "backup-qdrant"):
+            result, calls = self.make(target, f"BACKUP_RECIPIENTS={self.tmp / 'missing.txt'}", "REASON=zz backup")
+            self.assertNotEqual(result.returncode, 0, target)
+            self.assertEqual(calls, [], target)
+            self.assertIn("age-keygen -o", result.stderr)
+        self.assertEqual(self.age_calls(), [])
+        self.assertFalse(self.backup_dir.exists())
+
+    def test_a_backup_carries_its_recipients_to_the_record(self) -> None:
+        """BACKUP_RECIPIENTS reaches the dump, and the encryption facts reach admin-audit's record."""
+        result, calls = self.make("backup-neo4j", f"BACKUP_RECIPIENTS={self.recipients}", "REASON=zz backup")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(calls[0].endswith("admin_audit.py begin backup neo4j"), calls[0])
+        self.assertEqual([call.split()[0] for call in calls[1:4]], ["stop", "run", "start"])
+        (name,) = os.listdir(self.backup_dir)
+        record = f"{calls[4]} "
+        self.assertIn(" end backup neo4j --status 0 ", record)
+        fingerprint = recipients_fingerprint(RECIPIENT_KEYS)
+        self.assertIn(f" encryption=age recipients=2 recipients_sha256={fingerprint} file={name} ", record)
+
+    def restorable(self) -> str:
+        """Put an encrypted dump, an earlier plaintext one and an encrypted snapshot in place, and an identity.
+
+        Returns:
+            The identity file's path.
+        """
+        self.backup_dir.mkdir()
+        (self.backup_dir / f"{DUMP}.age").write_bytes(AGE_HEADER + b"DZV1 synthetic dump")
+        (self.backup_dir / DUMP).write_bytes(b"DZV1 an earlier, unencrypted dump")
+        (self.backup_dir / "qdrant-docs-1.snapshot.age").write_bytes(AGE_HEADER + b"synthetic snapshot tar")
+        identity = self.tmp / "offline" / "backup-identity.txt"
+        identity.parent.mkdir()
+        identity.write_text(f"{AGE_SECRET}\n", encoding="utf-8")
+        return str(identity)
+
+    def test_a_restore_without_a_usable_identity_asks_nothing(self) -> None:
+        """No IDENTITY, or a plaintext dump: refused before the confirmation; nothing is called."""
+        identity = self.restorable()
+        cases = [
+            ("restore-neo4j", f"DUMP={DUMP}.age"),
+            ("restore-neo4j", f"DUMP={DUMP}", f"IDENTITY={identity}"),
+            ("restore-qdrant", "COLLECTION=docs", "SNAPSHOT=qdrant-docs-1.snapshot.age"),
+        ]
+        for target, *args in cases:
+            result, calls = self.make(target, *args, stdin="restore\n")
+            self.assertNotEqual(result.returncode, 0, args)
+            self.assertEqual(calls, [], args)
+            self.assertNotIn("REPLACES", result.stdout, args)
+        self.assertEqual(self.age_calls(), [])
+
+    def test_a_restore_decrypts_with_the_identity_of_the_run(self) -> None:
+        """Confirmed, then recorded at both ends; the identity's path reaches no record."""
+        identity = self.restorable()
+        result, calls = self.make("restore-neo4j", f"DUMP={DUMP}.age", f"IDENTITY={identity}", stdin="restore\n")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(calls[0].endswith(f"admin_audit.py begin restore neo4j file={DUMP}.age"), calls[0])
+        self.assertEqual([call.split()[0] for call in calls[1:4]], ["stop", "run", "start"])
+        self.assertIn(" end restore neo4j --status 0 ", calls[4])
+        self.assertTrue(calls[4].endswith(" encryption=age"), calls[4])
+        self.assertNotIn("offline", "".join(calls))
+        self.assertEqual(self.age_calls(), [f"age -d -i {identity} {self.backup_dir}/{DUMP}.age"] * 2)
 
 
 @unittest.skipUnless(ADMIN_OVERLAY.is_file(), "needs the repo's docker/")
@@ -1264,17 +2050,18 @@ class FakeQdrant:
         """Start serving on a free local port."""
         self.status = 200
         self.requests: list[tuple[str, str, dict[str, str], bytes]] = []
+        self.bodies: dict[tuple[str, str], bytes] = {}
         fake = self
 
         class Handler(http.server.BaseHTTPRequestHandler):
             """Records the request and answers like Qdrant, with a JSON body."""
 
             def answer(self) -> None:
-                """Record the request and send the set status."""
+                """Record the request and send the set status, with the body set for it."""
                 length = int(self.headers.get("Content-Length") or 0)
                 body = self.rfile.read(length) if length else b""
                 fake.requests.append((self.command, self.path, dict(self.headers.items()), body))
-                payload = b'{"status":"ok","time":0.0}'
+                payload = fake.bodies.get((self.command, self.path), b'{"status":"ok","time":0.0}')
                 self.send_response(fake.status)
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", str(len(payload)))
@@ -1287,6 +2074,14 @@ class FakeQdrant:
 
             def do_PUT(self) -> None:
                 """Answer a PUT."""
+                self.answer()
+
+            def do_POST(self) -> None:
+                """Answer a POST."""
+                self.answer()
+
+            def do_DELETE(self) -> None:
+                """Answer a DELETE."""
                 self.answer()
 
             @override
@@ -1381,6 +2176,75 @@ class QdrantApiTest(unittest.TestCase):
         self.assertEqual(method, "PUT")
         self.assertEqual(sent, body.encode("utf-8"))
         self.assertEqual(headers.get("Content-Length"), str(len(body.encode("utf-8"))))
+
+    def command(self, *args: str) -> subprocess.CompletedProcess[str]:
+        """Run one of the helper's commands, as scripts/qdrant_admin.sh does.
+
+        Args:
+            *args: The command and its arguments.
+
+        Returns:
+            The finished process.
+        """
+        script = (SCRIPTS / "qdrant_api.sh").read_text(encoding="utf-8")
+        return subprocess.run(
+            ["bash", "-c", script, "qdrant_api", *args],
+            env={"PATH": os.environ["PATH"], "QDRANT_PORT": str(self.qdrant.port), "QDRANT__SERVICE__API_KEY": "zz-k"},
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=60,
+        )
+
+    def test_the_collections_are_listed(self) -> None:
+        """One name per line, as Qdrant spells them."""
+        listing = '{"result":{"collections":[{"name":"docs"},{"name":"case files 2026"}]},"status":"ok"}'
+        self.qdrant.bodies[("GET", "/collections")] = listing.encode()
+        result = self.command("collections")
+        self.assertEqual((result.returncode, result.stdout), (0, "docs\ncase files 2026\n"), result.stderr)
+        self.qdrant.bodies[("GET", "/collections")] = b'{"result":{"collections":[]},"status":"ok"}'
+        self.assertEqual((self.command("collections").returncode, self.command("collections").stdout), (0, ""))
+        self.qdrant.status = 500
+        self.assertEqual(self.command("collections").returncode, 1)
+
+    def test_a_snapshot_is_made_and_named(self) -> None:
+        """POST to the collection, its name percent-encoded; the snapshot's file name is printed."""
+        path = "/collections/case%20files%202026-%C3%A4/snapshots"
+        name = "case files 2026-" + chr(0xE4) + "-1-2026-11-04-02-00-00.snapshot"
+        # Qdrant answers in UTF-8, not with \u escapes.
+        answer = {"result": {"name": name, "size": 1}}
+        self.qdrant.bodies[("POST", path)] = json.dumps(answer, ensure_ascii=False).encode()
+        result = self.command("snapshot", "case files 2026-" + chr(0xE4))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, f"{name}\n")
+        ((method, sent_path, headers, _),) = self.qdrant.requests
+        self.assertEqual((method, sent_path, headers.get("api-key")), ("POST", path, "zz-k"))
+
+    def test_a_failed_snapshot_names_nothing(self) -> None:
+        """An error answer, or no file name in it: exit 1, nothing printed."""
+        self.qdrant.status = 500
+        result = self.command("snapshot", "docs")
+        self.assertEqual((result.returncode, result.stdout), (1, ""))
+        self.assertIn("the snapshot of docs failed", result.stderr)
+        self.qdrant.status = 200
+        self.qdrant.bodies[("POST", "/collections/docs/snapshots")] = b'{"result":{"name":"../x"},"status":"ok"}'
+        self.assertEqual(self.command("snapshot", "docs").returncode, 1)
+
+    def test_a_snapshot_is_dropped(self) -> None:
+        """DELETE names the collection and the snapshot, both percent-encoded; an error answer is exit 1."""
+        result = self.command("drop-snapshot", "case files", "case files-1.snapshot")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        ((method, path, _, _),) = self.qdrant.requests
+        self.assertEqual((method, path), ("DELETE", "/collections/case%20files/snapshots/case%20files-1.snapshot"))
+        self.qdrant.status = 404
+        self.assertEqual(self.command("drop-snapshot", "docs", "docs-1.snapshot").returncode, 1)
+
+    def test_usage(self) -> None:
+        """Unknown commands and missing arguments: exit 2, no request."""
+        for args in (("vacuum",), ("snapshot",), ("drop-snapshot", "docs"), ("collections", "docs")):
+            self.assertEqual(self.command(*args).returncode, 2, args)
+        self.assertEqual(self.qdrant.requests, [])
 
 
 if __name__ == "__main__":

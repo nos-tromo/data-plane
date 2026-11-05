@@ -32,6 +32,11 @@ COMPOSE_ADMIN  := docker compose --env-file .env -f docker/compose.yaml -f docke
 PROFILE_FLAG   := --profile $(PROFILE)
 BACKUP_DIR     ?= ./backup/snapshots
 
+# Backups are encrypted with age to the public keys in this file, one per line
+# (backup/README.md: Encryption); without it every backup refuses to run.
+# Override via BACKUP_RECIPIENTS in .env or on the command line.
+BACKUP_RECIPIENTS ?= $(or $(strip $(shell test -f .env && grep -E '^BACKUP_RECIPIENTS=' .env | cut -d= -f2-)),./backup/recipients.txt)
+
 # Direct database access, backups and restores are recorded in the
 # data-protection audit trail by the admin-audit service (README: Audit
 # trail): scripts/audit-admin.sh refuses to start one while admin-audit cannot
@@ -39,7 +44,9 @@ BACKUP_DIR     ?= ./backup/snapshots
 # command-line variables to the recipe's environment); the operator is the
 # sudo user, else the login user, e.g.
 #   make db-shell CASE_REF=case-0001 REASON="verify a reported duplicate"
-AUDITED = COMPOSE='$(COMPOSE)' PROFILE='$(PROFILE)' BACKUP_DIR='$(BACKUP_DIR)' ./scripts/audit-admin.sh
+AUDITED = COMPOSE='$(COMPOSE)' PROFILE='$(PROFILE)' BACKUP_DIR='$(BACKUP_DIR)' BACKUP_RECIPIENTS='$(BACKUP_RECIPIENTS)' ./scripts/audit-admin.sh
+# Checks that a backup can be encrypted before admin-audit is asked for anything.
+ENCRYPTION = BACKUP_RECIPIENTS='$(BACKUP_RECIPIENTS)' ./scripts/backup_age.sh
 # The admin overlay's loopback ports open only on demand, and both their
 # opening and their close are recorded (scripts/admin-ports.sh, README: Admin
 # access). The open window is kept in .admin-ports between the two.
@@ -75,11 +82,14 @@ help:
 	@echo "  make qdrant-shell    shell with Qdrant's HTTP API (qdrant METHOD /path [JSON])"
 	@echo
 	@echo "Backup / restore (recorded; see backup/README.md for the full runbook):"
-	@echo "  make backup          backup both DBs (needs CASE_REF= or REASON= by default)"
-	@echo "  make backup-neo4j    just Neo4j (offline dump into $(BACKUP_DIR))"
-	@echo "  make backup-qdrant   just Qdrant (snapshots into the qdrant-snapshots volume)"
-	@echo "  make restore-neo4j DUMP=<file>                        REPLACE the neo4j database with a dump (asks first)"
-	@echo "  make restore-qdrant COLLECTION=<name> SNAPSHOT=<file> REPLACE one collection with a snapshot (asks first)"
+	@echo "  make backup          backup both DBs, encrypted with age (needs CASE_REF= or REASON= by default)"
+	@echo "  make backup-neo4j    just Neo4j (offline dump, encrypted into $(BACKUP_DIR))"
+	@echo "  make backup-qdrant   just Qdrant (online snapshots, encrypted into $(BACKUP_DIR))"
+	@echo "                       both encrypt to the public keys in $(BACKUP_RECIPIENTS)"
+	@echo "  make restore-neo4j DUMP=<file> IDENTITY=<key file>    REPLACE the neo4j database with a dump (asks first)"
+	@echo "  make restore-qdrant COLLECTION=<name> SNAPSHOT=<file> IDENTITY=<key file>"
+	@echo "                       REPLACE one collection with a snapshot (asks first)"
+	@echo "                       both decrypt with the age identity given for that run only"
 	@echo
 	@echo "Profile: $(PROFILE)  (override with PROFILE=cuda)"
 
@@ -175,10 +185,12 @@ qdrant-shell:
 
 # ---- Backups ---------------------------------------------------------------
 # These are intentionally minimal — see backup/README.md for retention,
-# off-host copy, and verify-restore steps. Each is recorded as a disclosure
+# off-host copy, and verify-restore steps. Each is encrypted with age on its
+# way out of the store, to the public keys in BACKUP_RECIPIENTS, and refuses
+# before doing anything while it cannot be. Each is recorded as a disclosure
 # to file:backup once it has run; under the default AUDIT_REQUIRE_PURPOSE
 # (query,disclose) it needs CASE_REF= or REASON= — a scheduled backup passes
-# one, e.g. REASON="nightly backup".
+# one, e.g. REASON="scheduled backup".
 
 backup: backup-neo4j backup-qdrant
 
@@ -186,29 +198,38 @@ backup: backup-neo4j backup-qdrant
 # restart also runs when the dump fails). Confirm the brief downtime window
 # is acceptable before scheduling.
 backup-neo4j:
+	@$(ENCRYPTION) recipients
 	@$(AUDITED) backup neo4j -- ./scripts/neo4j_admin.sh dump
 
 # Qdrant supports online snapshots via its HTTP API. Iterates every
-# collection. Snapshots land in the qdrant-snapshots volume; copying them
-# off-host is a separate step (backup/README.md).
+# collection; each snapshot leaves the qdrant-snapshots volume encrypted, for
+# BACKUP_DIR, and is deleted there. Copying BACKUP_DIR off-host is a separate
+# step (backup/README.md).
 backup-qdrant:
+	@$(ENCRYPTION) recipients
 	@$(AUDITED) backup qdrant -- ./scripts/qdrant_admin.sh snapshot
 
 # ---- Restores --------------------------------------------------------------
-# Each REPLACES live data, so it asks for confirmation, then is recorded as a
+# Each takes an encrypted backup from BACKUP_DIR and IDENTITY=<file>, the age
+# identity it was encrypted to, for this run only (never stored or recorded),
+# and decrypts by streaming; both are checked before anything is asked. Each
+# REPLACES live data, so it asks for confirmation, then is recorded as a
 # modification once it has run (needs a purpose only if AUDIT_REQUIRE_PURPOSE
 # lists modify).
 
 restore-neo4j:
-	@test -n "$(DUMP)" || { echo "usage: make restore-neo4j DUMP=<dump file in $(BACKUP_DIR)> [CASE_REF=...] [REASON=...]" >&2; exit 2; }
+	@test -n "$(DUMP)" || { echo "usage: make restore-neo4j DUMP=<encrypted dump in $(BACKUP_DIR)> IDENTITY=<age identity file> [CASE_REF=...] [REASON=...]" >&2; exit 2; }
 	@test -f "$(BACKUP_DIR)/$(DUMP)" || { echo "no dump $(DUMP) in $(BACKUP_DIR)" >&2; exit 2; }
+	@$(ENCRYPTION) identity '$(BACKUP_DIR)/$(DUMP)'
 	@echo "This REPLACES the neo4j database with $(DUMP); Neo4j stops while it loads."
 	@read -p "Type 'restore' to confirm: " confirm && [ "$$confirm" = "restore" ] \
 	  || { echo "aborted"; exit 1; }
 	@$(AUDITED) restore neo4j 'file=$(DUMP)' -- ./scripts/neo4j_admin.sh load '$(DUMP)'
 
 restore-qdrant:
-	@test -n "$(COLLECTION)" && test -n "$(SNAPSHOT)" || { echo "usage: make restore-qdrant COLLECTION=<name> SNAPSHOT=<snapshot file> [CASE_REF=...] [REASON=...]" >&2; exit 2; }
+	@test -n "$(COLLECTION)" && test -n "$(SNAPSHOT)" || { echo "usage: make restore-qdrant COLLECTION=<name> SNAPSHOT=<encrypted snapshot in $(BACKUP_DIR)> IDENTITY=<age identity file> [CASE_REF=...] [REASON=...]" >&2; exit 2; }
+	@test -f "$(BACKUP_DIR)/$(SNAPSHOT)" || { echo "no snapshot $(SNAPSHOT) in $(BACKUP_DIR)" >&2; exit 2; }
+	@$(ENCRYPTION) identity '$(BACKUP_DIR)/$(SNAPSHOT)'
 	@echo "This REPLACES the Qdrant collection $(COLLECTION) with the snapshot $(SNAPSHOT)."
 	@read -p "Type 'restore' to confirm: " confirm && [ "$$confirm" = "restore" ] \
 	  || { echo "aborted"; exit 1; }

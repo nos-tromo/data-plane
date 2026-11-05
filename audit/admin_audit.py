@@ -14,6 +14,10 @@ Every record is a chain of its own, written by a short ``docker compose exec``
 run in the ``admin-audit`` container (``AUDIT_OUTPUT=container``). It therefore
 lands in that container's log, the source obs-plane binds data-plane's chains to.
 
+Backups are encrypted with age on their way out of the stores
+(``scripts/backup_age.sh``): a backup's record says so, to how many public keys,
+and which set of them by its fingerprint, never the keys.
+
 Subcommands:
 
 ``serve``
@@ -73,14 +77,15 @@ PORT_CLOSERS: Final = ("up", "down", "up-admin")
 BACKUP_RECIPIENT: Final = "file:backup"
 #: The actions ``AUDIT_REQUIRE_PURPOSE`` may list.
 REQUIRABLE: Final = ACTIONS - {"lifecycle"}
-#: Where a restored Qdrant snapshot was read from.
-SNAPSHOT_SOURCES: Final = ("host", "volume")
+#: How backup files are encrypted (scripts/backup_age.sh): age, to public keys.
+ENCRYPTIONS: Final = ("age",)
 
 _PAIR: Final = re.compile(r"([a-z][a-z0-9_]{0,31})=(.*)", re.DOTALL)
 _VERSION: Final = re.compile(r"[0-9A-Za-z][0-9A-Za-z.+-]{0,63}")
 _EVENT_ID: Final = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
 # A base name only: never a directory, so a path naming a user cannot be recorded.
 _FILE_NAME: Final = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,254}")
+_SHA256: Final = re.compile(r"[0-9a-f]{64}")
 
 Parser = Callable[[str], object]
 
@@ -102,6 +107,58 @@ def whole_number(text: str) -> int:
     if not text.isascii() or not text.isdigit() or len(text) > 18:
         raise ValueError("not a whole number")
     return int(text)
+
+
+def positive_number(text: str) -> int:
+    """Parse a count that is never zero, e.g. of a backup's recipients.
+
+    Args:
+        text: Decimal digits.
+
+    Returns:
+        The number.
+
+    Raises:
+        ValueError: If it is not a whole number of at least 1.
+    """
+    value = whole_number(text)
+    if value < 1:
+        raise ValueError("not a positive number")
+    return value
+
+
+def sha256_hex(text: str) -> str:
+    """Accept a SHA-256 digest, e.g. the fingerprint of a backup's recipients.
+
+    Args:
+        text: 64 lowercase hex digits.
+
+    Returns:
+        The digest.
+
+    Raises:
+        ValueError: If it is not one.
+    """
+    if _SHA256.fullmatch(text) is None:
+        raise ValueError("not a SHA-256 digest")
+    return text
+
+
+def encryption(text: str) -> str:
+    """Accept how a backup file is encrypted.
+
+    Args:
+        text: ``age``.
+
+    Returns:
+        The encryption.
+
+    Raises:
+        ValueError: If the scripts do not encrypt that way.
+    """
+    if text not in ENCRYPTIONS:
+        raise ValueError("not an encryption the backups use")
+    return text
 
 
 def file_name(text: str) -> str:
@@ -139,24 +196,6 @@ def store_name(text: str) -> str:
     return text
 
 
-def snapshot_source(text: str) -> str:
-    """Accept where a restored snapshot came from.
-
-    Args:
-        text: ``host`` (a copy in the backup directory) or ``volume`` (still in
-            Qdrant's snapshot volume).
-
-    Returns:
-        The source.
-
-    Raises:
-        ValueError: If it is neither.
-    """
-    if text not in SNAPSHOT_SOURCES:
-        raise ValueError("not a snapshot source")
-    return text
-
-
 def port_closer(text: str) -> str:
     """Accept what ended an admin-ports window.
 
@@ -185,21 +224,39 @@ PARAMETERS: Final[Mapping[OperationKey, Mapping[str, Parser]]] = {
     ("restore", "neo4j"): {"file": file_name},
     ("restore", "qdrant"): {"collection": store_name, "snapshot": file_name},
 }
+#: What a backup reports about its encryption: age, to how many public keys
+#: (the recipients file's distinct entries), and the SHA-256 of that set, so a
+#: record shows which keys can read the file without naming one.
+ENCRYPTION_FACTS: Final[Mapping[str, Parser]] = {
+    "encryption": encryption,
+    "recipients": positive_number,
+    "recipients_sha256": sha256_hex,
+}
 #: The facts an operation reports for its record (``end`` only).
 FACTS: Final[Mapping[OperationKey, Mapping[str, Parser]]] = {
-    ("backup", "neo4j"): {"file": file_name, "size_bytes": whole_number},
+    ("backup", "neo4j"): {"file": file_name, "size_bytes": whole_number, **ENCRYPTION_FACTS},
     ("backup", "qdrant"): {
         "collection": store_name,
         "snapshots": whole_number,
         "size_bytes": whole_number,
         "failed": whole_number,
+        **ENCRYPTION_FACTS,
     },
-    ("restore", "neo4j"): {"size_bytes": whole_number},
-    ("restore", "qdrant"): {"source": snapshot_source},
+    ("restore", "neo4j"): {"size_bytes": whole_number, "encryption": encryption},
+    ("restore", "qdrant"): {"encryption": encryption},
     ("ports", None): {"by": port_closer},
 }
 #: The fact that may repeat, once per object of the record's target.
 TARGET_FACTS: Final[Mapping[OperationKey, str]] = {("backup", "qdrant"): "collection"}
+#: The facts an operation that succeeded must report: a backup how it was
+#: encrypted and to which keys, a restore that it read an encrypted file. No
+#: ``ok`` record can therefore show an unencrypted backup.
+REQUIRED_FACTS: Final[Mapping[OperationKey, tuple[str, ...]]] = {
+    ("backup", "neo4j"): tuple(ENCRYPTION_FACTS),
+    ("backup", "qdrant"): tuple(ENCRYPTION_FACTS),
+    ("restore", "neo4j"): ("encryption",),
+    ("restore", "qdrant"): ("encryption",),
+}
 
 
 def parse_pairs(
@@ -539,7 +596,9 @@ def end(
         opened: For a shell or the admin ports, the id of the opening's event.
 
     Returns:
-        0 when the record was written, 1 when it was not, 2 on bad arguments.
+        0 when the record was written, 1 when it was not, 2 on bad arguments,
+        among them an operation that succeeded without its required facts
+        (:data:`REQUIRED_FACTS`).
     """
     names = PARAMETERS.get((kind, store), {})
     try:
@@ -555,6 +614,9 @@ def end(
         call = Invocation(environ, kind, store, {key: value for key, value in values.items() if key in names})
         if kind == "ports" and "by" not in values:
             raise ValueError(f"the admin ports' close needs by=<{'|'.join(PORT_CLOSERS)}>")
+        missing = [key for key in REQUIRED_FACTS.get((kind, store), ()) if key not in values]
+        if status == 0 and missing:
+            raise ValueError(f"{call.operation} succeeded without reporting {', '.join(missing)}")
     except PurposeError as exc:
         return _refuse(f"the stated purpose is not accepted ({exc})", 2)
     except ValueError as exc:

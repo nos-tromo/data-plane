@@ -58,6 +58,12 @@ data-plane's `.env` and the same value in docint's `.env` (docint >= v2.5.0)
 before running `make up` here, then `make up` in docint. Until docint has
 the key, Qdrant refuses its requests (401).
 
+**Upgrading to 0.6.0:** backups are encrypted with age now, and refuse to run
+until the host has age and a recipients file of public keys
+([`backup/README.md`](backup/README.md), Encryption). Restores take
+`IDENTITY=` and encrypted backups only: encrypt or delete the unencrypted
+backups earlier versions left (same file, Plaintext from earlier versions).
+
 ## Admin access (production)
 
 Production shape publishes no ports, and the edge-plane gateway deliberately
@@ -136,14 +142,19 @@ rationale in
 
 ## Backup / restore
 
-`make backup` writes a Neo4j offline dump and triggers Qdrant snapshots.
-The Neo4j dump requires a brief stop of the service; Qdrant snapshots
-are online. `make restore-neo4j DUMP=<file>` and
-`make restore-qdrant COLLECTION=<name> SNAPSHOT=<file>` write one back (each
-asks for confirmation first). All of them are recorded in the audit trail; a
-backup needs a stated purpose by default (`make backup REASON="nightly
-backup"`). Full runbook with retention, off-host copy, and verify-restore
-steps in [`backup/README.md`](backup/README.md).
+`make backup` writes a Neo4j offline dump and Qdrant snapshots, each
+encrypted with [age](https://age-encryption.org) on its way out of the store,
+to the public keys in `backup/recipients.txt` (`BACKUP_RECIPIENTS`); the
+identity that decrypts stays offline, and no unencrypted dump or snapshot
+rests on the host. age comes from the host's package manager. The Neo4j dump
+requires a brief stop of the service; Qdrant snapshots are online.
+`make restore-neo4j DUMP=<file> IDENTITY=<file>` and
+`make restore-qdrant COLLECTION=<name> SNAPSHOT=<file> IDENTITY=<file>`
+decrypt one back with the identity given for that run (each asks for
+confirmation first). All of them are recorded in the audit trail; a backup
+needs a stated purpose by default (`make backup REASON="scheduled backup"`).
+Full runbook with installing age, the key pair, retention, off-host copy,
+scheduling and verify-restore steps in [`backup/README.md`](backup/README.md).
 
 ## Audit trail
 
@@ -194,8 +205,8 @@ loudly: record it by other means.
 | `make up-admin`, then `make up` or `make down` | `admin` / `db.ports.open`, then `db.ports.close` | open before the ports are published, close when `make up` has removed them or before `make down` does (its `parent_event_id` is the open) | `store`: `neo4j`, `qdrant` | always required (for the opening) |
 | `make backup-neo4j`, `make backup` | `disclose` / `backup.neo4j`, `recipient: file:backup` | after the dump | `database`: `neo4j` | when `AUDIT_REQUIRE_PURPOSE` lists `disclose` (the default) |
 | `make backup-qdrant`, `make backup` | `disclose` / `backup.qdrant`, `recipient: file:backup` | after the snapshots | `collection`: each one snapshotted; beyond 200, `backup.qdrant.ids` events continue the list | as above |
-| `make restore-neo4j DUMP=…` | `modify` / `restore.neo4j` | after the load | `database`: `neo4j` | when it lists `modify` (not by default) |
-| `make restore-qdrant COLLECTION=… SNAPSHOT=…` | `modify` / `restore.qdrant` | after the recovery | `collection`: the one recovered | as above |
+| `make restore-neo4j DUMP=… IDENTITY=…` | `modify` / `restore.neo4j` | after the load | `database`: `neo4j` | when it lists `modify` (not by default) |
+| `make restore-qdrant COLLECTION=… SNAPSHOT=… IDENTITY=…` | `modify` / `restore.qdrant` | after the recovery | `collection`: the one recovered | as above |
 
 Every event names the operator, `actor: {user: <sudo user, else the login
 user>, via: "cli"}`, and carries `purpose: {case_ref, reason}` when one was
@@ -207,21 +218,23 @@ stated. The `criteria`:
 | `db.shell.close` | `store`, `exit_status`, `duration_s` |
 | `db.ports.open` | `ports` (the loopback bindings) |
 | `db.ports.close` | `ports`, `by` (`up`, `down`, or `up-admin` when the opening failed and published nothing), `exit_status`, `duration_s` (how long they were open) |
-| `backup.neo4j` | `file` (the dump's name), `size_bytes`, `exit_status`, `duration_s` |
-| `backup.qdrant` | `snapshots`, `size_bytes` (their total, as Qdrant reports it), `failed` (collections not snapshotted), `exit_status`, `duration_s` |
-| `restore.neo4j` | `file`, `size_bytes`, `exit_status`, `duration_s` |
-| `restore.qdrant` | `collection`, `snapshot`, `source` (`host`: a copy in the backup directory; `volume`: from Qdrant's snapshot volume), `exit_status`, `duration_s` |
+| `backup.neo4j` | `file` (the encrypted dump's name), `size_bytes`, `encryption` (`age`), `recipients` (how many public keys can read it), `recipients_sha256` (the fingerprint of that set of keys, [`backup/README.md`](backup/README.md)), `exit_status`, `duration_s` |
+| `backup.qdrant` | `snapshots`, `size_bytes` (the encrypted files' total), `failed` (collections not backed up), `encryption`, `recipients`, `recipients_sha256`, `exit_status`, `duration_s` |
+| `restore.neo4j` | `file`, `size_bytes`, `encryption`, `exit_status`, `duration_s` |
+| `restore.qdrant` | `collection`, `snapshot`, `encryption`, `exit_status`, `duration_s` |
 
 A refusal is the operation's event with `outcome: denied`, its criteria and
-no target. Never recorded: what a session read or changed, file contents,
-paths (file names only — a path can name a user), the Neo4j password or the
-Qdrant key.
+no target. A backup or restore recorded as `ok` always states its encryption:
+admin-audit refuses such a record without it. Never recorded: what a session
+read or changed, file contents, paths (file names only — a path can name a
+user), the Neo4j password, the Qdrant key, the public keys, or the identity a
+restore used and where it is.
 
 ### Stating the purpose
 
 ```bash
 make db-shell CASE_REF=case-0001 REASON="verify a reported duplicate"
-make backup REASON="nightly backup"     # a scheduled backup states one too
+make backup REASON="scheduled backup"   # a scheduled backup states one too
 ```
 
 Either field is enough. The purpose is personal data in its own right:
@@ -243,7 +256,10 @@ reach the stores without them (`docker exec`, or publishing ports by hand,
 which `make health` then reports as open without an open record). That
 access is root-equivalent and is the host's to audit. Inside a shell session,
 nothing the session does is recorded, nor what is done over the admin ports
-while they are open; their opening and close are.
+while they are open; their opening and close are. A backup is recorded when
+it is written, not where its copies go: whoever holds one of the identities
+can decrypt a copy anywhere, unrecorded, which is why the identities stay
+offline.
 
 ### Checking it
 
@@ -274,13 +290,13 @@ data-plane/
     neo4j_admin.sh        cypher-shell session, offline dump and load
     qdrant_admin.sh       API shell, snapshot of every collection, recovery of one
     qdrant_api.sh         Qdrant's HTTP API over /dev/tcp, run inside the container
-    qdrant_snapshot.sh    snapshot-every-collection script, run inside the container
+    backup_age.sh         the age encryption of backups: recipients and identity checks
     bundle_images.sh      airgap bundler (sources the vendored bundle-lib.sh)
     bundle-lib.sh         shared bundle library, vendored from nos-tromo/.github
   .env.example            copy to .env
   Makefile                operator commands
   VERSION                 release version read by the release-tag workflow
-  backup/                 runbooks + snapshot drop location
+  backup/                 runbook; the recipients file and encrypted backups (gitignored)
 ```
 
 ## Pointers
