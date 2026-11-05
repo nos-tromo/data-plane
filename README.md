@@ -64,6 +64,12 @@ until the host has age and a recipients file of public keys
 `IDENTITY=` and encrypted backups only: encrypt or delete the unencrypted
 backups earlier versions left (same file, Plaintext from earlier versions).
 
+**Upgrading to 0.7.0:** every backup deletes the store's backups older than
+`BACKUP_RETENTION_DAYS` (default 30) afterwards, recorded. The first run only
+records when pruning took effect; nothing is deleted for one period after it
+([`backup/README.md`](backup/README.md), Retention). Prune the off-host copies
+at the same age.
+
 ## Admin access (production)
 
 Production shape publishes no ports, and the edge-plane gateway deliberately
@@ -153,8 +159,11 @@ requires a brief stop of the service; Qdrant snapshots are online.
 decrypt one back with the identity given for that run (each asks for
 confirmation first). All of them are recorded in the audit trail; a backup
 needs a stated purpose by default (`make backup REASON="scheduled backup"`).
-Full runbook with installing age, the key pair, retention, off-host copy,
-scheduling and verify-restore steps in [`backup/README.md`](backup/README.md).
+After every backup that succeeded, that store's backups older than
+`BACKUP_RETENTION_DAYS` (default 30) are deleted; `make backup-prune` does it
+on its own. Full runbook with installing age, the key pair, retention,
+off-host copy, scheduling and verify-restore steps in
+[`backup/README.md`](backup/README.md).
 
 ## Audit trail
 
@@ -205,6 +214,7 @@ loudly: record it by other means.
 | `make up-admin`, then `make up` or `make down` | `admin` / `db.ports.open`, then `db.ports.close` | open before the ports are published, close when `make up` has removed them or before `make down` does (its `parent_event_id` is the open) | `store`: `neo4j`, `qdrant` | always required (for the opening) |
 | `make backup-neo4j`, `make backup` | `disclose` / `backup.neo4j`, `recipient: file:backup` | after the dump | `database`: `neo4j` | when `AUDIT_REQUIRE_PURPOSE` lists `disclose` (the default) |
 | `make backup-qdrant`, `make backup` | `disclose` / `backup.qdrant`, `recipient: file:backup` | after the snapshots | `collection`: each one snapshotted; beyond 200, `backup.qdrant.ids` events continue the list | as above |
+| `make backup-neo4j`, `make backup-qdrant`, `make backup`, `make backup-prune` | `delete` / `backup.prune.neo4j`, `backup.prune.qdrant` | after the store's backup succeeded (or on its own) | `file`: each backup deleted, by name; beyond 200, `backup.prune.<store>.ids` events continue the list | when it lists `delete` (not by default) |
 | `make restore-neo4j DUMP=… IDENTITY=…` | `modify` / `restore.neo4j` | after the load | `database`: `neo4j` | when it lists `modify` (not by default) |
 | `make restore-qdrant COLLECTION=… SNAPSHOT=… IDENTITY=…` | `modify` / `restore.qdrant` | after the recovery | `collection`: the one recovered | as above |
 
@@ -220,6 +230,7 @@ stated. The `criteria`:
 | `db.ports.close` | `ports`, `by` (`up`, `down`, or `up-admin` when the opening failed and published nothing), `exit_status`, `duration_s` (how long they were open) |
 | `backup.neo4j` | `file` (the encrypted dump's name), `size_bytes`, `encryption` (`age`), `recipients` (how many public keys can read it), `recipients_sha256` (the fingerprint of that set of keys, [`backup/README.md`](backup/README.md)), `exit_status`, `duration_s` |
 | `backup.qdrant` | `snapshots`, `size_bytes` (the encrypted files' total), `failed` (collections not backed up), `encryption`, `recipients`, `recipients_sha256`, `exit_status`, `duration_s` |
+| `backup.prune.<store>` | `period_days`, `cutoff` (backups written before it were due), `deleted`, `not_deleted` (files the account could not delete), `exit_status`, `duration_s` |
 | `restore.neo4j` | `file`, `size_bytes`, `encryption`, `exit_status`, `duration_s` |
 | `restore.qdrant` | `collection`, `snapshot`, `encryption`, `exit_status`, `duration_s` |
 

@@ -1923,9 +1923,22 @@ class BackupPruneTest(unittest.TestCase):
             self.assertEqual((status, facts), (2, {}), days)
         self.assertEqual(len(self.left()), 1)
 
+    def test_check_mode_validates_the_period_only(self) -> None:
+        """``check`` exits 0 for a valid period and 2 otherwise, touching nothing."""
+        for days, want in (("30", 0), ("365", 0), ("0", 2), ("abc", 2)):
+            result = subprocess.run(
+                ["bash", str(SCRIPTS / "backup_prune.sh"), "check"],
+                env={"PATH": os.environ["PATH"], "BACKUP_RETENTION_DAYS": days, "BACKUP_DIR": str(self.dir)},
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(result.returncode, want, days)
+        self.assertEqual(list(self.dir.iterdir()), [])
+
     def test_usage(self) -> None:
         """An unknown store or a missing argument: exit 2."""
-        for args in ((), ("chorus",), ("neo4j", "--now")):
+        for args in ((), ("chorus",), ("neo4j", "--now"), ("check", "neo4j")):
             result = subprocess.run(
                 ["bash", str(SCRIPTS / "backup_prune.sh"), *args],
                 env={"PATH": os.environ["PATH"], "BACKUP_RETENTION_DAYS": "30", "BACKUP_DIR": str(self.dir)},
@@ -2266,12 +2279,15 @@ class MakefileTest(AgeStandIn):
         compose.chmod(0o755)
         self.compose = f"{compose} --env-file .env -f docker/compose.yaml"
 
-    def make(self, *args: str, stdin: str = "") -> tuple[subprocess.CompletedProcess[str], list[str]]:
+    def make(
+        self, *args: str, stdin: str = "", env: dict[str, str] | None = None
+    ) -> tuple[subprocess.CompletedProcess[str], list[str]]:
         """Run make in the repo with the stand-ins.
 
         Args:
             *args: Targets and variables.
             stdin: What make reads, e.g. a restore's confirmation.
+            env: More environment for make, e.g. a stand-in's failure switch.
 
         Returns:
             The finished process, and the compose calls in order.
@@ -2279,7 +2295,7 @@ class MakefileTest(AgeStandIn):
         command = ["make", "-s", "-C", str(AUDIT_DIR.parent), *args, f"COMPOSE={self.compose}"]
         result = subprocess.run(
             [*command, f"BACKUP_DIR={self.backup_dir}"],
-            env={**self.env, "FAKE_LOG": str(self.log), "SUDO_USER": "ops.example"},
+            env={**self.env, "FAKE_LOG": str(self.log), "SUDO_USER": "ops.example", **(env or {})},
             input=stdin,
             capture_output=True,
             text=True,
@@ -2304,11 +2320,66 @@ class MakefileTest(AgeStandIn):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertTrue(calls[0].endswith("admin_audit.py begin backup neo4j"), calls[0])
         self.assertEqual([call.split()[0] for call in calls[1:4]], ["stop", "run", "start"])
-        (name,) = os.listdir(self.backup_dir)
+        (name,) = [entry for entry in os.listdir(self.backup_dir) if entry != ".prune-since"]
         record = f"{calls[4]} "
         self.assertIn(" end backup neo4j --status 0 ", record)
         fingerprint = recipients_fingerprint(RECIPIENT_KEYS)
         self.assertIn(f" encryption=age recipients=2 recipients_sha256={fingerprint} file={name} ", record)
+
+    def old_backup(self) -> str:
+        """Put a Neo4j backup older than the default period in place, past the grace period.
+
+        Returns:
+            Its name.
+        """
+        self.backup_dir.mkdir(exist_ok=True)
+        now = int(time.time())
+        (self.backup_dir / ".prune-since").write_text(f"{now - 400 * DAY_S}\n", encoding="utf-8")
+        name = f"neo4j-{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime(now - 40 * DAY_S))}.dump.age"
+        (self.backup_dir / name).write_bytes(AGE_HEADER + b"old")
+        return name
+
+    def test_a_backup_prunes_after_it_succeeded(self) -> None:
+        """The backup is recorded first, then the pruning, as a deletion of the old file."""
+        old = self.old_backup()
+        result, calls = self.make("backup-neo4j", f"BACKUP_RECIPIENTS={self.recipients}", "REASON=zz backup")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(" end backup neo4j --status 0 ", f"{calls[4]} ")
+        self.assertTrue(calls[5].endswith("admin_audit.py begin prune neo4j"), calls[5])
+        record = f"{calls[6]} "
+        self.assertIn(" end prune neo4j --status 0 ", record)
+        self.assertIn(" period_days=30 ", record)
+        self.assertIn(" deleted=1 ", record)
+        self.assertIn(f" file={old} ", record)
+        self.assertFalse((self.backup_dir / old).exists())
+        self.assertEqual(len(os.listdir(self.backup_dir)), 2)
+
+    def test_a_failed_backup_prunes_nothing(self) -> None:
+        """When the backup fails, nothing is pruned: the old backup stays the newest restore point."""
+        old = self.old_backup()
+        result, calls = self.make(
+            "backup-neo4j", f"BACKUP_RECIPIENTS={self.recipients}", "REASON=zz backup", env={"FAKE_RUN": "1"}
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse(any(" prune " in f" {call} " for call in calls), calls)
+        self.assertTrue((self.backup_dir / old).exists())
+
+    def test_backup_prune_target(self) -> None:
+        """make backup-prune prunes both stores, each recorded, without a backup."""
+        old = self.old_backup()
+        result, calls = self.make("backup-prune")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        begins = [call.rsplit("admin_audit.py ", 1)[1] for call in calls if " begin " in call]
+        self.assertEqual(begins, ["begin prune neo4j", "begin prune qdrant"])
+        self.assertFalse((self.backup_dir / old).exists())
+
+    def test_a_bad_period_refuses_the_backup_before_anything(self) -> None:
+        """BACKUP_RETENTION_DAYS out of range: no store and no admin-audit call."""
+        for target in ("backup-neo4j", "backup-qdrant", "backup-prune"):
+            result, calls = self.make(target, f"BACKUP_RECIPIENTS={self.recipients}", "BACKUP_RETENTION_DAYS=400")
+            self.assertNotEqual(result.returncode, 0, target)
+            self.assertEqual(calls, [], target)
+            self.assertIn("BACKUP_RETENTION_DAYS", result.stderr)
 
     def restorable(self) -> str:
         """Put an encrypted dump, an earlier plaintext one and an encrypted snapshot in place, and an identity.

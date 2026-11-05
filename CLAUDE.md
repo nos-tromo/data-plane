@@ -30,7 +30,7 @@ The **state tier** of the nos-tromo federation: a Docker Compose project that ow
 - **Qdrant** (1.18, `cpu`/`cuda` profile variants) — vector store for docint
 - **admin-audit** (stdlib Python on the pinned python image) — records direct database access, backups and restores in the data-protection audit trail (README § Audit trail)
 
-No application code and no Python venv. The whole repo is a `Makefile`, a `VERSION` file, three compose files under `docker/`, admin-audit's stdlib Python under `audit/` (`admin_audit.py`, the two audit modules vendored from `nos-tromo/.github`, and a `unittest` suite), the shell scripts under `scripts/` (the airgap bundler and its vendored `bundle-lib.sh`; `audit-admin.sh`, which records an operation through admin-audit; `admin-ports.sh`, which opens and closes the admin overlay's ports, recorded; `neo4j_admin.sh` and `qdrant_admin.sh`, the operator commands `audit-admin.sh` wraps, which both source `backup_age.sh`, the age encryption of their backups; `qdrant_api.sh`, which runs inside the Qdrant container), a backup runbook under `backup/`, and CI under `.github/`. For how this tier slots into the wider workspace (inference vs state vs apps, the three external network seams `inference-net` / `data-net` / `edge-net`, bring-up order), see the parent `../CLAUDE.md`.
+No application code and no Python venv. The whole repo is a `Makefile`, a `VERSION` file, three compose files under `docker/`, admin-audit's stdlib Python under `audit/` (`admin_audit.py`, the two audit modules vendored from `nos-tromo/.github`, and a `unittest` suite), the shell scripts under `scripts/` (the airgap bundler and its vendored `bundle-lib.sh`; `audit-admin.sh`, which records an operation through admin-audit; `admin-ports.sh`, which opens and closes the admin overlay's ports, recorded; `neo4j_admin.sh` and `qdrant_admin.sh`, the operator commands `audit-admin.sh` wraps, which both source `backup_age.sh`, the age encryption of their backups; `backup_prune.sh`, which deletes backups older than the retention period; `qdrant_api.sh`, which runs inside the Qdrant container), a backup runbook under `backup/`, and CI under `.github/`. For how this tier slots into the wider workspace (inference vs state vs apps, the three external network seams `inference-net` / `data-net` / `edge-net`, bring-up order), see the parent `../CLAUDE.md`.
 
 ## Common commands
 
@@ -58,6 +58,7 @@ make bundle                   # airgap tarball from the latest release tag (curr
 make backup REASON="..."      # neo4j (offline dump) + qdrant (online snapshot), encrypted with age — recorded; purpose needed by default
 make backup-neo4j             # neo4j only — briefly STOPS the service
 make backup-qdrant            # qdrant only — online, no downtime
+make backup-prune             # delete backups older than BACKUP_RETENTION_DAYS (default 30); every backup also does it — recorded
                               # backups need age on the host and the public keys in backup/recipients.txt (BACKUP_RECIPIENTS)
 make restore-neo4j DUMP=<file> IDENTITY=<key>                     # REPLACE the neo4j database from an encrypted dump in backup/snapshots (asks)
 make restore-qdrant COLLECTION=<c> SNAPSHOT=<file> IDENTITY=<key> # REPLACE one collection from an encrypted snapshot (asks)

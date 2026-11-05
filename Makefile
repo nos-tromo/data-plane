@@ -37,6 +37,12 @@ BACKUP_DIR     ?= ./backup/snapshots
 # Override via BACKUP_RECIPIENTS in .env or on the command line.
 BACKUP_RECIPIENTS ?= $(or $(strip $(shell test -f .env && grep -E '^BACKUP_RECIPIENTS=' .env | cut -d= -f2-)),./backup/recipients.txt)
 
+# Backups are short-lived restore points, not an archive: after every backup
+# that succeeded, the store's backups older than this many days (1 to 365) are
+# deleted, recorded (backup/README.md: Retention). Override via
+# BACKUP_RETENTION_DAYS in .env or on the command line.
+BACKUP_RETENTION_DAYS ?= $(or $(strip $(shell test -f .env && grep -E '^BACKUP_RETENTION_DAYS=' .env | cut -d= -f2-)),30)
+
 # Direct database access, backups and restores are recorded in the
 # data-protection audit trail by the admin-audit service (README: Audit
 # trail): scripts/audit-admin.sh refuses to start one while admin-audit cannot
@@ -44,7 +50,9 @@ BACKUP_RECIPIENTS ?= $(or $(strip $(shell test -f .env && grep -E '^BACKUP_RECIP
 # command-line variables to the recipe's environment); the operator is the
 # sudo user, else the login user, e.g.
 #   make db-shell CASE_REF=case-0001 REASON="verify a reported duplicate"
-AUDITED = COMPOSE='$(COMPOSE)' PROFILE='$(PROFILE)' BACKUP_DIR='$(BACKUP_DIR)' BACKUP_RECIPIENTS='$(BACKUP_RECIPIENTS)' ./scripts/audit-admin.sh
+AUDITED = COMPOSE='$(COMPOSE)' PROFILE='$(PROFILE)' BACKUP_DIR='$(BACKUP_DIR)' BACKUP_RECIPIENTS='$(BACKUP_RECIPIENTS)' BACKUP_RETENTION_DAYS='$(BACKUP_RETENTION_DAYS)' ./scripts/audit-admin.sh
+# Checks the retention period before a backup or a pruning asks for anything.
+RETENTION = BACKUP_RETENTION_DAYS='$(BACKUP_RETENTION_DAYS)' ./scripts/backup_prune.sh
 # Checks that a backup can be encrypted before admin-audit is asked for anything.
 ENCRYPTION = BACKUP_RECIPIENTS='$(BACKUP_RECIPIENTS)' ./scripts/backup_age.sh
 # The admin overlay's loopback ports open only on demand, and both their
@@ -53,7 +61,7 @@ ENCRYPTION = BACKUP_RECIPIENTS='$(BACKUP_RECIPIENTS)' ./scripts/backup_age.sh
 PORTS = COMPOSE='$(COMPOSE)' ./scripts/admin-ports.sh
 
 .PHONY: help network volumes pull bundle up up-dev up-admin stop down restart logs ps \
-        health nuke db-shell qdrant-shell backup backup-neo4j backup-qdrant restore-neo4j restore-qdrant
+        health nuke db-shell qdrant-shell backup backup-neo4j backup-qdrant backup-prune restore-neo4j restore-qdrant
 
 help:
 	@echo "data-plane — stateful services for chorus (Neo4j) + docint (Qdrant)."
@@ -85,6 +93,7 @@ help:
 	@echo "  make backup          backup both DBs, encrypted with age (needs CASE_REF= or REASON= by default)"
 	@echo "  make backup-neo4j    just Neo4j (offline dump, encrypted into $(BACKUP_DIR))"
 	@echo "  make backup-qdrant   just Qdrant (online snapshots, encrypted into $(BACKUP_DIR))"
+	@echo "  make backup-prune    delete backups older than BACKUP_RETENTION_DAYS ($(BACKUP_RETENTION_DAYS)); every backup does it too"
 	@echo "                       both encrypt to the public keys in $(BACKUP_RECIPIENTS)"
 	@echo "  make restore-neo4j DUMP=<file> IDENTITY=<key file>    REPLACE the neo4j database with a dump (asks first)"
 	@echo "  make restore-qdrant COLLECTION=<name> SNAPSHOT=<file> IDENTITY=<key file>"
@@ -198,16 +207,27 @@ backup: backup-neo4j backup-qdrant
 # restart also runs when the dump fails). Confirm the brief downtime window
 # is acceptable before scheduling.
 backup-neo4j:
+	@$(RETENTION) check
 	@$(ENCRYPTION) recipients
 	@$(AUDITED) backup neo4j -- ./scripts/neo4j_admin.sh dump
+	@$(AUDITED) prune neo4j -- ./scripts/backup_prune.sh neo4j
 
 # Qdrant supports online snapshots via its HTTP API. Iterates every
 # collection; each snapshot leaves the qdrant-snapshots volume encrypted, for
 # BACKUP_DIR, and is deleted there. Copying BACKUP_DIR off-host is a separate
 # step (backup/README.md).
 backup-qdrant:
+	@$(RETENTION) check
 	@$(ENCRYPTION) recipients
 	@$(AUDITED) backup qdrant -- ./scripts/qdrant_admin.sh snapshot
+	@$(AUDITED) prune qdrant -- ./scripts/backup_prune.sh qdrant
+
+# The pruning on its own, for both stores (each recorded as delete /
+# backup.prune.<store>), e.g. after BACKUP_RETENTION_DAYS was lowered.
+backup-prune:
+	@$(RETENTION) check
+	@$(AUDITED) prune neo4j -- ./scripts/backup_prune.sh neo4j
+	@$(AUDITED) prune qdrant -- ./scripts/backup_prune.sh qdrant
 
 # ---- Restores --------------------------------------------------------------
 # Each takes an encrypted backup from BACKUP_DIR and IDENTITY=<file>, the age

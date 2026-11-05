@@ -6,6 +6,9 @@
 #
 #   BACKUP_RETENTION_DAYS=<1..365> BACKUP_DIR=<dir> AUDIT_FACTS=<file> \
 #     scripts/backup_prune.sh <neo4j|qdrant> [--now <epoch seconds>]
+#   BACKUP_RETENTION_DAYS=<1..365> scripts/backup_prune.sh check
+#       exit 0 when the period is valid, 2 otherwise; touches nothing. make runs
+#       it before a backup asks admin-audit or a store for anything.
 #
 # A backup's age is the UTC time in its name, the last one before the suffix:
 # neo4j-<YYYYmmddTHHMMSSZ>.dump[.age], qdrant-<collection>-<stamp>[-n].snapshot[.age].
@@ -24,7 +27,7 @@
 set -euo pipefail
 
 usage() {
-  echo "usage: BACKUP_RETENTION_DAYS=<1..365> BACKUP_DIR=<dir> $0 <neo4j|qdrant> [--now <epoch>]" >&2
+  echo "usage: BACKUP_RETENTION_DAYS=<1..365> BACKUP_DIR=<dir> $0 <neo4j|qdrant> [--now <epoch>] | $0 check" >&2
   exit 2
 }
 
@@ -33,7 +36,7 @@ usage() {
 
 [[ $# -eq 1 || $# -eq 3 ]] || usage
 store=$1
-case $store in neo4j | qdrant) ;; *) usage ;; esac
+case $store:$# in neo4j:* | qdrant:* | check:1) ;; *) usage ;; esac
 now=$(date -u +%s)
 if [[ $# -eq 3 ]]; then
   [[ $2 == --now && $3 =~ ^[0-9]+$ ]] || usage
@@ -46,6 +49,7 @@ if [[ ! $days =~ ^[0-9]{1,3}$ ]] || ((10#$days < 1 || 10#$days > 365)); then
   exit 2
 fi
 days=$((10#$days))
+[[ $store != check ]] || exit 0
 facts=${AUDIT_FACTS:-/dev/null}
 period=$((days * 86400))
 
