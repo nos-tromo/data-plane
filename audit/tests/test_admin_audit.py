@@ -1721,6 +1721,221 @@ os.execv(os.environ["FAKE_STAT_REAL"], ["stat", *args])
 OTHER_UID = os.getuid() + 1
 
 
+# The pruning tests' clock: 2026-03-01T00:00:00Z.
+PRUNE_NOW = 1_772_323_200
+DAY_S = 86_400
+
+
+def stamp(days_ago: float) -> str:
+    """Format the UTC moment ``days_ago`` before :data:`PRUNE_NOW` as the backups name it.
+
+    Args:
+        days_ago: Days before the pruning tests' clock; negative is the future.
+
+    Returns:
+        ``YYYYmmddTHHMMSSZ``.
+    """
+    moment = time.gmtime(PRUNE_NOW - days_ago * DAY_S)
+    return time.strftime("%Y%m%dT%H%M%SZ", moment)
+
+
+@unittest.skipUnless(HAS_SCRIPTS, "needs bash and the repo's scripts/")
+class BackupPruneTest(unittest.TestCase):
+    """scripts/backup_prune.sh: which backups a pruning deletes, and what it reports."""
+
+    @override
+    def setUp(self) -> None:
+        """Create a backup directory and a facts file."""
+        self.tmp = Path(tempfile.mkdtemp(prefix="admin-audit-prune-"))
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.dir = self.tmp / "snapshots"
+        self.dir.mkdir()
+        self.facts = self.tmp / "facts"
+        self.stderr = ""
+
+    def backups(self, *names: str) -> None:
+        """Put files with these names into the backup directory.
+
+        Args:
+            *names: The file names.
+        """
+        for name in names:
+            (self.dir / name).write_bytes(b"x")
+
+    def since(self, days_ago: float) -> None:
+        """Record that pruning took effect ``days_ago`` before the clock.
+
+        Args:
+            days_ago: Days before :data:`PRUNE_NOW`.
+        """
+        (self.dir / ".prune-since").write_text(f"{int(PRUNE_NOW - days_ago * DAY_S)}\n", encoding="utf-8")
+
+    def prune(self, store: str, days: str = "30", now: int = PRUNE_NOW) -> tuple[int, dict[str, list[str]]]:
+        """Run the pruning of one store.
+
+        Args:
+            store: ``neo4j`` or ``qdrant``.
+            days: ``BACKUP_RETENTION_DAYS``.
+            now: The clock.
+
+        Returns:
+            The exit status and the reported facts, each key with its values in order.
+            What it wrote to stderr is kept in ``self.stderr``.
+        """
+        result = subprocess.run(
+            ["bash", str(SCRIPTS / "backup_prune.sh"), store, "--now", str(now)],
+            env={
+                "PATH": os.environ["PATH"],
+                "BACKUP_RETENTION_DAYS": days,
+                "BACKUP_DIR": str(self.dir),
+                "AUDIT_FACTS": str(self.facts),
+            },
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.stderr = result.stderr
+        facts: dict[str, list[str]] = {}
+        if self.facts.exists():
+            for line in self.facts.read_text(encoding="utf-8").splitlines():
+                key, _, value = line.partition("=")
+                facts.setdefault(key, []).append(value)
+        return result.returncode, facts
+
+    def left(self) -> list[str]:
+        """List the backup directory, without the pruning's own state file.
+
+        Returns:
+            The names, sorted.
+        """
+        return sorted(path.name for path in self.dir.iterdir() if path.name != ".prune-since")
+
+    def test_old_backups_of_the_store_go(self) -> None:
+        """Older than the period: deleted and named; the other store's files and young ones stay."""
+        self.since(400)
+        old, young = f"neo4j-{stamp(31)}.dump.age", f"neo4j-{stamp(29)}.dump.age"
+        other = f"qdrant-docs-{stamp(40)}.snapshot.age"
+        self.backups(old, young, other)
+        status, facts = self.prune("neo4j")
+        self.assertEqual(status, 0, self.stderr)
+        self.assertEqual(self.left(), sorted([young, other]))
+        self.assertEqual(facts["file"], [old])
+        self.assertEqual(
+            {key: facts[key] for key in ("period_days", "cutoff", "deleted", "not_deleted")},
+            {"period_days": ["30"], "cutoff": ["2026-01-30T00:00:00Z"], "deleted": ["1"], "not_deleted": ["0"]},
+        )
+
+    def test_qdrant_snapshots_go_by_the_last_stamp_in_the_name(self) -> None:
+        """A collection named like a date does not decide; the stamp before the suffix does."""
+        self.since(400)
+        old = f"qdrant-{stamp(0)}-{stamp(60)}.snapshot.age"
+        young = f"qdrant-{stamp(60)}-{stamp(1)}-2.snapshot.age"
+        self.backups(old, young)
+        status, facts = self.prune("qdrant")
+        self.assertEqual(status, 0, self.stderr)
+        self.assertEqual(self.left(), [young])
+        self.assertEqual(facts["file"], [old])
+
+    def test_plaintext_leftovers_by_the_same_rule(self) -> None:
+        """Unencrypted backups of earlier versions go once they are older than the period."""
+        self.since(400)
+        self.backups(f"neo4j-{stamp(90)}.dump", f"neo4j-{stamp(2)}.dump")
+        status, facts = self.prune("neo4j")
+        self.assertEqual(status, 0, self.stderr)
+        self.assertEqual(self.left(), [f"neo4j-{stamp(2)}.dump"])
+        self.assertEqual(facts["file"], [f"neo4j-{stamp(90)}.dump"])
+
+    def test_the_backup_just_written_never_goes(self) -> None:
+        """Written now, even under the shortest period: kept."""
+        self.since(400)
+        self.backups(f"neo4j-{stamp(0)}.dump.age")
+        status, facts = self.prune("neo4j", days="1")
+        self.assertEqual((status, self.left(), facts["deleted"]), (0, [f"neo4j-{stamp(0)}.dump.age"], ["0"]))
+
+    def test_an_old_only_backup_still_goes(self) -> None:
+        """No backup outlives the period, not even the last one left."""
+        self.since(400)
+        self.backups(f"neo4j-{stamp(40)}.dump.age")
+        status, _ = self.prune("neo4j")
+        self.assertEqual((status, self.left()), (0, []))
+
+    def test_grace_on_first_run(self) -> None:
+        """The first pruning records when it took effect and deletes nothing for one period."""
+        self.backups(f"neo4j-{stamp(100)}.dump.age")
+        status, facts = self.prune("neo4j")
+        self.assertEqual((status, self.left(), facts["deleted"]), (0, [f"neo4j-{stamp(100)}.dump.age"], ["0"]))
+        self.assertEqual((self.dir / ".prune-since").read_text(encoding="utf-8").strip(), str(PRUNE_NOW))
+        self.assertEqual((self.dir / ".prune-since").stat().st_mode & 0o777, 0o600)
+        self.assertIn("2026-03-31", self.stderr)
+        status, _ = self.prune("neo4j", now=PRUNE_NOW + 29 * DAY_S)
+        self.assertEqual(len(self.left()), 1)
+        status, facts = self.prune("neo4j", now=PRUNE_NOW + 30 * DAY_S)
+        self.assertEqual((status, self.left(), facts["deleted"][-1]), (0, [], "1"))
+
+    def test_a_damaged_state_is_refused(self) -> None:
+        """A state file that holds no time refuses, deleting nothing."""
+        self.backups(f"neo4j-{stamp(100)}.dump.age")
+        (self.dir / ".prune-since").write_text("yesterday\n", encoding="utf-8")
+        status, facts = self.prune("neo4j")
+        self.assertEqual((status, facts), (2, {}))
+        self.assertEqual(len(self.left()), 1)
+
+    def test_part_files_and_unparsable_names_stay_and_are_named(self) -> None:
+        """An unfinished file and a name without a stamp are never deleted; the operator is told."""
+        self.since(400)
+        part, odd = f"neo4j-{stamp(90)}.dump.age.part", "neo4j-copy.dump.age"
+        self.backups(part, odd)
+        status, facts = self.prune("neo4j")
+        self.assertEqual((status, self.left(), facts["deleted"]), (0, sorted([part, odd]), ["0"]))
+        self.assertIn(part, self.stderr)
+        self.assertIn(odd, self.stderr)
+
+    def test_future_stamp_is_kept_with_a_warning(self) -> None:
+        """A clock set back makes a backup look written later than now: kept, and said."""
+        self.since(400)
+        name = f"neo4j-{stamp(-3)}.dump.age"
+        self.backups(name)
+        status, _ = self.prune("neo4j")
+        self.assertEqual((status, self.left()), (0, [name]))
+        self.assertIn("future", self.stderr)
+
+    @unittest.skipIf(os.geteuid() == 0, "root can delete anything")
+    def test_undeletable_file_is_reported_not_failed(self) -> None:
+        """A file the account cannot delete is named, counted as not deleted, and the pruning succeeds."""
+        self.since(400)
+        name = f"neo4j-{stamp(90)}.dump"
+        self.backups(name)
+        self.dir.chmod(0o555)
+        self.addCleanup(self.dir.chmod, 0o755)
+        status, facts = self.prune("neo4j")
+        self.assertEqual(status, 0, self.stderr)
+        self.assertEqual((facts["deleted"], facts["not_deleted"]), (["0"], ["1"]))
+        self.assertNotIn("file", facts)
+        self.assertIn(f"remove {name} as root", self.stderr)
+
+    def test_bad_period_refuses(self) -> None:
+        """Only whole days from 1 to 365: anything else refuses before anything is deleted."""
+        self.since(400)
+        self.backups(f"neo4j-{stamp(90)}.dump.age")
+        for days in ("0", "366", "abc", "", "30d"):
+            status, facts = self.prune("neo4j", days=days)
+            self.assertEqual((status, facts), (2, {}), days)
+        self.assertEqual(len(self.left()), 1)
+
+    def test_usage(self) -> None:
+        """An unknown store or a missing argument: exit 2."""
+        for args in ((), ("chorus",), ("neo4j", "--now")):
+            result = subprocess.run(
+                ["bash", str(SCRIPTS / "backup_prune.sh"), *args],
+                env={"PATH": os.environ["PATH"], "BACKUP_RETENTION_DAYS": "30", "BACKUP_DIR": str(self.dir)},
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 2, args)
+
+
 @unittest.skipUnless(HAS_SCRIPTS, "needs bash and the repo's scripts/")
 class BackupAgeTest(AgeStandIn):
     """scripts/backup_age.sh: whether a backup can be encrypted, and what its record says about it."""
