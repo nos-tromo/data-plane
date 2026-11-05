@@ -10,7 +10,10 @@ its sequence number and the hash of the event before it, so a removed,
 inserted, reordered or altered line breaks the chain. A heartbeat keeps a live
 chain visibly moving and a shutdown event marks a clean end, so a chain that
 stops without one points at lost or deleted lines. :func:`verify_chain` checks
-all of this and is what the audit store's verifier runs.
+all of this and is what the audit store's verifier runs. The written line
+escapes the characters some readers take for a line break (NEL and the other
+C1 controls, U+2028, U+2029), so one event is one line to every reader; the
+parsed event and its hash are the same either way.
 
 Hashes make alteration detectable, not authorship: whatever can write audit
 lines can also write a whole, internally consistent fake chain. Two controls
@@ -122,6 +125,30 @@ def event_hash(event: Mapping[str, object]) -> str:
     """
     body = {key: value for key, value in event.items() if key != "hash"}
     return hashlib.sha256(canonical_json(body).encode("utf-8")).hexdigest()
+
+
+#: Characters JSON lets stand unescaped in a string but that some readers take
+#: for a line break: NEL and the other C1 controls, and the Unicode line and
+#: paragraph separators (Python's ``str.splitlines`` splits on all three kinds).
+_LINE_BREAKERS: Final = re.compile("[\u0080-\u009f\u2028\u2029]")
+
+
+def event_line(event: Mapping[str, object]) -> str:
+    """Write an event as the one line every reader splits the same way.
+
+    The canonical JSON with every character of :data:`_LINE_BREAKERS` written
+    as its six-character JSON escape. Such a character can only stand inside
+    a JSON string, so the escape decodes to the same value: the parsed event,
+    and the hash :func:`verify_chain` checks over it, are those of
+    :func:`canonical_json`.
+
+    Args:
+        event: The event, with its ``hash``.
+
+    Returns:
+        The line, without its newline.
+    """
+    return _LINE_BREAKERS.sub(lambda char: f"\\u{ord(char.group()):04x}", canonical_json(event))
 
 
 def new_event_id() -> str:
@@ -571,7 +598,7 @@ class AuditEmitter:
                 body["seq"] = self._seq
                 body["prev_hash"] = self._prev_hash
                 body["hash"] = event_hash(body)
-                line = canonical_json(body)
+                line = event_line(body)
                 out = self._stream if self._stream is not None else sys.stdout
                 try:
                     out.write(line + "\n")

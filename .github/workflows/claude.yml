@@ -32,5 +32,5 @@ permissions:
 
 jobs:
   claude:
-    uses: nos-tromo/.github/.github/workflows/claude.yml@44032ac756bd7700ba19fc65e141a5c2f8992416 # v3.20
+    uses: nos-tromo/.github/.github/workflows/claude.yml@2715bedabe594a449e411182393e68da59c791f3 # v3.22
     secrets: inherit
