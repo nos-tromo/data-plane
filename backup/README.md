@@ -77,8 +77,16 @@ age1...
 
 Only public keys belong there. Every backup refuses, before anything else
 happens and with how to create the key pair, when the file is missing, holds a
-private key, can be changed by anyone (whoever can change it chooses who reads
-the next backup), or has a line age does not take as a public key. A key from
+private key, or has a line age does not take as a public key.
+
+Whoever can change the file chooses who reads the next backup. So the file
+and every directory above it, up to the checkout (or up to `/` for a file
+outside it), must belong to root or to the account running the backup, and
+be writable by their owner only. A directory with the sticky bit, such as
+`/tmp`, may be writable by others. A backup also refuses a symbolic link in
+place of the file, and a mode or owner it cannot read. It then reads the
+file once, into a private copy that age encrypts to, so the keys its record
+counts and fingerprints are the keys the backup was encrypted to. A key from
 `age-keygen` works with every age release; a post-quantum one (`age-keygen
 -pq`) needs age 1.3 or later on the host, and a plugin key (`age1yubikey1…`)
 its plugin there.
@@ -285,7 +293,9 @@ The unit runs as an account that may use Docker; the records name that
 account as the operator. Exit status: `0` when the backup was written and
 recorded; non-zero when it was refused (no usable recipients, no purpose,
 admin-audit down), failed, or could not be recorded. The recipients file and
-age must be in place before the first run.
+age must be in place before the first run, and the checkout, `backup/` and
+the recipients file must belong to root or to that account, writable by
+their owner only (The recipients file, above).
 
 ## Plaintext from earlier versions
 

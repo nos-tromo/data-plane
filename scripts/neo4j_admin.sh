@@ -90,6 +90,7 @@ cleanup() {
   if [[ $stopped -eq 1 ]]; then
     start_neo4j || true
   fi
+  age_cleanup
 }
 trap cleanup EXIT
 trap 'exit 130' INT

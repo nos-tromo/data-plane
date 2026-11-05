@@ -80,6 +80,7 @@ cleanup() {
       echo "ERROR: the decrypted snapshot $restored may still be in the qdrant-snapshots volume: delete it" >&2
     fi
   fi
+  age_cleanup
 }
 trap cleanup EXIT
 trap 'exit 130' INT

@@ -997,8 +997,11 @@ class WrapperScriptTest(ComposeStandIn):
 # stand-in's secret, and logs every call. FAKE_AGE_FAIL=encrypt|decrypt fails
 # that direction once it has written (a decryption after FAKE_AGE_PASS_BYTES
 # bytes, and only from its FAKE_AGE_FAIL_FROM-th call on), except into
-# /dev/null; FAKE_AGE_WARN warns like age about a key it skips.
+# /dev/null; FAKE_AGE_WARN warns like age about a key it skips. Each
+# encryption appends the recipients file it read to FAKE_AGE_SEEN, as one JSON
+# string per line.
 FAKE_AGE = r"""#!/usr/bin/env python3
+import json
 import os
 import sys
 
@@ -1043,13 +1046,16 @@ if decrypt:
         out = out[: int(os.environ.get("FAKE_AGE_PASS_BYTES", "0"))]
 else:
     try:
-        lines = open(options["-R"], encoding="utf-8").read().replace("\r", "").split("\n")
+        text = open(options["-R"], encoding="utf-8").read()
     except OSError:
         fail("failed to open recipient file")
+    with open(os.environ["FAKE_AGE_SEEN"], "a", encoding="utf-8") as seen:
+        seen.write(json.dumps(text) + "\n")
+    lines = text.replace("\r", "").split("\n")
     keys = [line for line in lines if line and not line.startswith("#")]
     for number, line in enumerate(lines, 1):
         if line in keys and not line.startswith("age1"):
-            fail(f"malformed recipient at line {number}")
+            fail(f'failed to parse recipient file "{options["-R"]}": malformed recipient at line {number}')
     if not keys:
         fail("no recipients found")
     if os.environ.get("FAKE_AGE_WARN"):
@@ -1085,40 +1091,72 @@ def recipients_fingerprint(keys: tuple[str, ...]) -> str:
 
 
 class AgeStandIn(unittest.TestCase):
-    """A temporary directory with the age stand-in first on PATH and a recipients file."""
+    """A temporary directory with the age stand-in first on PATH and a recipients file.
+
+    ``TMPDIR`` is a directory of its own, so that the private copy of the
+    recipients the scripts make there can be found, and found removed.
+    """
 
     @override
     def setUp(self) -> None:
-        """Create the stand-in, its log and a recipients file with two keys."""
+        """Create the stand-in, its logs, TMPDIR and a recipients file with two keys."""
         self.tmp = Path(tempfile.mkdtemp(prefix="admin-audit-age-"))
         self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.private = self.tmp / "private"
+        self.private.mkdir()
         self.bin = self.tmp / "bin"
         self.bin.mkdir()
         age = self.bin / "age"
         age.write_text(FAKE_AGE, encoding="utf-8")
         age.chmod(0o755)
         self.age_log = self.tmp / "age.log"
+        self.age_seen = self.tmp / "age-seen.log"
         self.recipients = self.tmp / "recipients.txt"
         self.recipients.write_text(f"# keyholder one\n{RECIPIENT_KEYS[0]}\n{RECIPIENT_KEYS[1]}\n", encoding="utf-8")
         self.recipients.chmod(0o644)
         self.env = {
             "PATH": f"{self.bin}{os.pathsep}{os.environ['PATH']}",
             "FAKE_AGE_LOG": str(self.age_log),
+            "FAKE_AGE_SEEN": str(self.age_seen),
             "BACKUP_RECIPIENTS": str(self.recipients),
+            "TMPDIR": str(self.private),
         }
 
     def age_calls(self) -> list[str]:
-        """Read the stand-in's log.
+        """Read the stand-in's log, a private copy of the recipients named ``<copy>``.
 
         Returns:
             Its calls, in order.
         """
-        return self.age_log.read_text(encoding="utf-8").splitlines() if self.age_log.exists() else []
+        if not self.age_log.exists():
+            return []
+        private = os.path.realpath(self.private)
+        copy = re.compile(re.escape(f"{private}{os.sep}data-plane-recipients.") + r"[A-Za-z0-9]{6}\b")
+        return [copy.sub("<copy>", line) for line in self.age_log.read_text(encoding="utf-8").splitlines()]
+
+    def age_read(self) -> list[str]:
+        """Read what each encryption took as its recipients file.
+
+        Returns:
+            The contents, in order.
+        """
+        if not self.age_seen.exists():
+            return []
+        return [json.loads(line) for line in self.age_seen.read_text(encoding="utf-8").splitlines()]
+
+    def left_private(self) -> list[str]:
+        """List what is left in TMPDIR.
+
+        Returns:
+            The names, sorted.
+        """
+        return sorted(path.name for path in self.private.iterdir())
 
 
 # A stand-in for `docker compose` for the store scripts: logs every call and
 # plays the part of neo4j-admin and of the Qdrant container. FAKE_INTERRUPT
 # names a call that is interrupted like ^C: SIGINT to the whole process group.
+# FAKE_SWAP replaces the recipients file's content as Neo4j is stopped.
 FAKE_STORE_COMPOSE = r"""#!/usr/bin/env bash
 call="$*"
 printf 'compose %s\n' "${call//$'\n'/\\n}" >> "$FAKE_LOG"
@@ -1130,7 +1168,9 @@ done
 last=${args[${#args[@]} - 1]}
 interrupt() { [[ ${FAKE_INTERRUPT:-} != "$1" ]] || kill -INT 0; }
 case " $* " in
-  *" stop neo4j "*) exit "${FAKE_STOP:-0}" ;;
+  *" stop neo4j "*)
+    [[ -z ${FAKE_SWAP:-} ]] || printf '%s\n' "$FAKE_SWAP" > "$BACKUP_RECIPIENTS"
+    exit "${FAKE_STOP:-0}" ;;
   *" start neo4j "*) exit "${FAKE_START:-0}" ;;
   *" run --rm -T --entrypoint neo4j-admin neo4j database dump neo4j --to-stdout "*)
     printf 'DZV1 synthetic dump of Alice Example'
@@ -1267,8 +1307,9 @@ class StoreScriptTest(AgeStandIn):
         self.assertEqual(content, AGE_HEADER + b"DZV1 synthetic dump of Alice Example")
         self.assertEqual(
             self.age_calls(),
-            [f"age -R {self.recipients} -o /dev/null", f"age -R {self.recipients} -o {self.backup_dir}/{name}.part"],
+            ["age -R <copy> -o /dev/null", f"age -R <copy> -o {self.backup_dir}/{name}.part"],
         )
+        self.assertEqual(self.left_private(), [])
         self.assertEqual(facts, [*self.encryption_facts(), f"file={name}", f"size_bytes={len(content)}"])
         self.assertEqual((self.backup_dir / name).stat().st_mode & 0o777, 0o600)
 
@@ -1287,6 +1328,7 @@ class StoreScriptTest(AgeStandIn):
         self.assertEqual([call.split()[0] for call in calls], ["stop", "run", "start"])
         self.assertEqual(facts, self.encryption_facts())
         self.assertEqual(self.backups(), {})
+        self.assertEqual(self.left_private(), [])
 
     def test_failed_encryption_keeps_nothing(self) -> None:
         """Age failing after it wrote part of the file leaves no file, not even the part."""
@@ -1302,6 +1344,17 @@ class StoreScriptTest(AgeStandIn):
         self.assertEqual(status, 130)
         self.assertEqual([call.split()[0] for call in calls], ["stop", "run", "start"])
         self.assertEqual(self.backups(), {})
+        self.assertEqual(self.left_private(), [])
+
+    def test_the_keys_checked_are_the_keys_encrypted_to(self) -> None:
+        """A recipients file changed after the check changes neither whom the dump is encrypted to nor its record."""
+        original = self.recipients.read_text(encoding="utf-8")
+        status, _, facts = self.run_script("neo4j_admin.sh", "dump", FAKE_SWAP=RECIPIENT_KEYS[0])
+        self.assertEqual(status, 0, self.stderr)
+        self.assertEqual(self.recipients.read_text(encoding="utf-8"), f"{RECIPIENT_KEYS[0]}\n")
+        self.assertEqual(self.age_read(), [original, original])
+        self.assertEqual(facts[:3], self.encryption_facts())
+        self.assertEqual(self.left_private(), [])
 
     def test_nothing_runs_when_neo4j_cannot_be_stopped(self) -> None:
         """No dump against a running database."""
@@ -1569,9 +1622,64 @@ class StoreScriptTest(AgeStandIn):
             self.assertEqual((status, calls), (2, []), (args, env))
 
 
+# A stand-in for stat(1), for the recipients checks: with FAKE_STAT_STYLE=gnu it
+# answers GNU's -c '%a %u', with bsd only BSD's -f '%p %u' (the GNU form then
+# fails, as on BSD), with none neither. FAKE_STAT_AS, a JSON object, gives the
+# answer for a path instead of the path's own mode and owner. Every other call
+# goes to the real stat, FAKE_STAT_REAL.
+FAKE_STAT = r"""#!/usr/bin/env python3
+import json
+import os
+import sys
+
+args = sys.argv[1:]
+style = os.environ.get("FAKE_STAT_STYLE", "gnu")
+forms = {("-c", "%a %u"): "gnu", ("-f", "%p %u"): "bsd"}
+if len(args) == 3 and tuple(args[:2]) in forms:
+    if forms[tuple(args[:2])] != style:
+        sys.stderr.write("stat: illegal option\n")
+        sys.exit(1)
+    answer = json.loads(os.environ.get("FAKE_STAT_AS", "{}")).get(args[2])
+    if answer is None:
+        info = os.lstat(args[2])
+        mode = info.st_mode if style == "bsd" else info.st_mode & 0o7777
+        answer = f"{mode:o} {info.st_uid}"
+    print(answer)
+    sys.exit(0)
+os.execv(os.environ["FAKE_STAT_REAL"], ["stat", *args])
+"""
+# A uid that is neither root nor the account running the tests.
+OTHER_UID = os.getuid() + 1
+
+
 @unittest.skipUnless(HAS_SCRIPTS, "needs bash and the repo's scripts/")
 class BackupAgeTest(AgeStandIn):
     """scripts/backup_age.sh: whether a backup can be encrypted, and what its record says about it."""
+
+    def stat_env(self, style: str = "gnu", answers: dict[str, str] | None = None) -> dict[str, str]:
+        """Put the stat stand-in first on PATH.
+
+        Args:
+            style: ``gnu``, ``bsd`` or ``none``: the form it answers.
+            answers: What it answers for a path (physical, as the checks name
+                it) instead of the path's own mode and owner.
+
+        Returns:
+            The environment to run the check with.
+        """
+        real = shutil.which("stat", path=self.env["PATH"])
+        if real is None:
+            self.skipTest("needs stat")
+        stand_in = self.tmp / "stat-bin"
+        stand_in.mkdir(exist_ok=True)
+        (stand_in / "stat").write_text(FAKE_STAT, encoding="utf-8")
+        (stand_in / "stat").chmod(0o755)
+        return {
+            "PATH": f"{stand_in}{os.pathsep}{self.env['PATH']}",
+            "FAKE_STAT_REAL": real,
+            "FAKE_STAT_STYLE": style,
+            "FAKE_STAT_AS": json.dumps(answers or {}),
+        }
 
     def check(self, **env: str) -> subprocess.CompletedProcess[str]:
         """Run ``backup_age.sh recipients``, as make does before a backup.
@@ -1615,7 +1723,9 @@ class BackupAgeTest(AgeStandIn):
         """Age installed, every line a public key: exit 0, silent, nothing encrypted for real."""
         result = self.check()
         self.assertEqual((result.returncode, result.stdout, result.stderr), (0, "", ""))
-        self.assertEqual(self.age_calls(), [f"age -R {self.recipients} -o /dev/null"])
+        self.assertEqual(self.age_calls(), ["age -R <copy> -o /dev/null"])
+        self.assertEqual(self.age_read(), [self.recipients.read_text(encoding="utf-8")])
+        self.assertEqual(self.left_private(), [])
 
     def test_no_recipients_file_is_refused_with_how_to_make_one(self) -> None:
         """Unset, missing or unreadable: exit 2, with the offline age-keygen steps."""
@@ -1634,14 +1744,107 @@ class BackupAgeTest(AgeStandIn):
             result = self.check()
             self.assertEqual(result.returncode, 2, line)
             self.assertIn("holds a private key", result.stderr)
+            self.assertNotIn("data-plane-recipients.", result.stderr)
+        self.assertEqual(self.age_calls(), [])
+        self.assertEqual(self.left_private(), [])
+
+    def test_a_file_others_can_change_is_refused(self) -> None:
+        """Recipients the group or anyone can write would let them choose who reads the next backup."""
+        for mode in (0o664, 0o646, 0o666):
+            self.recipients.chmod(mode)
+            result = self.check()
+            self.assertEqual(result.returncode, 2, oct(mode))
+            self.assertIn("chmod go-w", result.stderr)
         self.assertEqual(self.age_calls(), [])
 
-    def test_a_file_anyone_can_change_is_refused(self) -> None:
-        """World-writable recipients would let anyone choose who reads the next backup."""
-        self.recipients.chmod(0o666)
-        result = self.check()
+    def test_a_directory_others_can_change_is_refused(self) -> None:
+        """Whoever can change a directory above the file can put another file in its place."""
+        keys = self.tmp / "keys"
+        keys.mkdir()
+        recipients = keys / "recipients.txt"
+        recipients.write_text(f"{RECIPIENT_KEYS[0]}\n", encoding="utf-8")
+        recipients.chmod(0o644)
+        keys.chmod(0o775)
+        result = self.check(BACKUP_RECIPIENTS=str(recipients))
         self.assertEqual(result.returncode, 2)
-        self.assertIn("chmod o-w", result.stderr)
+        self.assertIn(f"the directory {os.path.realpath(keys)} (above the recipients file)", result.stderr)
+        self.assertIn("chmod go-w", result.stderr)
+        self.assertEqual(self.age_calls(), [])
+        keys.chmod(0o755)
+        result = self.check(BACKUP_RECIPIENTS=str(recipients))
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_a_symbolic_link_is_refused(self) -> None:
+        """The file itself is named, never a link to it."""
+        link = self.tmp / "link.txt"
+        link.symlink_to(self.recipients)
+        result = self.check(BACKUP_RECIPIENTS=str(link))
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("is a symbolic link", result.stderr)
+        self.assertEqual(self.age_calls(), [])
+
+    def test_only_root_or_the_backup_account_may_own_the_file_and_its_directories(self) -> None:
+        """Their owner chooses who can read the backups."""
+        file = os.path.realpath(self.recipients)
+        directory = os.path.dirname(file)
+        for path in (file, directory):
+            result = self.check(**self.stat_env(answers={path: f"644 {OTHER_UID}"}))
+            self.assertEqual(result.returncode, 2, path)
+            self.assertIn(f"belongs to uid {OTHER_UID}, not to root", result.stderr)
+        self.assertEqual(self.age_calls(), [])
+        result = self.check(**self.stat_env(answers={file: "644 0", directory: "755 0"}))
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_a_mode_or_owner_that_cannot_be_read_is_refused(self) -> None:
+        """Every check fails closed: no answer, or one not in the shape asked for."""
+        file = os.path.realpath(self.recipients)
+        cases = [self.stat_env("none")]
+        cases += [self.stat_env(answers={file: answer}) for answer in ("", "rw-r--r-- 0", "644", "12345 0", "644 x")]
+        cases += [self.stat_env("bsd", {file: answer}) for answer in ("644 0", "-rw-r--r-- 0")]
+        for env in cases:
+            result = self.check(**env)
+            self.assertEqual(result.returncode, 2, env["FAKE_STAT_AS"])
+            self.assertIn("cannot read the mode and owner", result.stderr)
+        self.assertEqual(self.age_calls(), [])
+
+    def test_bsd_stat_answers_the_same(self) -> None:
+        """BSD's -f '%p %u' carries the file type in front of the mode; the checks see the same mode."""
+        env = self.stat_env("bsd")
+        result = self.check(**env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.recipients.chmod(0o664)
+        result = self.check(**env)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("chmod go-w", result.stderr)
+
+    def test_a_sticky_directory_others_may_write_is_safe(self) -> None:
+        """Like /tmp: nobody can rename or remove an entry there they do not own. Without the bit, refused."""
+        file = os.path.realpath(self.recipients)
+        directory = os.path.dirname(file)
+        for style, answer in (("gnu", "1777 0"), ("bsd", "41777 0"), ("gnu", "1775 0")):
+            result = self.check(**self.stat_env(style, {directory: answer}))
+            self.assertEqual(result.returncode, 0, (answer, result.stderr))
+        refused = (("gnu", "777 0", directory), ("bsd", "40777 0", directory), ("gnu", "1666 0", file))
+        for style, answer, path in refused:
+            result = self.check(**self.stat_env(style, {path: answer}))
+            self.assertEqual(result.returncode, 2, answer)
+            self.assertIn("chmod go-w", result.stderr)
+
+    def test_the_private_copy_is_what_age_reads_and_is_removed(self) -> None:
+        """The file is read once, into a copy only its owner can read; age_cleanup removes it."""
+        result = self.sourced(
+            'age_recipients; echo "$AGE_RECIPIENTS"; _age_stat "$AGE_RECIPIENTS"; age_cleanup; '
+            '[[ -e $AGE_RECIPIENTS ]] || echo removed'
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        copy, info, removed = result.stdout.splitlines()
+        private = os.path.realpath(self.private)
+        self.assertRegex(copy, "^" + re.escape(f"{private}{os.sep}data-plane-recipients.") + "[A-Za-z0-9]{6}$")
+        mode, owner = info.split()
+        self.assertEqual((int(mode, 8), int(owner)), (0o600, os.getuid()))
+        self.assertEqual(removed, "removed")
+        self.assertEqual(self.age_read(), [self.recipients.read_text(encoding="utf-8")])
+        self.assertEqual(self.left_private(), [])
 
     def test_age_must_be_installed(self) -> None:
         """Without age on PATH: exit 2, pointing at how to install it."""
@@ -1657,7 +1860,33 @@ class BackupAgeTest(AgeStandIn):
         self.recipients.write_text(f"{RECIPIENT_KEYS[0]}\nnot-a-public-key\n", encoding="utf-8")
         result = self.check()
         self.assertEqual(result.returncode, 2)
-        self.assertIn("malformed recipient at line 2", result.stderr)
+        self.assertIn(f'recipient file "{self.recipients}": malformed recipient at line 2', result.stderr)
+        self.assertNotIn("data-plane-recipients.", result.stderr)
+        self.assertEqual(self.left_private(), [])
+
+    def test_a_path_with_an_ampersand_is_named_as_it_is(self) -> None:
+        """Age's message names the recipients file, not the copy, whatever characters its path holds."""
+        keys = self.tmp / "a&b"
+        keys.mkdir(mode=0o755)
+        recipients = keys / "recipients.txt"
+        recipients.write_text("not-a-public-key\n", encoding="utf-8")
+        recipients.chmod(0o644)
+        result = self.check(BACKUP_RECIPIENTS=str(recipients))
+        self.assertEqual(result.returncode, 2)
+        self.assertIn(f'recipient file "{recipients}": malformed recipient at line 1', result.stderr)
+        self.assertNotIn("data-plane-recipients.", result.stderr)
+
+    def test_a_temporary_directory_others_can_change_is_refused(self) -> None:
+        """Whoever can change TMPDIR could swap the private copy before age reads it."""
+        self.private.chmod(0o777)
+        result = self.check()
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("(above the private copy of the recipients (TMPDIR))", result.stderr)
+        self.assertEqual(self.age_calls(), [])
+        self.private.chmod(0o1777)
+        result = self.check()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.check(TMPDIR=str(self.tmp / "missing")).returncode, 2)
 
     def test_a_warning_from_age_is_refused(self) -> None:
         """A key age skips with a warning would make the recipient count wrong."""
@@ -1671,16 +1900,11 @@ class BackupAgeTest(AgeStandIn):
         self.recipients.write_bytes(
             f"# created offline\r\n{keys[0]}\r\n\r\n{keys[1]}\n{keys[0]}\n#{RECIPIENT_KEYS[1]}x\n".encode()
         )
-        result = self.sourced('age_recipients; age_facts /dev/stdout; echo "$AGE_RECIPIENTS"')
+        result = self.sourced("age_recipients; age_facts /dev/stdout; age_cleanup")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(
             result.stdout.splitlines(),
-            [
-                "encryption=age",
-                "recipients=2",
-                f"recipients_sha256={recipients_fingerprint(RECIPIENT_KEYS)}",
-                str(self.recipients),
-            ],
+            ["encryption=age", "recipients=2", f"recipients_sha256={recipients_fingerprint(RECIPIENT_KEYS)}"],
         )
 
     def test_unencrypted_backups_are_warned_about(self) -> None:
