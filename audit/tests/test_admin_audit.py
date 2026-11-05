@@ -628,6 +628,75 @@ class EndTest(Workspace):
         self.assertIn("could not write the record", self.stderr.getvalue())
 
 
+PRUNE_FACTS = ("period_days=30", "cutoff=2026-01-01T02:00:00Z", "deleted=2", "not_deleted=0")
+
+
+class PruneRecordTest(Workspace):
+    """The record of a backup pruning: a deletion of files."""
+
+    def test_prune_is_a_deletion_of_files(self) -> None:
+        """The deleted files are the target, by name; the rule and the counts are criteria."""
+        names = [f"{DUMP}.age", "neo4j-20260130T020000Z.dump"]
+        status, events = self.end(self.environ(), "prune", "neo4j", *PRUNE_FACTS, *[f"file={n}" for n in names])
+        self.assertEqual(status, 0)
+        (event,) = records(events)
+        self.assertEqual((event["action"], event["operation"], event["outcome"]), ("delete", "backup.prune.neo4j", "ok"))
+        self.assertEqual(event["target"], {"kind": "file", "ids": names, "count": 2})
+        self.assertEqual(
+            event["criteria"],
+            {
+                "period_days": 30,
+                "cutoff": "2026-01-01T02:00:00Z",
+                "deleted": 2,
+                "not_deleted": 0,
+                "exit_status": 0,
+                "duration_s": 7,
+            },
+        )
+        self.assertIsNone(event.get("recipient"))
+        self.assert_chains_intact()
+
+    def test_nothing_pruned_still_records_an_empty_target(self) -> None:
+        """A pruning that found nothing due is recorded too, with no ids."""
+        facts = ("period_days=30", "cutoff=2026-01-01T02:00:00Z", "deleted=0", "not_deleted=0")
+        _, events = self.end(self.environ(), "prune", "qdrant", *facts)
+        (event,) = records(events)
+        self.assertEqual(event["operation"], "backup.prune.qdrant")
+        self.assertEqual(event["target"], {"kind": "file", "count": 0})
+
+    def test_long_file_list_continues_in_id_events(self) -> None:
+        """More than 200 files are not cut: continuation events carry the rest."""
+        names = [f"qdrant-docs-20260101T0000{n:02d}Z-{n}.snapshot.age" for n in range(250)]
+        _, events = self.end(self.environ(), "prune", "qdrant", *PRUNE_FACTS, *[f"file={n}" for n in names])
+        primary, *more = records(events)
+        self.assertEqual(primary["target"]["count"], 250)
+        self.assertEqual([event["operation"] for event in more], ["backup.prune.qdrant.ids"])
+        self.assertEqual([n for event in (primary, *more) for n in event["target"]["ids"]], names)
+        self.assert_chains_intact()
+
+    def test_success_must_state_the_rule_and_counts(self) -> None:
+        """An ok pruning without its period, cutoff or count is refused and writes nothing."""
+        for missing in ("period_days", "cutoff", "deleted"):
+            facts = [fact for fact in PRUNE_FACTS if not fact.startswith(f"{missing}=")]
+            status, events = self.end(self.environ(), "prune", "neo4j", *facts)
+            self.assertEqual((status, events), (2, []), missing)
+
+    def test_malformed_facts_are_refused(self) -> None:
+        """A path instead of a file name, or a cutoff that is not UTC, is never recorded."""
+        for bad in ("file=../neo4j.dump", "file=dir/neo4j.dump", "cutoff=2026-01-01", "cutoff=2026-01-01T02:00:00+01:00"):
+            status, events = self.end(self.environ(), "prune", "neo4j", *PRUNE_FACTS, bad)
+            self.assertEqual((status, events), (2, []), bad)
+
+    def test_prune_follows_require_purpose(self) -> None:
+        """Without delete in AUDIT_REQUIRE_PURPOSE a pruning needs no purpose; with it, it does."""
+        status, _, _ = self.begin(self.environ(AUDIT_REQUIRE_PURPOSE="query,disclose"), "prune", "neo4j")
+        self.assertEqual(status, 0)
+        status, _, events = self.begin(self.environ(AUDIT_REQUIRE_PURPOSE="delete"), "prune", "neo4j")
+        self.assertEqual(status, 2)
+        (event,) = records(events)
+        self.assertEqual((event["action"], event["operation"], event["outcome"]), ("delete", "backup.prune.neo4j", "denied"))
+
+
 class ServeTest(Workspace):
     """The long-running service, check and verify."""
 

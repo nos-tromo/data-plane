@@ -62,7 +62,7 @@ SERVICE: Final = "data-plane"
 DEFAULT_VERSION_FILE: Final = "/etc/data-plane/VERSION"
 STORES: Final = ("neo4j", "qdrant")
 #: Each kind of operation and the action its record has.
-KIND_ACTIONS: Final = {"shell": "admin", "backup": "disclose", "restore": "modify", "ports": "admin"}
+KIND_ACTIONS: Final = {"shell": "admin", "backup": "disclose", "restore": "modify", "ports": "admin", "prune": "delete"}
 #: The kinds recorded when they open and again when they close, linked: the
 #: operations of the two events. They always need a stated purpose.
 OPENED_KINDS: Final = {
@@ -86,6 +86,7 @@ _EVENT_ID: Final = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-
 # A base name only: never a directory, so a path naming a user cannot be recorded.
 _FILE_NAME: Final = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,254}")
 _SHA256: Final = re.compile(r"[0-9a-f]{64}")
+_UTC: Final = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z")
 
 Parser = Callable[[str], object]
 
@@ -178,6 +179,23 @@ def file_name(text: str) -> str:
     return text
 
 
+def utc_time(text: str) -> str:
+    """Accept a moment in UTC, e.g. the cutoff a pruning applied.
+
+    Args:
+        text: ``YYYY-MM-DDTHH:MM:SSZ``.
+
+    Returns:
+        The moment, as given.
+
+    Raises:
+        ValueError: If it is not in that form.
+    """
+    if _UTC.fullmatch(text) is None:
+        raise ValueError("not a UTC time (YYYY-MM-DDTHH:MM:SSZ)")
+    return text
+
+
 def store_name(text: str) -> str:
     """Accept a name a store gave an object, e.g. a Qdrant collection.
 
@@ -245,9 +263,24 @@ FACTS: Final[Mapping[OperationKey, Mapping[str, Parser]]] = {
     ("restore", "neo4j"): {"size_bytes": whole_number, "encryption": encryption},
     ("restore", "qdrant"): {"encryption": encryption},
     ("ports", None): {"by": port_closer},
+    **{
+        ("prune", store): {
+            "file": file_name,
+            "period_days": positive_number,
+            "cutoff": utc_time,
+            "deleted": whole_number,
+            "not_deleted": whole_number,
+        }
+        for store in STORES
+    },
 }
-#: The fact that may repeat, once per object of the record's target.
-TARGET_FACTS: Final[Mapping[OperationKey, str]] = {("backup", "qdrant"): "collection"}
+#: The fact that may repeat, once per object of the record's target: the
+#: collections a Qdrant backup covers, the files a pruning deleted.
+TARGET_FACTS: Final[Mapping[OperationKey, str]] = {
+    ("backup", "qdrant"): "collection",
+    ("prune", "neo4j"): "file",
+    ("prune", "qdrant"): "file",
+}
 #: The facts an operation that succeeded must report: a backup how it was
 #: encrypted and to which keys, a restore that it read an encrypted file. No
 #: ``ok`` record can therefore show an unencrypted backup.
@@ -256,6 +289,8 @@ REQUIRED_FACTS: Final[Mapping[OperationKey, tuple[str, ...]]] = {
     ("backup", "qdrant"): tuple(ENCRYPTION_FACTS),
     ("restore", "neo4j"): ("encryption",),
     ("restore", "qdrant"): ("encryption",),
+    ("prune", "neo4j"): ("period_days", "cutoff", "deleted"),
+    ("prune", "qdrant"): ("period_days", "cutoff", "deleted"),
 }
 
 
@@ -354,7 +389,7 @@ def purpose_required(kind: str, required: frozenset[str]) -> bool:
     """Decide whether an operation needs a stated purpose.
 
     Args:
-        kind: ``shell``, ``backup``, ``restore`` or ``ports``.
+        kind: ``shell``, ``backup``, ``restore``, ``ports`` or ``prune``.
         required: The actions ``AUDIT_REQUIRE_PURPOSE`` lists.
 
     Returns:
@@ -368,16 +403,19 @@ def operation_of(kind: str, store: str | None) -> str:
     """Name the operation an operation's main record has.
 
     Args:
-        kind: ``shell``, ``backup``, ``restore`` or ``ports``.
+        kind: ``shell``, ``backup``, ``restore``, ``ports`` or ``prune``.
         store: ``neo4j`` or ``qdrant``; ``None`` for the admin ports.
 
     Returns:
         The opening's operation for a shell or the admin ports
         (``db.shell.open``, ``db.ports.open``; :data:`OPENED_KINDS` names their
-        closes), else ``backup.<store>`` or ``restore.<store>``.
+        closes), ``backup.prune.<store>`` for a pruning of a store's backups,
+        else ``backup.<store>`` or ``restore.<store>``.
     """
     if kind in OPENED_KINDS:
         return OPENED_KINDS[kind][0]
+    if kind == "prune":
+        return f"backup.prune.{store}"
     return f"{kind}.{store}"
 
 
@@ -391,7 +429,7 @@ def target_of(
     """Name what an operation touched, by reference.
 
     Args:
-        kind: ``shell``, ``backup``, ``restore`` or ``ports``.
+        kind: ``shell``, ``backup``, ``restore``, ``ports`` or ``prune``.
         store: ``neo4j`` or ``qdrant``; ``None`` for the admin ports.
         parameters: The operation's parameters.
         ids: The objects it reported: the collections a Qdrant backup covers,
@@ -406,6 +444,8 @@ def target_of(
     """
     if kind == "ports":
         return Target(kind="store", ids=list(STORES), count=len(STORES))
+    if kind == "prune":
+        return Target(kind="file", ids=list(ids), count=len(ids) if total is None else total)
     if kind == "shell":
         return Target(kind="store", ids=[str(store)], count=1)
     if store == "neo4j":
@@ -419,7 +459,7 @@ def check_operation(kind: str, store: str | None, parameters: Mapping[str, objec
     """Check that an operation is known and has all its parameters.
 
     Args:
-        kind: ``shell``, ``backup``, ``restore`` or ``ports``.
+        kind: ``shell``, ``backup``, ``restore``, ``ports`` or ``prune``.
         store: ``neo4j`` or ``qdrant``; ``None`` for the admin ports, which
             open both.
         parameters: The parsed parameters.
@@ -446,7 +486,7 @@ class Invocation:
             environ: The process environment: ``AUDIT_CLI_USER`` (the operator),
                 ``AUDIT_CASE_REF``/``AUDIT_REASON`` (the purpose),
                 ``AUDIT_REQUIRE_PURPOSE``, ``AUDIT_OUTPUT``.
-            kind: ``shell``, ``backup``, ``restore`` or ``ports``.
+            kind: ``shell``, ``backup``, ``restore``, ``ports`` or ``prune``.
             store: ``neo4j`` or ``qdrant``; ``None`` for the admin ports.
             parameters: The operation's parameters, already parsed.
 
@@ -522,7 +562,7 @@ def begin(environ: Mapping[str, str], kind: str, store: str | None, pairs: Seque
 
     Args:
         environ: The process environment.
-        kind: ``shell``, ``backup``, ``restore`` or ``ports``.
+        kind: ``shell``, ``backup``, ``restore``, ``ports`` or ``prune``.
         store: ``neo4j`` or ``qdrant``; ``None`` for the admin ports.
         pairs: The operation's ``KEY=VALUE`` parameters.
         out: Where the opening's event id goes.
@@ -586,7 +626,7 @@ def end(
 
     Args:
         environ: The process environment.
-        kind: ``shell``, ``backup``, ``restore`` or ``ports``.
+        kind: ``shell``, ``backup``, ``restore``, ``ports`` or ``prune``.
         store: ``neo4j`` or ``qdrant``; ``None`` for the admin ports.
         pairs: The operation's parameters (as given to :func:`begin`) and the
             facts it reported, as ``KEY=VALUE``.

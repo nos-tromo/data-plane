@@ -3,7 +3,7 @@
 # the data-protection audit trail (README: Audit trail).
 #
 #   COMPOSE="docker compose --env-file .env -f docker/compose.yaml" \
-#     scripts/audit-admin.sh <shell|backup|restore> <neo4j|qdrant> [key=value ...] -- <command ...>
+#     scripts/audit-admin.sh <shell|backup|restore|prune> <neo4j|qdrant> [key=value ...] -- <command ...>
 #
 # The operator is the sudo user, or the login user without sudo; CASE_REF and
 # REASON in the environment state the purpose (make passes its variables on).
@@ -24,7 +24,7 @@
 set -euo pipefail
 
 usage() {
-  echo "usage: COMPOSE=<docker compose command> $0 <shell|backup|restore> <neo4j|qdrant> [key=value ...] -- <command ...>" >&2
+  echo "usage: COMPOSE=<docker compose command> $0 <shell|backup|restore|prune> <neo4j|qdrant> [key=value ...] -- <command ...>" >&2
   exit 2
 }
 
