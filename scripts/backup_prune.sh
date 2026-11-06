@@ -20,9 +20,10 @@
 # A period that is new on this host takes effect when a run first sees it and
 # deletes nothing for the notice period after that (RETENTION_NOTICE_DAYS, 1 to
 # 365, default 30), so nothing an earlier version left is deleted without
-# notice. A changed period never postpones what the period in force already
-# made due: a longer one applies at once, and a shorter one gives the notice
-# period only to the backups it makes due sooner. Changing the notice alone
+# notice. A changed period never deletes sooner than announced: a longer one
+# applies at once (also to backups due under the shorter one but not yet
+# pruned), and a shorter one gives the notice period only to the backups it
+# makes due sooner while the rule in force keeps deleting. Changing the notice alone
 # moves nothing. The state is $BACKUP_DIR/.prune-since, "<since> <days>
 # <grace until> [<days in force> <their grace until>]" in epoch seconds, mode
 # 0644 so every account that backs up can read it: while the grace runs, a

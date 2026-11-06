@@ -306,9 +306,9 @@ collection until a backup succeeds again.
   first sees it, and nothing is deleted for `RETENTION_NOTICE_DAYS` (default
   30) after that, so nothing an earlier version left is deleted without
   notice.
-- **Changing the period** never postpones what the period in force already
-  made due, and never deletes sooner than announced. A longer period applies
-  at once (within a running first grace, at that grace's end). A shorter one
+- **Changing the period** never deletes sooner than announced. A longer period
+  applies at once (within a running first grace, at that grace's end), also to
+  backups that were due under the shorter one but not yet pruned. A shorter one
   gives the notice period only to the backups it makes due sooner, never
   ending before a grace already running; meanwhile what the rule in force
   deletes still goes when it says. Changing `RETENTION_NOTICE_DAYS` alone
