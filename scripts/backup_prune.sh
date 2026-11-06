@@ -143,10 +143,14 @@ if [[ -n $inforce ]]; then
 fi
 
 if ((since > now)); then
-  echo "WARNING: $state is dated in the future; the grace period starts again now. Check the host's clock." >&2
-  since=$now grace=$((now + notice * 86400)) inforce='' inforce_grace=''
-  _record_state "$since" "$grace"
-elif ((recorded != days)); then
+  # A clock set back: keep the rule, its dates never more than a notice ahead.
+  echo "WARNING: $state is dated in the future; its dates are capped at now. Check the host's clock." >&2
+  since=$now
+  ((grace <= now + notice * 86400)) || grace=$((now + notice * 86400))
+  if [[ -n $inforce ]] && ((inforce_grace > grace)); then inforce_grace=$grace; fi
+  upgraded=1
+fi
+if ((recorded != days)); then
   # The rule actually in force before this change: the recorded period once
   # its grace had passed (or when nothing older was in force), else what both
   # it and the older rule allowed.
@@ -169,10 +173,10 @@ elif ((recorded != days)); then
   fi
   _record_state "$since" "$grace" "$inforce" "$inforce_grace"
 elif [[ -n $upgraded ]]; then
-  if ! (umask 022 && printf '%s %s %s\n' "$since" "$days" "$grace" >"$state.tmp.$$" &&
-    mv -f "$state.tmp.$$" "$state") 2>/dev/null; then
+  if ! (umask 022 && printf '%s %s %s%s\n' "$since" "$days" "$grace" "${inforce:+ $inforce $inforce_grace}" \
+    >"$state.tmp.$$" && mv -f "$state.tmp.$$" "$state") 2>/dev/null; then
     rm -f "$state.tmp.$$"
-    echo "WARNING: cannot rewrite $state with this account; a change of RETENTION_NOTICE_DAYS would still move its grace." >&2
+    echo "WARNING: cannot rewrite $state with this account; its dates are used as read." >&2
   fi
 fi
 

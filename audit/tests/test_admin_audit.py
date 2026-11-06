@@ -2046,6 +2046,24 @@ class BackupPruneTest(unittest.TestCase):
         self.prune("neo4j", now=PRUNE_NOW + 30 * DAY_S)
         self.assertEqual(self.left(), [])
 
+    def test_a_clock_stepped_back_keeps_what_is_due(self) -> None:
+        """A clock set back a few seconds after a change caps the state at now; it never restarts the grace."""
+        name = f"neo4j-{stamp(100)}.dump.age"
+        self.backups(name)
+        (self.dir / ".prune-since").write_text(f"{PRUNE_NOW} 30 {PRUNE_NOW}\n", encoding="utf-8")
+        self.prune("neo4j", now=PRUNE_NOW - 5)
+        self.assertIn("future", self.stderr)
+        self.assertEqual(self.state(), f"{PRUNE_NOW - 5} 30 {PRUNE_NOW}")
+        self.prune("neo4j", now=PRUNE_NOW)
+        self.assertEqual(self.left(), [])
+
+    def test_a_capped_state_keeps_the_period_in_force(self) -> None:
+        """Capping a state dated in the future keeps the period still deleting meanwhile."""
+        line = f"{PRUNE_NOW} 7 {PRUNE_NOW + 30 * DAY_S} 30 {PRUNE_NOW - 370 * DAY_S}"
+        (self.dir / ".prune-since").write_text(line + "\n", encoding="utf-8")
+        self.prune("neo4j", days="7", now=PRUNE_NOW - 5)
+        self.assertEqual(self.state(), f"{PRUNE_NOW - 5} 7 {PRUNE_NOW + 30 * DAY_S - 5} 30 {PRUNE_NOW - 370 * DAY_S}")
+
     def test_a_backup_another_pruning_removed_is_not_counted(self) -> None:
         """Two prunings at once: the file the other one deleted is neither named nor counted here."""
         self.since(400)

@@ -317,7 +317,8 @@ collection until a backup succeeds again.
   period, when its grace ends and, after a change, the rule in force until
   then (mode `0644`, so every account that backs up can read it). The state
   of 0.7.0 is rewritten with its grace end on the first run. A state dated in
-  the future (a clock set back) is warned about and the grace starts again; one
+  the future (a clock set back) is warned about and its dates are capped at
+  now, never restarted; one
   with impossible values (a period of 0 days, a grace end before its start) is
   refused and nothing is deleted. Deleting the file restarts the grace period.
 - **Off-host copies** are backups too. This repo cannot reach them: prune them
