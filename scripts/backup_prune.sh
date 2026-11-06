@@ -26,9 +26,11 @@
 # moves nothing. The state is $BACKUP_DIR/.prune-since, "<since> <days>
 # <grace until> [<days in force> <their grace until>]" in epoch seconds, mode
 # 0644 so every account that backs up can read it: while the grace runs, a
-# backup goes when the rule in force before the change (its days and its own
-# grace) would delete it. The two-field form of earlier versions is read as a
-# grace that started at <since>. A file this account
+# backup older than the new period goes when the rule in force before the
+# change (its days and its own grace) would delete it too. The two-field form
+# of earlier versions is read as a grace that started at <since>, and
+# rewritten with its end. A state with impossible values is refused. A file
+# this account
 # cannot delete is named and counted as not deleted; it does not fail the run.
 #
 # Reports the facts of the record to $AUDIT_FACTS: period_days, cutoff (the
@@ -112,28 +114,65 @@ if [[ ! -r $state ]]; then
 fi
 since='' recorded='' grace='' inforce='' inforce_grace=''
 read -r since recorded grace inforce inforce_grace _ <"$state" || true
-if [[ ! $since =~ ^[0-9]+$ || ! ${recorded:-} =~ ^[0-9]+$ ]] ||
-  [[ -n $grace && ! $grace =~ ^[0-9]+$ ]] || [[ -n $inforce && ! $inforce =~ ^[0-9]+$ ]] ||
-  [[ -n $inforce && ! ${inforce_grace:-} =~ ^[0-9]+$ ]]; then
-  echo "ERROR: $state holds no time and period. Delete it to restart the grace period. Nothing was deleted." >&2
+_bad_state() {
+  echo "ERROR: $state $1. Delete it to restart the grace period. Nothing was deleted." >&2
   exit 2
+}
+# Epoch seconds fit 11 digits until the year 5138; periods are 1 to 365 days.
+epoch='^[0-9]{1,11}$' period_re='^[0-9]{1,3}$'
+[[ $since =~ $epoch && ${recorded:-} =~ $period_re ]] || _bad_state "holds no time and period"
+[[ -z $grace || $grace =~ $epoch ]] || _bad_state "holds no grace end"
+if [[ -n $inforce ]]; then
+  [[ $inforce =~ $period_re && ${inforce_grace:-} =~ $epoch ]] || _bad_state "holds a period in force without its grace"
 fi
 since=$((10#$since)) recorded=$((10#$recorded))
-[[ -n $grace ]] && grace=$((10#$grace)) || grace=$((since + notice * 86400))
-[[ -z $inforce ]] || inforce=$((10#$inforce)) inforce_grace=$((10#$inforce_grace))
+((recorded >= 1 && recorded <= 365)) || _bad_state "holds a period outside 1 to 365 days"
+upgraded=''
+if [[ -n $grace ]]; then
+  grace=$((10#$grace))
+else
+  # The state of the release before: its grace ends a notice after <since>,
+  # fixed now so a later change of the notice moves nothing.
+  grace=$((since + notice * 86400)) upgraded=1
+fi
+((grace >= since && grace <= since + 365 * 86400)) || _bad_state "holds a grace end outside its period's notice"
+if [[ -n $inforce ]]; then
+  inforce=$((10#$inforce)) inforce_grace=$((10#$inforce_grace))
+  ((inforce >= 1 && inforce <= 365 && inforce_grace <= grace)) || _bad_state "holds an impossible period in force"
+fi
+
 if ((since > now)); then
   echo "WARNING: $state is dated in the future; the grace period starts again now. Check the host's clock." >&2
   since=$now grace=$((now + notice * 86400)) inforce='' inforce_grace=''
   _record_state "$since" "$grace"
 elif ((recorded != days)); then
-  # The rule in force meanwhile: the old period with its own grace, unless
-  # that grace had not passed and an older rule was still in force in it.
+  # The rule actually in force before this change: the recorded period once
+  # its grace had passed (or when nothing older was in force), else what both
+  # it and the older rule allowed.
   if ((now >= grace)) || [[ -z $inforce ]]; then
-    inforce=$recorded inforce_grace=$grace
+    in_force=$recorded in_force_grace=$grace
+  else
+    in_force=$((inforce > recorded ? inforce : recorded)) in_force_grace=$inforce_grace
   fi
   echo ">> BACKUP_RETENTION_DAYS changed from $recorded to $days: the new period takes effect now" >&2
-  since=$now grace=$((now + notice * 86400))
+  if ((days >= in_force)); then
+    # Longer: it applies at once; nothing that was announced moves earlier.
+    since=$now grace=$((now > in_force_grace ? now : in_force_grace)) inforce='' inforce_grace=''
+  else
+    # Shorter: what it makes due sooner gets the notice, never less than the
+    # grace already running; meanwhile the rule in force still deletes.
+    old_grace=$grace
+    since=$now grace=$((now + notice * 86400))
+    ((old_grace <= now || old_grace <= grace)) || grace=$old_grace
+    inforce=$in_force inforce_grace=$in_force_grace
+  fi
   _record_state "$since" "$grace" "$inforce" "$inforce_grace"
+elif [[ -n $upgraded ]]; then
+  if ! (umask 022 && printf '%s %s %s\n' "$since" "$days" "$grace" >"$state.tmp.$$" &&
+    mv -f "$state.tmp.$$" "$state") 2>/dev/null; then
+    rm -f "$state.tmp.$$"
+    echo "WARNING: cannot rewrite $state with this account; a change of RETENTION_NOTICE_DAYS would still move its grace." >&2
+  fi
 fi
 
 deleted=0
@@ -148,8 +187,9 @@ elif [[ -n $inforce ]] && ((now >= inforce_grace)); then
 else
   cutoff=$((now - period))
   echo ">> pruning takes effect on $(_utc "$grace"): until then no backup is deleted" >&2
-  printf 'period_days=%s\ncutoff=%s\ngrace_until=%s\ndeleted=0\nnot_deleted=0\n' \
-    "$days" "$(_utc "$cutoff")" "$(_utc "$grace")" >>"$facts"
+  printf 'period_days=%s\ncutoff=%s\ngrace_until=%s\n%sdeleted=0\nnot_deleted=0\n' \
+    "$days" "$(_utc "$cutoff")" "$(_utc "$grace")" "${inforce:+in_force_days=$inforce
+}" >>"$facts"
   exit 0
 fi
 printf 'period_days=%s\ncutoff=%s\n' "$days" "$(_utc "$cutoff")" >>"$facts"

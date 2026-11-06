@@ -1969,6 +1969,62 @@ class BackupPruneTest(unittest.TestCase):
         self.prune("neo4j", days="7", now=PRUNE_NOW + 30 * DAY_S)
         self.assertEqual(self.left(), [])
 
+    def test_raising_then_lowering_gives_the_notice(self) -> None:
+        """7 → 30 → 7: the 30 days were in force, so a backup they keep gets the full notice."""
+        self.since(400, days=7)
+        self.prune("neo4j", days="30")
+        name = f"neo4j-{stamp(-1)}.dump.age"
+        self.backups(name)
+        self.prune("neo4j", days="7", now=PRUNE_NOW + 10 * DAY_S)
+        self.assertEqual(self.left(), [name])
+        self.prune("neo4j", days="7", now=PRUNE_NOW + 31 * DAY_S)
+        self.assertEqual(self.left(), [name])
+        self.prune("neo4j", days="7", now=PRUNE_NOW + 41 * DAY_S)
+        self.assertEqual(self.left(), [])
+
+    def test_a_lower_notice_never_ends_a_running_grace_sooner(self) -> None:
+        """Changing the period and lowering the notice together keeps the grace already announced."""
+        name = f"neo4j-{stamp(100)}.dump.age"
+        self.backups(name)
+        self.prune("neo4j")
+        self.prune("neo4j", days="7", notice="7", now=PRUNE_NOW + DAY_S)
+        self.prune("neo4j", days="7", notice="7", now=PRUNE_NOW + 8 * DAY_S)
+        self.assertEqual(self.left(), [name])
+        self.prune("neo4j", days="7", notice="7", now=PRUNE_NOW + 30 * DAY_S)
+        self.assertEqual(self.left(), [])
+
+    def test_an_old_state_is_upgraded_so_the_notice_moves_nothing(self) -> None:
+        """A state of the release before is rewritten with its grace end on the first run."""
+        (self.dir / ".prune-since").write_text(f"{PRUNE_NOW - 5 * DAY_S} 30\n", encoding="utf-8")
+        name = f"neo4j-{stamp(100)}.dump.age"
+        self.backups(name)
+        self.prune("neo4j")
+        self.assertEqual(self.state(), f"{PRUNE_NOW - 5 * DAY_S} 30 {PRUNE_NOW + 25 * DAY_S}")
+        self.prune("neo4j", notice="1", now=PRUNE_NOW + 2 * DAY_S)
+        self.assertEqual(self.left(), [name])
+
+    def test_the_period_in_force_is_recorded_during_a_full_grace(self) -> None:
+        """A change during the first grace records the period in force, even while nothing can go."""
+        self.prune("neo4j")
+        self.facts.unlink()
+        status, facts = self.prune("neo4j", days="7", now=PRUNE_NOW + DAY_S)
+        self.assertEqual((status, facts["in_force_days"], facts["deleted"]), (0, ["30"], ["0"]))
+
+    def test_a_state_with_impossible_values_is_refused(self) -> None:
+        """Zero days, values beyond any clock, or a grace before its start delete nothing and record nothing."""
+        name = f"neo4j-{stamp(100)}.dump.age"
+        self.backups(name)
+        for line in (
+            f"{PRUNE_NOW - 400 * DAY_S} 0",
+            f"{PRUNE_NOW - 400 * DAY_S} 30 {PRUNE_NOW} 0 {PRUNE_NOW - 400 * DAY_S}",
+            f"{PRUNE_NOW - 400 * DAY_S} 30 18446744073709551617",
+            f"{PRUNE_NOW - 40 * DAY_S} 30 {PRUNE_NOW - 400 * DAY_S}",
+            f"{PRUNE_NOW - 40 * DAY_S} 30 {PRUNE_NOW} 7",
+        ):
+            (self.dir / ".prune-since").write_text(line + "\n", encoding="utf-8")
+            status, facts = self.prune("neo4j")
+            self.assertEqual((status, facts, self.left()), (2, {}, [name]), line)
+
     def test_a_notice_change_alone_moves_nothing(self) -> None:
         """Lowering RETENTION_NOTICE_DAYS during the grace never ends the grace sooner than announced."""
         name = f"neo4j-{stamp(100)}.dump.age"

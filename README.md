@@ -74,8 +74,8 @@ at the same age.
 **Upgrading to 0.8.0:** a change of `BACKUP_RETENTION_DAYS` no longer pauses
 every deletion: a longer period applies at once, a shorter one gives the notice
 period only to the backups it makes due sooner, and changing
-`RETENTION_NOTICE_DAYS` alone moves nothing. The state file of 0.7.0 is read as
-it is; 0.7.0 also reads the new one.
+`RETENTION_NOTICE_DAYS` alone moves nothing. The state file of 0.7.0 is read and
+rewritten with its grace end on the first run; 0.7.0 also reads the new one.
 
 ## Admin access (production)
 
