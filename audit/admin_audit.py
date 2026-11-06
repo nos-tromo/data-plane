@@ -270,6 +270,8 @@ FACTS: Final[Mapping[OperationKey, Mapping[str, Parser]]] = {
             "cutoff": utc_time,
             "deleted": whole_number,
             "not_deleted": whole_number,
+            "grace_until": utc_time,
+            "in_force_days": positive_number,
         }
         for store in STORES
     },
