@@ -1429,6 +1429,8 @@ class StoreScriptTest(AgeStandIn):
         self.assertRegex(cases_file, r"^qdrant-case_files_2026-\d{8}T\d{6}Z\.snapshot\.age$")
         self.assertRegex(docs_file, r"^qdrant-docs-\d{8}T\d{6}Z\.snapshot\.age$")
         self.assertEqual(files[docs_file], AGE_HEADER + f"snapshot bytes of /qdrant/snapshots/docs/{docs}".encode())
+        for name in files:
+            self.assertEqual((self.backup_dir / name).stat().st_mode & 0o777, 0o600, name)
         total = sum(len(content) for content in files.values())
         self.assertEqual(
             facts,
