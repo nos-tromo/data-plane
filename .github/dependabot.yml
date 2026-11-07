@@ -4,7 +4,7 @@ version: 2
 # first. Security updates are exempt and still open immediately. Our own
 # nos-tromo/* workflows skip the wait, so a hub release is not held back.
 updates:
-  # No `docker` ecosystem block — data-plane is pull-only (Neo4j + Qdrant
+  # No `docker` ecosystem block — data-plane is pull-only (Qdrant + python
   # images referenced by compose). It has no Dockerfiles for dependabot
   # to update, and the ecosystem fails the run when it finds nothing.
   - package-ecosystem: github-actions
