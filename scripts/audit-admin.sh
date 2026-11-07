@@ -3,7 +3,7 @@
 # the data-protection audit trail (README: Audit trail).
 #
 #   COMPOSE="docker compose --env-file .env -f docker/compose.yaml" \
-#     scripts/audit-admin.sh <shell|backup|restore|prune> <neo4j|qdrant> [key=value ...] -- <command ...>
+#     scripts/audit-admin.sh <shell|backup|restore|prune> qdrant [key=value ...] -- <command ...>
 #
 # The operator is the sudo user, or the login user without sudo; CASE_REF and
 # REASON in the environment state the purpose (make passes its variables on).
@@ -24,7 +24,7 @@
 set -euo pipefail
 
 usage() {
-  echo "usage: COMPOSE=<docker compose command> $0 <shell|backup|restore|prune> <neo4j|qdrant> [key=value ...] -- <command ...>" >&2
+  echo "usage: COMPOSE=<docker compose command> $0 <shell|backup|restore|prune> qdrant [key=value ...] -- <command ...>" >&2
   exit 2
 }
 
@@ -47,7 +47,7 @@ AUDIT_REASON="${REASON:-}"
 export AUDIT_CLI_USER AUDIT_CASE_REF AUDIT_REASON
 # Valueless -e: compose takes the values from this environment, so the purpose
 # never shows on a command line. stdin is /dev/null for every record, so a
-# command reading stdin (a piped cypher-shell session) gets all of it.
+# command reading stdin (a piped qdrant-shell session) gets all of it.
 audit=("${compose[@]}" exec -T -e AUDIT_CLI_USER -e AUDIT_CASE_REF -e AUDIT_REASON admin-audit python /app/admin_audit.py)
 
 status=0

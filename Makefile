@@ -1,8 +1,7 @@
 # data-plane operator targets.
 #
 # By default operates on the *cpu* Qdrant profile. Override with
-# `make up PROFILE=cuda` for the GPU profile. Neo4j has no profile —
-# it always runs.
+# `make up PROFILE=cuda` for the GPU profile.
 #
 # This repo keeps a bespoke Makefile and does NOT `include make/common.mk` from
 # nos-tromo/.github. common.mk targets a build-and-run app shape (single compose
@@ -24,7 +23,7 @@ DATA_NET ?= $(or $(strip $(shell test -f .env && grep -E '^DATA_NET=' .env | cut
 # External named volumes this project owns. `make volumes` creates them
 # (compose won't — they're external) and `make nuke` removes them (compose's
 # `down -v` won't, same reason). Keep in sync with docker/compose.yaml.
-VOLUMES := neo4j-data neo4j-logs neo4j-import neo4j-plugins qdrant-snapshots qdrant-storage
+VOLUMES := qdrant-snapshots qdrant-storage
 
 COMPOSE        := docker compose --env-file .env -f docker/compose.yaml
 COMPOSE_DEV    := docker compose --env-file .env -f docker/compose.yaml -f docker/compose.override.yaml
@@ -51,7 +50,7 @@ RETENTION_NOTICE_DAYS ?= $(or $(strip $(shell test -f .env && grep -E '^RETENTIO
 # record it. CASE_REF=<ref> and/or REASON=<text> state the purpose (make hands
 # command-line variables to the recipe's environment); the operator is the
 # sudo user, else the login user, e.g.
-#   make db-shell CASE_REF=case-0001 REASON="verify a reported duplicate"
+#   make qdrant-shell CASE_REF=case-0001 REASON="verify a reported duplicate"
 AUDITED = COMPOSE='$(COMPOSE)' PROFILE='$(PROFILE)' BACKUP_DIR='$(BACKUP_DIR)' BACKUP_RECIPIENTS='$(BACKUP_RECIPIENTS)' BACKUP_RETENTION_DAYS='$(BACKUP_RETENTION_DAYS)' RETENTION_NOTICE_DAYS='$(RETENTION_NOTICE_DAYS)' ./scripts/audit-admin.sh
 # Checks the retention period before a backup or a pruning asks for anything.
 RETENTION = BACKUP_RETENTION_DAYS='$(BACKUP_RETENTION_DAYS)' RETENTION_NOTICE_DAYS='$(RETENTION_NOTICE_DAYS)' ./scripts/backup_prune.sh
@@ -63,19 +62,19 @@ ENCRYPTION = BACKUP_RECIPIENTS='$(BACKUP_RECIPIENTS)' ./scripts/backup_age.sh
 PORTS = COMPOSE='$(COMPOSE)' ./scripts/admin-ports.sh
 
 .PHONY: help network volumes pull bundle up up-dev up-admin stop down restart logs ps \
-        health nuke db-shell qdrant-shell backup backup-neo4j backup-qdrant backup-prune restore-neo4j restore-qdrant
+        health nuke qdrant-shell backup backup-qdrant backup-prune restore-qdrant
 
 help:
-	@echo "data-plane — stateful services for chorus (Neo4j) + docint (Qdrant)."
+	@echo "data-plane — the stateful service for docint (Qdrant)."
 	@echo
 	@echo "Lifecycle:"
 	@echo "  make network         create the external data-net if missing"
 	@echo "  make volumes         create the external data volumes if missing"
 	@echo "  make pull            pull all images from the registry"
 	@echo "  make bundle          save images as a versioned airgap tarball ($(PROFILE))"
-	@echo "  make up              start neo4j + qdrant ($(PROFILE) profile) + admin-audit; closes the admin ports"
+	@echo "  make up              start qdrant ($(PROFILE) profile) + admin-audit; closes the admin ports"
 	@echo "  make up-dev          like 'up', but publishes ports on the host"
-	@echo "  make up-admin        like 'up', plus 127.0.0.1:7474/7687/6333 for SSH-tunnelled dashboards;"
+	@echo "  make up-admin        like 'up', plus 127.0.0.1:6333 for the SSH-tunnelled dashboard;"
 	@echo "                       needs CASE_REF= or REASON=, recorded until make up (or down) closes them"
 	@echo "  make stop            stop containers (keep them)"
 	@echo "  make down            stop + remove containers (volumes preserved)"
@@ -85,22 +84,19 @@ help:
 	@echo "Observability:"
 	@echo "  make ps              service status"
 	@echo "  make health          show health + uptime of each service, the admin ports; admin-audit can record"
-	@echo "  make logs S=neo4j  tail logs for one service"
+	@echo "  make logs S=qdrant-cpu  tail logs for one service"
 	@echo
 	@echo "Direct access (recorded in the audit trail; always needs CASE_REF= or REASON=):"
-	@echo "  make db-shell        cypher-shell session on Neo4j"
 	@echo "  make qdrant-shell    shell with Qdrant's HTTP API (qdrant METHOD /path [JSON])"
 	@echo
 	@echo "Backup / restore (recorded; see backup/README.md for the full runbook):"
-	@echo "  make backup          backup both DBs, encrypted with age (needs CASE_REF= or REASON= by default)"
-	@echo "  make backup-neo4j    just Neo4j (offline dump, encrypted into $(BACKUP_DIR))"
-	@echo "  make backup-qdrant   just Qdrant (online snapshots, encrypted into $(BACKUP_DIR))"
-	@echo "                       both encrypt to the public keys in $(BACKUP_RECIPIENTS)"
+	@echo "  make backup          backup Qdrant, encrypted with age (needs CASE_REF= or REASON= by default)"
+	@echo "  make backup-qdrant   the same: online snapshots, encrypted into $(BACKUP_DIR)"
+	@echo "                       to the public keys in $(BACKUP_RECIPIENTS)"
 	@echo "  make backup-prune    delete backups older than BACKUP_RETENTION_DAYS ($(BACKUP_RETENTION_DAYS)); every backup does it too"
-	@echo "  make restore-neo4j DUMP=<file> IDENTITY=<key file>    REPLACE the neo4j database with a dump (asks first)"
 	@echo "  make restore-qdrant COLLECTION=<name> SNAPSHOT=<file> IDENTITY=<key file>"
 	@echo "                       REPLACE one collection with a snapshot (asks first)"
-	@echo "                       both decrypt with the age identity given for that run only"
+	@echo "                       decrypts with the age identity given for that run only"
 	@echo
 	@echo "Profile: $(PROFILE)  (override with PROFILE=cuda)"
 
@@ -124,7 +120,7 @@ pull:
 bundle:
 	./scripts/bundle_images.sh $(PROFILE)
 
-# Production shape. Recreating the stores without the admin ports ends an
+# Production shape. Recreating the store without the admin ports ends an
 # open admin-ports window, which is then recorded as closed.
 up: network volumes
 	$(COMPOSE) $(PROFILE_FLAG) up --no-build -d
@@ -153,10 +149,9 @@ down:
 
 restart: down up
 
-# Destructive — needs an interactive confirm. Mirrors the chorus
-# architecture invariant: only this project can wipe graph + vector data.
-# The volumes are external, so `down -v` won't remove them — we stop the
-# stack, then delete the volumes by name.
+# Destructive — needs an interactive confirm. Only this project can wipe
+# vector data. The volumes are external, so `down -v` won't remove them — we
+# stop the stack, then delete the volumes by name.
 nuke:
 	@echo "This will DESTROY all data-plane volumes:"
 	@for v in $(VOLUMES); do echo "  - $$v"; done
@@ -184,35 +179,23 @@ else
 endif
 
 # ---- Direct access ---------------------------------------------------------
-# Neo4j Community keeps no query log and Qdrant no access log, so these
-# records are the only trail of a session: who opened it, when, why, how long
-# it lasted. Both need a stated purpose, whatever AUDIT_REQUIRE_PURPOSE says.
-
-db-shell:
-	@$(AUDITED) shell neo4j -- ./scripts/neo4j_admin.sh shell
+# Qdrant keeps no access log, so these records are the only trail of a
+# session: who opened it, when, why, how long it lasted. It needs a stated
+# purpose, whatever AUDIT_REQUIRE_PURPOSE says.
 
 qdrant-shell:
 	@$(AUDITED) shell qdrant -- ./scripts/qdrant_admin.sh shell
 
 # ---- Backups ---------------------------------------------------------------
-# These are intentionally minimal — see backup/README.md for retention,
-# off-host copy, and verify-restore steps. Each is encrypted with age on its
-# way out of the store, to the public keys in BACKUP_RECIPIENTS, and refuses
-# before doing anything while it cannot be. Each is recorded as a disclosure
-# to file:backup once it has run; under the default AUDIT_REQUIRE_PURPOSE
+# This is intentionally minimal — see backup/README.md for retention, off-host
+# copy, and verify-restore steps. A backup is encrypted with age on its way
+# out of the store, to the public keys in BACKUP_RECIPIENTS, and refuses
+# before doing anything while it cannot be. It is recorded as a disclosure to
+# file:backup once it has run; under the default AUDIT_REQUIRE_PURPOSE
 # (query,disclose) it needs CASE_REF= or REASON= — a scheduled backup passes
 # one, e.g. REASON="scheduled backup".
 
-backup: backup-neo4j backup-qdrant
-
-# Neo4j community edition has no online backup. We stop, dump, restart (the
-# restart also runs when the dump fails). Confirm the brief downtime window
-# is acceptable before scheduling.
-backup-neo4j:
-	@$(RETENTION) check
-	@$(ENCRYPTION) recipients
-	@$(AUDITED) backup neo4j -- ./scripts/neo4j_admin.sh dump
-	@$(AUDITED) prune neo4j -- ./scripts/backup_prune.sh neo4j
+backup: backup-qdrant
 
 # Qdrant supports online snapshots via its HTTP API. Iterates every
 # collection; each snapshot leaves the qdrant-snapshots volume encrypted, for
@@ -224,29 +207,18 @@ backup-qdrant:
 	@$(AUDITED) backup qdrant -- ./scripts/qdrant_admin.sh snapshot
 	@$(AUDITED) prune qdrant -- ./scripts/backup_prune.sh qdrant
 
-# The pruning on its own, for both stores (each recorded as delete /
-# backup.prune.<store>).
+# The pruning on its own (recorded as delete / backup.prune.qdrant).
 backup-prune:
 	@$(RETENTION) check
-	@$(AUDITED) prune neo4j -- ./scripts/backup_prune.sh neo4j
 	@$(AUDITED) prune qdrant -- ./scripts/backup_prune.sh qdrant
 
 # ---- Restores --------------------------------------------------------------
-# Each takes an encrypted backup from BACKUP_DIR and IDENTITY=<file>, the age
-# identity it was encrypted to, for this run only (never stored or recorded),
-# and decrypts by streaming; both are checked before anything is asked. Each
-# REPLACES live data, so it asks for confirmation, then is recorded as a
-# modification once it has run (needs a purpose only if AUDIT_REQUIRE_PURPOSE
-# lists modify).
-
-restore-neo4j:
-	@test -n "$(DUMP)" || { echo "usage: make restore-neo4j DUMP=<encrypted dump in $(BACKUP_DIR)> IDENTITY=<age identity file> [CASE_REF=...] [REASON=...]" >&2; exit 2; }
-	@test -f "$(BACKUP_DIR)/$(DUMP)" || { echo "no dump $(DUMP) in $(BACKUP_DIR)" >&2; exit 2; }
-	@$(ENCRYPTION) identity '$(BACKUP_DIR)/$(DUMP)'
-	@echo "This REPLACES the neo4j database with $(DUMP); Neo4j stops while it loads."
-	@read -p "Type 'restore' to confirm: " confirm && [ "$$confirm" = "restore" ] \
-	  || { echo "aborted"; exit 1; }
-	@$(AUDITED) restore neo4j 'file=$(DUMP)' -- ./scripts/neo4j_admin.sh load '$(DUMP)'
+# A restore takes an encrypted snapshot from BACKUP_DIR and IDENTITY=<file>,
+# the age identity it was encrypted to, for this run only (never stored or
+# recorded), and decrypts by streaming; both are checked before anything is
+# asked. It REPLACES live data, so it asks for confirmation, then is recorded
+# as a modification once it has run (needs a purpose only if
+# AUDIT_REQUIRE_PURPOSE lists modify).
 
 restore-qdrant:
 	@test -n "$(COLLECTION)" && test -n "$(SNAPSHOT)" || { echo "usage: make restore-qdrant COLLECTION=<name> SNAPSHOT=<encrypted snapshot in $(BACKUP_DIR)> IDENTITY=<age identity file> [CASE_REF=...] [REASON=...]" >&2; exit 2; }

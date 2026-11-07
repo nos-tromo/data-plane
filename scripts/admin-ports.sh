@@ -14,12 +14,12 @@
 #         fails and no port is published, the window is closed at once.
 # close   writes admin / db.ports.close, linked to that open event, with how
 #         long the ports were open, then removes the state file: make up runs
-#         it once the stores are back in their production shape, make down
-#         before it removes them (`up` or `down` is recorded as what closed
-#         the window). Nothing to do without a state file. When the close
-#         cannot be recorded the state file stays, and the next make up
-#         records it.
-# status  (make health) says whether the stores publish ports, and since when.
+#         it once the store is back in its production shape, make down
+#         before it removes the containers (`up` or `down` is recorded as
+#         what closed the window). Nothing to do without a state file. When
+#         the close cannot be recorded the state file stays, and the next
+#         make up records it.
+# status  (make health) says whether the store publishes ports, and since when.
 #
 # The operator is the sudo user, else the login user.
 set -euo pipefail

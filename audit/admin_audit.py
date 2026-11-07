@@ -1,10 +1,9 @@
 """data-plane's data-protection audit events: direct database access, backups, restores.
 
-The apps record what their users do with the data in Neo4j and Qdrant; access
-that bypasses them leaves no trace there. Neo4j Community keeps no query log and
-Qdrant no access log, so the operator targets that open the stores directly
-(``make db-shell``, ``make qdrant-shell``), copy their data out (``make backup``)
-or write it back (``make restore-neo4j``, ``make restore-qdrant``) run through
+docint records what its users do with the data in Qdrant; access that
+bypasses it leaves no trace there. Qdrant keeps no access log, so the operator
+targets that open the store directly (``make qdrant-shell``), copy its data out
+(``make backup``) or write it back (``make restore-qdrant``) run through
 ``scripts/audit-admin.sh``, which records them with this module; the admin
 overlay's loopback ports (``make up-admin``, closed by ``make up`` or ``make
 down``) through ``scripts/admin-ports.sh``. Operator guide: the README's "Audit
@@ -14,7 +13,7 @@ Every record is a chain of its own, written by a short ``docker compose exec``
 run in the ``admin-audit`` container (``AUDIT_OUTPUT=container``). It therefore
 lands in that container's log, the source obs-plane binds data-plane's chains to.
 
-Backups are encrypted with age on their way out of the stores
+Backups are encrypted with age on their way out of the store
 (``scripts/backup_age.sh``): a backup's record says so, to how many public keys,
 and which set of them by its fingerprint, never the keys.
 
@@ -60,7 +59,7 @@ from audit_runtime import PurposeError, id_chunks, open_audit_stream, parse_requ
 #: The compose project: every chain this module writes names it as its service.
 SERVICE: Final = "data-plane"
 DEFAULT_VERSION_FILE: Final = "/etc/data-plane/VERSION"
-STORES: Final = ("neo4j", "qdrant")
+STORES: Final = ("qdrant",)
 #: Each kind of operation and the action its record has.
 KIND_ACTIONS: Final = {"shell": "admin", "backup": "disclose", "restore": "modify", "ports": "admin", "prune": "delete"}
 #: The kinds recorded when they open and again when they close, linked: the
@@ -70,7 +69,7 @@ OPENED_KINDS: Final = {
     "ports": ("db.ports.open", "db.ports.close"),
 }
 #: The loopback bindings docker/compose.admin.yaml publishes (make up-admin).
-ADMIN_PORTS: Final = ("127.0.0.1:7474", "127.0.0.1:7687", "127.0.0.1:6333")
+ADMIN_PORTS: Final = ("127.0.0.1:6333",)
 #: What ended an admin-ports window: make up, make down, or the failed opening.
 PORT_CLOSERS: Final = ("up", "down", "up-admin")
 #: Where a backup goes, as its record names the recipient.
@@ -163,10 +162,10 @@ def encryption(text: str) -> str:
 
 
 def file_name(text: str) -> str:
-    """Accept the base name of a dump or snapshot file.
+    """Accept the base name of a backup file.
 
     Args:
-        text: E.g. ``neo4j-20260131T020000Z.dump``.
+        text: E.g. ``qdrant-docs-20260131T020000Z.snapshot.age``.
 
     Returns:
         The name.
@@ -218,7 +217,7 @@ def port_closer(text: str) -> str:
     """Accept what ended an admin-ports window.
 
     Args:
-        text: ``up`` (make up recreated the stores without the ports),
+        text: ``up`` (make up recreated the store without the ports),
             ``down`` (make down removed them) or ``up-admin`` (the opening
             failed and published nothing).
 
@@ -239,7 +238,6 @@ OperationKey = tuple[str, str | None]
 #: The parameters of an operation: given to ``begin`` and again to ``end``,
 #: and recorded as criteria on each of its events.
 PARAMETERS: Final[Mapping[OperationKey, Mapping[str, Parser]]] = {
-    ("restore", "neo4j"): {"file": file_name},
     ("restore", "qdrant"): {"collection": store_name, "snapshot": file_name},
 }
 #: What a backup reports about its encryption: age, to how many public keys
@@ -252,7 +250,6 @@ ENCRYPTION_FACTS: Final[Mapping[str, Parser]] = {
 }
 #: The facts an operation reports for its record (``end`` only).
 FACTS: Final[Mapping[OperationKey, Mapping[str, Parser]]] = {
-    ("backup", "neo4j"): {"file": file_name, "size_bytes": whole_number, **ENCRYPTION_FACTS},
     ("backup", "qdrant"): {
         "collection": store_name,
         "snapshots": whole_number,
@@ -260,7 +257,6 @@ FACTS: Final[Mapping[OperationKey, Mapping[str, Parser]]] = {
         "failed": whole_number,
         **ENCRYPTION_FACTS,
     },
-    ("restore", "neo4j"): {"size_bytes": whole_number, "encryption": encryption},
     ("restore", "qdrant"): {"encryption": encryption},
     ("ports", None): {"by": port_closer},
     **{
@@ -280,18 +276,14 @@ FACTS: Final[Mapping[OperationKey, Mapping[str, Parser]]] = {
 #: collections a Qdrant backup covers, the files a pruning deleted.
 TARGET_FACTS: Final[Mapping[OperationKey, str]] = {
     ("backup", "qdrant"): "collection",
-    ("prune", "neo4j"): "file",
     ("prune", "qdrant"): "file",
 }
 #: The facts an operation that succeeded must report: a backup how it was
 #: encrypted and to which keys, a restore that it read an encrypted file. No
 #: ``ok`` record can therefore show an unencrypted backup.
 REQUIRED_FACTS: Final[Mapping[OperationKey, tuple[str, ...]]] = {
-    ("backup", "neo4j"): tuple(ENCRYPTION_FACTS),
     ("backup", "qdrant"): tuple(ENCRYPTION_FACTS),
-    ("restore", "neo4j"): ("encryption",),
     ("restore", "qdrant"): ("encryption",),
-    ("prune", "neo4j"): ("period_days", "cutoff", "deleted"),
     ("prune", "qdrant"): ("period_days", "cutoff", "deleted"),
 }
 
@@ -305,7 +297,7 @@ def parse_pairs(
     """Parse ``KEY=VALUE`` arguments against the fields an operation records.
 
     Args:
-        pairs: E.g. ``["file=neo4j-20260131T020000Z.dump", "size_bytes=1024"]``.
+        pairs: E.g. ``["collection=docs", "size_bytes=1024"]``.
         fields: The keys accepted and how each value is checked.
         repeatable: A key that may be given more than once.
 
@@ -395,7 +387,7 @@ def purpose_required(kind: str, required: frozenset[str]) -> bool:
         required: The actions ``AUDIT_REQUIRE_PURPOSE`` lists.
 
     Returns:
-        Always ``True`` for a shell and the admin ports: both open the stores
+        Always ``True`` for a shell and the admin ports: both open the store
         to anything. Otherwise whether the action of the kind's record is listed.
     """
     return kind in OPENED_KINDS or KIND_ACTIONS[kind] in required
@@ -406,7 +398,7 @@ def operation_of(kind: str, store: str | None) -> str:
 
     Args:
         kind: ``shell``, ``backup``, ``restore``, ``ports`` or ``prune``.
-        store: ``neo4j`` or ``qdrant``; ``None`` for the admin ports.
+        store: ``qdrant``; ``None`` for the admin ports.
 
     Returns:
         The opening's operation for a shell or the admin ports
@@ -432,7 +424,7 @@ def target_of(
 
     Args:
         kind: ``shell``, ``backup``, ``restore``, ``ports`` or ``prune``.
-        store: ``neo4j`` or ``qdrant``; ``None`` for the admin ports.
+        store: ``qdrant``; ``None`` for the admin ports.
         parameters: The operation's parameters.
         ids: The objects it reported: the collections a Qdrant backup covers,
             at most one event's worth.
@@ -440,9 +432,8 @@ def target_of(
             chunk of a longer list.
 
     Returns:
-        The store for a shell, both stores for the admin ports; Neo4j's
-        database ``neo4j`` for a dump or load; the collections snapshotted,
-        or the one recovered, for Qdrant.
+        The store for a shell, every store for the admin ports; the
+        collections snapshotted, or the one recovered.
     """
     if kind == "ports":
         return Target(kind="store", ids=list(STORES), count=len(STORES))
@@ -450,8 +441,6 @@ def target_of(
         return Target(kind="file", ids=list(ids), count=len(ids) if total is None else total)
     if kind == "shell":
         return Target(kind="store", ids=[str(store)], count=1)
-    if store == "neo4j":
-        return Target(kind="database", ids=["neo4j"], count=1)
     if kind == "backup":
         return Target(kind="collection", ids=list(ids), count=len(ids) if total is None else total)
     return Target(kind="collection", ids=[str(parameters["collection"])], count=1)
@@ -462,8 +451,8 @@ def check_operation(kind: str, store: str | None, parameters: Mapping[str, objec
 
     Args:
         kind: ``shell``, ``backup``, ``restore``, ``ports`` or ``prune``.
-        store: ``neo4j`` or ``qdrant``; ``None`` for the admin ports, which
-            open both.
+        store: ``qdrant``; ``None`` for the admin ports, which open every
+            store.
         parameters: The parsed parameters.
 
     Raises:
@@ -489,7 +478,7 @@ class Invocation:
                 ``AUDIT_CASE_REF``/``AUDIT_REASON`` (the purpose),
                 ``AUDIT_REQUIRE_PURPOSE``, ``AUDIT_OUTPUT``.
             kind: ``shell``, ``backup``, ``restore``, ``ports`` or ``prune``.
-            store: ``neo4j`` or ``qdrant``; ``None`` for the admin ports.
+            store: ``qdrant``; ``None`` for the admin ports.
             parameters: The operation's parameters, already parsed.
 
         Raises:
@@ -565,7 +554,7 @@ def begin(environ: Mapping[str, str], kind: str, store: str | None, pairs: Seque
     Args:
         environ: The process environment.
         kind: ``shell``, ``backup``, ``restore``, ``ports`` or ``prune``.
-        store: ``neo4j`` or ``qdrant``; ``None`` for the admin ports.
+        store: ``qdrant``; ``None`` for the admin ports.
         pairs: The operation's ``KEY=VALUE`` parameters.
         out: Where the opening's event id goes.
 
@@ -629,7 +618,7 @@ def end(
     Args:
         environ: The process environment.
         kind: ``shell``, ``backup``, ``restore``, ``ports`` or ``prune``.
-        store: ``neo4j`` or ``qdrant``; ``None`` for the admin ports.
+        store: ``qdrant``; ``None`` for the admin ports.
         pairs: The operation's parameters (as given to :func:`begin`) and the
             facts it reported, as ``KEY=VALUE``.
         status: The operation's exit status; 0 is ``ok``, anything else ``error``

@@ -1,29 +1,28 @@
-### data-plane compose — stateful services for chorus (Neo4j) and docint (Qdrant).
+### data-plane compose — the stateful service for docint (Qdrant).
 ###
 ### What this project owns:
-###   - The named volumes that hold all graph + vector data
-###   - The neo4j and qdrant services that read/write that data
+###   - The named volumes that hold all vector data
+###   - The qdrant service that reads/writes that data
 ###   - admin-audit, which records direct database access, backups and
 ###     restores in the data-protection audit trail (README: Audit trail)
 ###
 ### What it does NOT own:
 ###   - data-net  (external; created via 'make network', shared with app backends)
-###   - Application code or app-side state (chorus/ and docint/ keep their own
-###     SQLite, caches, logs, etc.)
+###   - Application code or app-side state (docint/ keeps its own SQLite,
+###     caches, logs, etc.)
 ###
 ### Blast-radius design:
-###   `docker compose down -v` *here* will destroy graph + vector data — that
-###   risk is concentrated in this one project. The chorus and docint compose
-###   files declare zero application-state volumes, so `down -v` over there is
-###   always safe. Backup + restore runbooks live in backup/.
+###   `docker compose down -v` *here* will destroy vector data — that risk is
+###   concentrated in this one project. The docint compose file declares none
+###   of these volumes, so `down -v` over there is always safe. Backup +
+###   restore runbooks live in backup/.
 
 name: data-plane
 
 ##########################################################
 # Shared logging — the local driver rotates and compresses
-# the container's stdout/stderr stream (not Neo4j's internal
-# /logs file directory, which still goes to the neo4j-logs
-# volume below). Tail with `docker compose logs -f <svc>`.
+# the containers' stdout/stderr streams. Tail with
+# `docker compose logs -f <svc>`.
 ##########################################################
 x-logging: &default-logging
   driver: "local"
@@ -34,10 +33,9 @@ x-logging: &default-logging
 
 ##########################################################
 # Shared hardening (deploy ADR 0001) — no privilege
-# escalation, all capabilities dropped (Neo4j re-adds the
-# ones its entrypoint needs, below). Deliberately deferred
-# here: `user:` and `read_only:` — both databases manage
-# their own on-disk state on external volumes whose
+# escalation, all capabilities dropped. Deliberately
+# deferred for Qdrant: `user:` and `read_only:` — it
+# manages its own on-disk state on external volumes whose
 # existing ownership is image-managed, and this repo's CI
 # is lint-only, so a UID change would land untested. The
 # root-daemon exposure is instead compensated host-side
@@ -56,82 +54,17 @@ networks:
 
 services:
   ##########################################################
-  # Neo4j  —  graph + native vector index for chorus
-  ##########################################################
-  neo4j:
-    <<: *hardened
-    image: docker.io/library/neo4j:5.26.26-community@sha256:0b5d3ab6ec1b866890dbfb53bf4fe1cf039f9e03c96165599a403005b7e7bcc3
-    logging: *default-logging
-    # The image's entrypoint chowns/chmods its dirs and drops to the
-    # internal neo4j user — exactly this set, verified empirically:
-    # the trio alone fails at chmod (FOWNER), and without DAC_OVERRIDE
-    # root can no longer traverse the dirs it just restricted. KILL lets
-    # tini (PID 1, root) forward `docker stop`'s SIGTERM to the server,
-    # which runs as the neo4j user: without it tini dies with EPERM, the
-    # server is killed mid-flight, and the offline dump of make
-    # backup-neo4j refuses the unclean store ("Active logical log").
-    cap_add:
-      - CHOWN
-      - SETUID
-      - SETGID
-      - FOWNER
-      - DAC_OVERRIDE
-      - KILL
-    # The server then needs about 10 s to stop even on a small store: the
-    # databases checkpoint within a second, the Bolt server takes the rest.
-    # Docker's default 10 s grace SIGKILLed it just before the end (exit
-    # 137); the checkpoint grows with the store, so it gets room.
-    stop_grace_period: 2m
-    environment:
-      NEO4J_AUTH: ${NEO4J_USER:-neo4j}/${NEO4J_PASSWORD:?NEO4J_PASSWORD must be set in .env}
-      # Airgap: no phone-home.
-      NEO4J_dbms_usage__report_enabled: "false"
-      # Memory tuning — adjust to host capacity.
-      NEO4J_server_memory_heap_initial__size: ${NEO4J_HEAP_INITIAL:-512m}
-      NEO4J_server_memory_heap_max__size: ${NEO4J_HEAP_MAX:-2G}
-      NEO4J_server_memory_pagecache_size: ${NEO4J_PAGECACHE:-1G}
-      # Listen on all interfaces inside the container so other compose projects
-      # on data-net can reach bolt + http.
-      NEO4J_server_default__listen__address: 0.0.0.0
-      # NEO4J_PLUGINS would auto-download from the internet on first boot —
-      # leave empty in airgap. Mirror plugins into the plugins volume out-of-band.
-      NEO4J_PLUGINS: ${NEO4J_PLUGINS:-}
-    expose:
-      - "7687"   # bolt
-      - "7474"   # http
-    volumes:
-      - neo4j-data:/data
-      - neo4j-logs:/logs
-      - neo4j-import:/var/lib/neo4j/import
-      - neo4j-plugins:/plugins
-    networks:
-      data-net:
-        aliases:
-          - neo4j
-    healthcheck:
-      # $$ escapes compose variable substitution so the container shell does
-      # the parameter expansion on NEO4J_AUTH ("user/password").
-      test:
-        - CMD-SHELL
-        - cypher-shell -u "$${NEO4J_AUTH%%/*}" -p "$${NEO4J_AUTH#*/}" 'RETURN 1' >/dev/null
-      interval: 30s
-      timeout: 10s
-      retries: 5
-      start_period: 60s
-    restart: unless-stopped
-
-  ##########################################################
   # Qdrant  —  vector store for docint  (CPU profile)
   ##########################################################
   qdrant-cpu:
     <<: *hardened
     image: docker.io/qdrant/qdrant:v1.18.3@sha256:0bd98fa7977f1e75694779359ca4e212822e5a71334e28421182f72f209d5286
     logging: *default-logging
-    # The API key is required, like NEO4J_PASSWORD: an empty value is not "no
-    # auth" — Qdrant then answers every request that carries no key with 401,
-    # docint's included. /readyz is exempt, so the healthcheck never needs it;
-    # the scripts that talk to Qdrant read it from the container's own
-    # environment (QDRANT__SERVICE__API_KEY).
+    # The API key is required: an empty value is not "no auth" — Qdrant then
+    # answers every request that carries no key with 401, docint's included.
+    # /readyz is exempt, so the healthcheck never needs it; the scripts that
+    # talk to Qdrant read it from the container's own environment
+    # (QDRANT__SERVICE__API_KEY).
     environment: &qdrant-env
       QDRANT__SERVICE__API_KEY: ${QDRANT_API_KEY:?QDRANT_API_KEY must be set in .env (generate one with openssl rand -hex 32; docint's QDRANT_API_KEY takes the same value)}
       QDRANT__TELEMETRY_DISABLED: "true"
@@ -197,9 +130,8 @@ services:
   ##########################################################
   # admin-audit  —  the record of access that bypasses the apps
   ##########################################################
-  # Neo4j Community keeps no query log and Qdrant no access log, so the
-  # operator targets that open the stores directly (make db-shell,
-  # qdrant-shell), back them up or restore them run through
+  # Qdrant keeps no access log, so the operator targets that open the store
+  # directly (make qdrant-shell), back it up or restore it run through
   # scripts/audit-admin.sh, which records each one here with
   # `docker compose exec`: a chain of its own per record, written into this
   # container's log (README: Audit trail). The long-running process only
@@ -241,14 +173,6 @@ services:
 # Volumes — all persistent data-plane state lives here.
 ##########################################################
 volumes:
-  neo4j-data:
-    external: true
-  neo4j-logs:
-    external: true
-  neo4j-import:
-    external: true
-  neo4j-plugins:
-    external: true
   qdrant-snapshots:
     external: true
   qdrant-storage:
