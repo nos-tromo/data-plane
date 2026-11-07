@@ -687,6 +687,18 @@ class PruneRecordTest(Workspace):
             status, events = self.end(self.environ(), "prune", "neo4j", *PRUNE_FACTS, bad)
             self.assertEqual((status, events), (2, []), bad)
 
+    def test_the_grace_and_the_period_in_force_are_recorded(self) -> None:
+        """While a grace runs, the record states until when, and which period still deletes meanwhile."""
+        grace = ("grace_until=2026-03-31T00:00:00Z", "in_force_days=30")
+        status, events = self.end(self.environ(), "prune", "neo4j", *PRUNE_FACTS, *grace)
+        self.assertEqual(status, 0)
+        (event,) = records(events)
+        criteria = event["criteria"]
+        self.assertEqual((criteria["grace_until"], criteria["in_force_days"]), ("2026-03-31T00:00:00Z", 30))
+        for bad in ("grace_until=2026-03-31", "in_force_days=0", "in_force_days=x"):
+            status, events = self.end(self.environ(), "prune", "neo4j", *PRUNE_FACTS, bad)
+            self.assertEqual((status, events), (2, []), bad)
+
     def test_prune_follows_require_purpose(self) -> None:
         """Without delete in AUDIT_REQUIRE_PURPOSE a pruning needs no purpose; with it, it does."""
         status, _, _ = self.begin(self.environ(AUDIT_REQUIRE_PURPOSE="query,disclose"), "prune", "neo4j")
@@ -1772,7 +1784,12 @@ class BackupPruneTest(unittest.TestCase):
         (self.dir / ".prune-since").write_text(f"{int(PRUNE_NOW - days_ago * DAY_S)} {days}\n", encoding="utf-8")
 
     def prune(
-        self, store: str, days: str = "30", now: int = PRUNE_NOW, notice: str | None = None
+        self,
+        store: str,
+        days: str = "30",
+        now: int = PRUNE_NOW,
+        notice: str | None = None,
+        path_prefix: Path | None = None,
     ) -> tuple[int, dict[str, list[str]]]:
         """Run the pruning of one store.
 
@@ -1781,6 +1798,7 @@ class BackupPruneTest(unittest.TestCase):
             days: ``BACKUP_RETENTION_DAYS``.
             now: The clock.
             notice: ``RETENTION_NOTICE_DAYS``; unset by default.
+            path_prefix: A directory put first on ``PATH`` (to stub a command).
 
         Returns:
             The exit status and the reported facts, each key with its values in order.
@@ -1789,7 +1807,7 @@ class BackupPruneTest(unittest.TestCase):
         result = subprocess.run(
             ["bash", str(SCRIPTS / "backup_prune.sh"), store, "--now", str(now)],
             env={
-                "PATH": os.environ["PATH"],
+                "PATH": os.environ["PATH"] if path_prefix is None else f"{path_prefix}:{os.environ['PATH']}",
                 "BACKUP_RETENTION_DAYS": days,
                 "BACKUP_DIR": str(self.dir),
                 "AUDIT_FACTS": str(self.facts),
@@ -1870,13 +1888,18 @@ class BackupPruneTest(unittest.TestCase):
         self.backups(f"neo4j-{stamp(100)}.dump.age")
         status, facts = self.prune("neo4j")
         self.assertEqual((status, self.left(), facts["deleted"]), (0, [f"neo4j-{stamp(100)}.dump.age"], ["0"]))
-        self.assertEqual((self.dir / ".prune-since").read_text(encoding="utf-8").strip(), f"{PRUNE_NOW} 30")
+        self.assertEqual(
+            (self.dir / ".prune-since").read_text(encoding="utf-8").strip(), f"{PRUNE_NOW} 30 {PRUNE_NOW + 30 * DAY_S}"
+        )
         self.assertEqual((self.dir / ".prune-since").stat().st_mode & 0o777, 0o644)
         self.assertIn("2026-03-31", self.stderr)
+        self.assertEqual(facts["grace_until"], ["2026-03-31T00:00:00Z"])
         status, _ = self.prune("neo4j", now=PRUNE_NOW + 29 * DAY_S)
         self.assertEqual(len(self.left()), 1)
+        self.facts.unlink()
         status, facts = self.prune("neo4j", now=PRUNE_NOW + 30 * DAY_S)
         self.assertEqual((status, self.left(), facts["deleted"][-1]), (0, [], "1"))
+        self.assertNotIn("grace_until", facts)
 
     def test_the_grace_lasts_the_notice_period_not_the_retention_period(self) -> None:
         """A one-day retention still waits the notice period (RETENTION_NOTICE_DAYS, default 30) at first."""
@@ -1892,16 +1915,171 @@ class BackupPruneTest(unittest.TestCase):
         status, _ = self.prune("neo4j", days="1", notice="7", now=PRUNE_NOW + 7 * DAY_S)
         self.assertEqual((status, self.left()), (0, []))
 
-    def test_a_changed_period_restarts_the_grace(self) -> None:
-        """Lowering the period takes effect anew: nothing more is deleted before its notice has passed."""
+    def state(self) -> str:
+        """The pruning's state file, stripped.
+
+        Returns:
+            Its content.
+        """
+        return (self.dir / ".prune-since").read_text(encoding="utf-8").strip()
+
+    def test_shortening_spares_only_what_falls_due_sooner(self) -> None:
+        """A shorter period: what the period in force makes due still goes on time; nothing goes sooner."""
         self.since(400, days=30)
-        name = f"neo4j-{stamp(10)}.dump.age"
-        self.backups(name)
+        due, newly = f"neo4j-{stamp(40)}.dump.age", f"neo4j-{stamp(5)}.dump.age"
+        self.backups(due, newly)
         status, facts = self.prune("neo4j", days="7")
-        self.assertEqual((status, self.left(), facts["deleted"]), (0, [name], ["0"]))
-        self.assertEqual((self.dir / ".prune-since").read_text(encoding="utf-8").strip(), f"{PRUNE_NOW} 7")
-        status, _ = self.prune("neo4j", days="7", now=PRUNE_NOW + 30 * DAY_S)
+        self.assertEqual((status, self.left(), facts["file"]), (0, [newly], [due]))
+        self.assertEqual(self.state(), f"{PRUNE_NOW} 7 {PRUNE_NOW + 30 * DAY_S} 30 {PRUNE_NOW - 370 * DAY_S}")
+        self.assertEqual(facts["in_force_days"], ["30"])
+        # 7 days alone would delete it on day 3; the 30 in force keep it until it is older than 30.
+        self.prune("neo4j", days="7", now=PRUNE_NOW + 25 * DAY_S)
+        self.assertEqual(self.left(), [newly])
+        self.prune("neo4j", days="7", now=PRUNE_NOW + 26 * DAY_S)
+        self.assertEqual(self.left(), [])
+
+    def test_lengthening_takes_effect_at_once(self) -> None:
+        """A longer period never pauses deletion: what is older than it goes now."""
+        self.since(400, days=7)
+        old, young = f"neo4j-{stamp(40)}.dump.age", f"neo4j-{stamp(10)}.dump.age"
+        self.backups(old, young)
+        status, facts = self.prune("neo4j", days="30")
+        self.assertEqual((status, self.left(), facts["file"]), (0, [young], [old]))
+
+    def test_changing_back_and_forth_postpones_nothing(self) -> None:
+        """30 → 29 → 30 within the notice period: what 30 days made due still goes on time."""
+        self.since(400, days=30)
+        self.prune("neo4j", days="29")
+        name = f"neo4j-{stamp(31)}.dump.age"
+        self.backups(name)
+        status, _ = self.prune("neo4j", days="30", now=PRUNE_NOW + DAY_S)
         self.assertEqual((status, self.left()), (0, []))
+
+    def test_a_change_during_the_first_grace_keeps_its_announced_end(self) -> None:
+        """Changing the period before the first grace ended never moves that end later."""
+        name = f"neo4j-{stamp(100)}.dump.age"
+        self.backups(name)
+        self.prune("neo4j")
+        self.prune("neo4j", days="7", now=PRUNE_NOW + 20 * DAY_S)
+        self.assertEqual(
+            self.state(), f"{PRUNE_NOW + 20 * DAY_S} 7 {PRUNE_NOW + 50 * DAY_S} 30 {PRUNE_NOW + 30 * DAY_S}"
+        )
+        self.prune("neo4j", days="7", now=PRUNE_NOW + 29 * DAY_S)
+        self.assertEqual(self.left(), [name])
+        self.prune("neo4j", days="7", now=PRUNE_NOW + 30 * DAY_S)
+        self.assertEqual(self.left(), [])
+
+    def test_raising_then_lowering_gives_the_notice(self) -> None:
+        """7 → 30 → 7: the 30 days were in force, so a backup they keep gets the full notice."""
+        self.since(400, days=7)
+        self.prune("neo4j", days="30")
+        name = f"neo4j-{stamp(-1)}.dump.age"
+        self.backups(name)
+        self.prune("neo4j", days="7", now=PRUNE_NOW + 10 * DAY_S)
+        self.assertEqual(self.left(), [name])
+        self.prune("neo4j", days="7", now=PRUNE_NOW + 31 * DAY_S)
+        self.assertEqual(self.left(), [name])
+        self.prune("neo4j", days="7", now=PRUNE_NOW + 41 * DAY_S)
+        self.assertEqual(self.left(), [])
+
+    def test_a_lower_notice_never_ends_a_running_grace_sooner(self) -> None:
+        """Changing the period and lowering the notice together keeps the grace already announced."""
+        name = f"neo4j-{stamp(100)}.dump.age"
+        self.backups(name)
+        self.prune("neo4j")
+        self.prune("neo4j", days="7", notice="7", now=PRUNE_NOW + DAY_S)
+        self.prune("neo4j", days="7", notice="7", now=PRUNE_NOW + 8 * DAY_S)
+        self.assertEqual(self.left(), [name])
+        self.prune("neo4j", days="7", notice="7", now=PRUNE_NOW + 30 * DAY_S)
+        self.assertEqual(self.left(), [])
+
+    def test_an_old_state_is_upgraded_so_the_notice_moves_nothing(self) -> None:
+        """A state of the release before is rewritten with its grace end on the first run."""
+        (self.dir / ".prune-since").write_text(f"{PRUNE_NOW - 5 * DAY_S} 30\n", encoding="utf-8")
+        name = f"neo4j-{stamp(100)}.dump.age"
+        self.backups(name)
+        self.prune("neo4j")
+        self.assertEqual(self.state(), f"{PRUNE_NOW - 5 * DAY_S} 30 {PRUNE_NOW + 25 * DAY_S}")
+        self.prune("neo4j", notice="1", now=PRUNE_NOW + 2 * DAY_S)
+        self.assertEqual(self.left(), [name])
+
+    def test_the_period_in_force_is_recorded_during_a_full_grace(self) -> None:
+        """A change during the first grace records the period in force, even while nothing can go."""
+        self.prune("neo4j")
+        self.facts.unlink()
+        status, facts = self.prune("neo4j", days="7", now=PRUNE_NOW + DAY_S)
+        self.assertEqual((status, facts["in_force_days"], facts["deleted"]), (0, ["30"], ["0"]))
+
+    def test_a_state_with_impossible_values_is_refused(self) -> None:
+        """Zero days, values beyond any clock, or a grace before its start delete nothing and record nothing."""
+        name = f"neo4j-{stamp(100)}.dump.age"
+        self.backups(name)
+        for line in (
+            f"{PRUNE_NOW - 400 * DAY_S} 0",
+            f"{PRUNE_NOW - 400 * DAY_S} 30 {PRUNE_NOW} 0 {PRUNE_NOW - 400 * DAY_S}",
+            f"{PRUNE_NOW - 400 * DAY_S} 30 18446744073709551617",
+            f"{PRUNE_NOW - 40 * DAY_S} 30 {PRUNE_NOW - 400 * DAY_S}",
+            f"{PRUNE_NOW - 40 * DAY_S} 30 {PRUNE_NOW} 7",
+        ):
+            (self.dir / ".prune-since").write_text(line + "\n", encoding="utf-8")
+            status, facts = self.prune("neo4j")
+            self.assertEqual((status, facts, self.left()), (2, {}, [name]), line)
+
+    def test_a_notice_change_alone_moves_nothing(self) -> None:
+        """Lowering RETENTION_NOTICE_DAYS during the grace never ends the grace sooner than announced."""
+        name = f"neo4j-{stamp(100)}.dump.age"
+        self.backups(name)
+        self.prune("neo4j")
+        self.prune("neo4j", notice="7", now=PRUNE_NOW + 10 * DAY_S)
+        self.assertEqual(self.left(), [name])
+        self.assertEqual(self.state(), f"{PRUNE_NOW} 30 {PRUNE_NOW + 30 * DAY_S}")
+
+    def test_a_state_dated_in_the_future_restarts_the_grace(self) -> None:
+        """A state file ahead of the clock never blocks pruning for long: warned, the grace starts now."""
+        self.since(-100)
+        name = f"neo4j-{stamp(100)}.dump.age"
+        self.backups(name)
+        status, _ = self.prune("neo4j")
+        self.assertEqual((status, self.left()), (0, [name]))
+        self.assertIn("future", self.stderr)
+        self.assertEqual(self.state(), f"{PRUNE_NOW} 30 {PRUNE_NOW + 30 * DAY_S}")
+        self.prune("neo4j", now=PRUNE_NOW + 30 * DAY_S)
+        self.assertEqual(self.left(), [])
+
+    def test_a_clock_stepped_back_keeps_what_is_due(self) -> None:
+        """A clock set back a few seconds after a change caps the state at now; it never restarts the grace."""
+        name = f"neo4j-{stamp(100)}.dump.age"
+        self.backups(name)
+        (self.dir / ".prune-since").write_text(f"{PRUNE_NOW} 30 {PRUNE_NOW}\n", encoding="utf-8")
+        self.prune("neo4j", now=PRUNE_NOW - 5)
+        self.assertIn("future", self.stderr)
+        self.assertEqual(self.state(), f"{PRUNE_NOW - 5} 30 {PRUNE_NOW}")
+        self.prune("neo4j", now=PRUNE_NOW)
+        self.assertEqual(self.left(), [])
+
+    def test_a_capped_state_keeps_the_period_in_force(self) -> None:
+        """Capping a state dated in the future keeps the period still deleting meanwhile."""
+        line = f"{PRUNE_NOW} 7 {PRUNE_NOW + 30 * DAY_S} 30 {PRUNE_NOW - 370 * DAY_S}"
+        (self.dir / ".prune-since").write_text(line + "\n", encoding="utf-8")
+        self.prune("neo4j", days="7", now=PRUNE_NOW - 5)
+        self.assertEqual(self.state(), f"{PRUNE_NOW - 5} 7 {PRUNE_NOW + 30 * DAY_S - 5} 30 {PRUNE_NOW - 370 * DAY_S}")
+
+    def test_a_backup_another_pruning_removed_is_not_counted(self) -> None:
+        """Two prunings at once: the file the other one deleted is neither named nor counted here."""
+        self.since(400)
+        name = f"neo4j-{stamp(90)}.dump.age"
+        self.backups(name)
+        stub = self.tmp / "bin"
+        stub.mkdir()
+        real_rm = shutil.which("rm")
+        assert real_rm is not None
+        (stub / "rm").write_text(f'#!/bin/sh\n{real_rm} -f "$(eval echo \\${{$#}})"\nexec {real_rm} "$@"\n')
+        (stub / "rm").chmod(0o755)
+        status, facts = self.prune("neo4j", path_prefix=stub)
+        self.assertEqual((status, self.left()), (0, []))
+        self.assertEqual(facts["deleted"], ["0"])
+        self.assertNotIn("file", facts)
+        self.assertIn("already gone", self.stderr)
 
     def test_bad_notice_refuses(self) -> None:
         """RETENTION_NOTICE_DAYS takes whole days from 1 to 365 only."""

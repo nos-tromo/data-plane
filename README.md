@@ -71,6 +71,12 @@ records when pruning took effect; nothing is deleted for `RETENTION_NOTICE_DAYS`
 ([`backup/README.md`](backup/README.md), Retention). Prune the off-host copies
 at the same age.
 
+**Upgrading to 0.8.0:** a change of `BACKUP_RETENTION_DAYS` no longer pauses
+every deletion: a longer period applies at once, a shorter one gives the notice
+period only to the backups it makes due sooner, and changing
+`RETENTION_NOTICE_DAYS` alone moves nothing. The state file of 0.7.0 is read and
+rewritten with its grace end on the first run; 0.7.0 also reads the new one.
+
 ## Admin access (production)
 
 Production shape publishes no ports, and the edge-plane gateway deliberately
@@ -231,7 +237,7 @@ stated. The `criteria`:
 | `db.ports.close` | `ports`, `by` (`up`, `down`, or `up-admin` when the opening failed and published nothing), `exit_status`, `duration_s` (how long they were open) |
 | `backup.neo4j` | `file` (the encrypted dump's name), `size_bytes`, `encryption` (`age`), `recipients` (how many public keys can read it), `recipients_sha256` (the fingerprint of that set of keys, [`backup/README.md`](backup/README.md)), `exit_status`, `duration_s` |
 | `backup.qdrant` | `snapshots`, `size_bytes` (the encrypted files' total), `failed` (collections not backed up), `encryption`, `recipients`, `recipients_sha256`, `exit_status`, `duration_s` |
-| `backup.prune.<store>` | `period_days`, `cutoff` (backups written before it were due), `deleted`, `not_deleted` (files the account could not delete), `exit_status`, `duration_s` |
+| `backup.prune.<store>` | `period_days`, `cutoff` (backups written before it were due), `deleted`, `not_deleted` (files the account could not delete), `exit_status`, `duration_s`; while a grace runs `grace_until` and, after a change of the period, `in_force_days` (the period still deleting meanwhile) |
 | `restore.neo4j` | `file`, `size_bytes`, `encryption`, `exit_status`, `duration_s` |
 | `restore.qdrant` | `collection`, `snapshot`, `encryption`, `exit_status`, `duration_s` |
 

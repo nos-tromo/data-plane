@@ -302,17 +302,33 @@ collection until a backup succeeds again.
   - A file the backup account cannot delete (an unencrypted dump an earlier
     version wrote as root) is named and counted as not deleted; remove it as
     root.
-- **Grace.** A period that is new on the host, or changed, takes effect when a
-  pruning first sees it: `snapshots/.prune-since` records when, and which
-  period (mode `0644`, so every account that backs up can read it). Nothing is
-  deleted for `RETENTION_NOTICE_DAYS` (default 30) after that, so nothing an
-  earlier version left is deleted without notice. Deleting the file restarts
-  the grace period.
+- **Grace.** A period that is new on the host takes effect when a pruning
+  first sees it, and nothing is deleted for `RETENTION_NOTICE_DAYS` (default
+  30) after that, so nothing an earlier version left is deleted without
+  notice.
+- **Changing the period** never deletes sooner than announced. A longer period
+  applies at once (within a running first grace, at that grace's end), also to
+  backups that were due under the shorter one but not yet pruned. A shorter one
+  gives the notice period only to the backups it makes due sooner, never
+  ending before a grace already running; meanwhile what the rule in force
+  deletes still goes when it says. Changing `RETENTION_NOTICE_DAYS` alone
+  moves nothing: it only sets the length of the next grace.
+- **State.** `snapshots/.prune-since` holds when the period took effect, the
+  period, when its grace ends and, after a change, the rule in force until
+  then (mode `0644`, so every account that backs up can read it). The state
+  of 0.7.0 is rewritten with its grace end on the first run. A state dated in
+  the future (a clock set back) is warned about and its dates are capped at
+  now, never restarted; one
+  with impossible values (a period of 0 days, a grace end before its start) is
+  refused and nothing is deleted. Deleting the file restarts the grace period.
 - **Off-host copies** are backups too. This repo cannot reach them: prune them
   at the same age, on the medium they are kept on.
 - **Recorded.** Each pruning is `delete` / `backup.prune.<store>` in the audit
   trail, attributed like the backup that ran it, with the files deleted (by
-  name), the period, the cutoff and the counts (README: Audit trail).
+  name), the period, the cutoff in effect and the counts; while a grace runs,
+  also when it ends and, after a change, the period still in force
+  (`grace_until`, `in_force_days`; README: Audit trail). A file another
+  pruning removed first is not counted.
 - **After a restore,** the restored data still carries its own deadlines: let
   docint's daily retention sweep run (it starts a few minutes after docint's
   backend starts) before users work on restored collections.

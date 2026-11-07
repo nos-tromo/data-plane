@@ -42,7 +42,7 @@ BACKUP_RECIPIENTS ?= $(or $(strip $(shell test -f .env && grep -E '^BACKUP_RECIP
 # deleted, recorded (backup/README.md: Retention). Override via
 # BACKUP_RETENTION_DAYS in .env or on the command line.
 BACKUP_RETENTION_DAYS ?= $(or $(strip $(shell test -f .env && grep -E '^BACKUP_RETENTION_DAYS=' .env | cut -d= -f2-)),30)
-# A period that is new or changed deletes nothing for this many days (1 to 365).
+# A new period deletes nothing for this many days (1 to 365); backup/README.md: Retention.
 RETENTION_NOTICE_DAYS ?= $(or $(strip $(shell test -f .env && grep -E '^RETENTION_NOTICE_DAYS=' .env | cut -d= -f2-)),30)
 
 # Direct database access, backups and restores are recorded in the
@@ -95,8 +95,8 @@ help:
 	@echo "  make backup          backup both DBs, encrypted with age (needs CASE_REF= or REASON= by default)"
 	@echo "  make backup-neo4j    just Neo4j (offline dump, encrypted into $(BACKUP_DIR))"
 	@echo "  make backup-qdrant   just Qdrant (online snapshots, encrypted into $(BACKUP_DIR))"
-	@echo "  make backup-prune    delete backups older than BACKUP_RETENTION_DAYS ($(BACKUP_RETENTION_DAYS)); every backup does it too"
 	@echo "                       both encrypt to the public keys in $(BACKUP_RECIPIENTS)"
+	@echo "  make backup-prune    delete backups older than BACKUP_RETENTION_DAYS ($(BACKUP_RETENTION_DAYS)); every backup does it too"
 	@echo "  make restore-neo4j DUMP=<file> IDENTITY=<key file>    REPLACE the neo4j database with a dump (asks first)"
 	@echo "  make restore-qdrant COLLECTION=<name> SNAPSHOT=<file> IDENTITY=<key file>"
 	@echo "                       REPLACE one collection with a snapshot (asks first)"

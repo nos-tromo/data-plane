@@ -17,16 +17,27 @@
 # stamp or that the audit record cannot carry (only letters, digits and ._-),
 # and stamps in the future (a clock set back).
 #
-# A period that is new on this host, or changed, takes effect when a run first
-# sees it ($BACKUP_DIR/.prune-since: "<epoch> <days>", mode 0644 so every
-# account that backs up can read it) and deletes nothing for the notice period
-# after that (RETENTION_NOTICE_DAYS, 1 to 365, default 30), so nothing an
-# earlier version left is deleted without notice. A file this account cannot
-# delete is named and counted as not deleted; it does not fail the run.
+# A period that is new on this host takes effect when a run first sees it and
+# deletes nothing for the notice period after that (RETENTION_NOTICE_DAYS, 1 to
+# 365, default 30), so nothing an earlier version left is deleted without
+# notice. A changed period never deletes sooner than announced: a longer one
+# applies at once (also to backups due under the shorter one but not yet
+# pruned), and a shorter one gives the notice period only to the backups it
+# makes due sooner while the rule in force keeps deleting. Changing the notice alone
+# moves nothing. The state is $BACKUP_DIR/.prune-since, "<since> <days>
+# <grace until> [<days in force> <their grace until>]" in epoch seconds, mode
+# 0644 so every account that backs up can read it: while the grace runs, a
+# backup older than the new period goes when the rule in force before the
+# change (its days and its own grace) would delete it too. The two-field form
+# of earlier versions is read as a grace that started at <since>, and
+# rewritten with its end. A state with impossible values is refused. A file
+# this account
+# cannot delete is named and counted as not deleted; it does not fail the run.
 #
-# Reports the facts of the record to $AUDIT_FACTS: period_days, cutoff,
-# deleted, not_deleted, and file=<name> for each file deleted. Exits 0 when it
-# ran, 2 on a bad setting, argument or state file. --now is for tests.
+# Reports the facts of the record to $AUDIT_FACTS: period_days, cutoff (the
+# effective one), deleted, not_deleted, file=<name> for each file deleted, and
+# while a grace runs grace_until and, after a change, in_force_days. Exits 0
+# when it ran, 2 on a bad setting, argument or state file. --now is for tests.
 set -euo pipefail
 
 usage() {
@@ -84,41 +95,111 @@ _utc() {
 dir=$(backup_dir)
 state="$dir/.prune-since"
 
-# _record_period: record that the period in force takes effect now.
-_record_period() {
-  if ! (umask 022 && printf '%s %s\n' "$now" "$days" >"$state.tmp" && mv -f "$state.tmp" "$state"); then
-    rm -f "$state.tmp"
+# _record_state SINCE GRACE_UNTIL [IN_FORCE_DAYS IN_FORCE_GRACE]: write the
+# state (a per-run temporary name, so two runs at once never fail each
+# other's write).
+_record_state() {
+  if ! (umask 022 && printf '%s %s %s%s\n' "$1" "$days" "$2" "${3:+ $3 $4}" >"$state.tmp.$$" &&
+    mv -f "$state.tmp.$$" "$state"); then
+    rm -f "$state.tmp.$$"
     echo "ERROR: cannot write $state with this account. Nothing was deleted." >&2
     exit 2
   fi
 }
 if [[ ! -e $state ]]; then
-  _record_period
+  _record_state "$now" $((now + notice * 86400))
 fi
 if [[ ! -r $state ]]; then
   echo "ERROR: this account cannot read $state: make it readable (chmod 644), or run the backups as its owner. Nothing was deleted." >&2
   exit 2
 fi
-read -r since recorded _ <"$state" || true
-if [[ ! $since =~ ^[0-9]+$ || ! ${recorded:-} =~ ^[0-9]+$ ]]; then
-  echo "ERROR: $state holds no time and period. Delete it to restart the grace period. Nothing was deleted." >&2
+since='' recorded='' grace='' inforce='' inforce_grace=''
+read -r since recorded grace inforce inforce_grace _ <"$state" || true
+_bad_state() {
+  echo "ERROR: $state $1. Delete it to restart the grace period. Nothing was deleted." >&2
   exit 2
+}
+# Epoch seconds fit 11 digits until the year 5138; periods are 1 to 365 days.
+epoch='^[0-9]{1,11}$' period_re='^[0-9]{1,3}$'
+[[ $since =~ $epoch && ${recorded:-} =~ $period_re ]] || _bad_state "holds no time and period"
+[[ -z $grace || $grace =~ $epoch ]] || _bad_state "holds no grace end"
+if [[ -n $inforce ]]; then
+  [[ $inforce =~ $period_re && ${inforce_grace:-} =~ $epoch ]] || _bad_state "holds a period in force without its grace"
 fi
-if ((10#$recorded != days)); then
-  echo ">> BACKUP_RETENTION_DAYS changed from $((10#$recorded)) to $days: the new period takes effect now" >&2
-  _record_period
-  since=$now
+since=$((10#$since)) recorded=$((10#$recorded))
+((recorded >= 1 && recorded <= 365)) || _bad_state "holds a period outside 1 to 365 days"
+upgraded=''
+if [[ -n $grace ]]; then
+  grace=$((10#$grace))
+else
+  # The state of the release before: its grace ends a notice after <since>,
+  # fixed now so a later change of the notice moves nothing.
+  grace=$((since + notice * 86400)) upgraded=1
+fi
+((grace >= since && grace <= since + 365 * 86400)) || _bad_state "holds a grace end outside its period's notice"
+if [[ -n $inforce ]]; then
+  inforce=$((10#$inforce)) inforce_grace=$((10#$inforce_grace))
+  ((inforce >= 1 && inforce <= 365 && inforce_grace <= grace)) || _bad_state "holds an impossible period in force"
 fi
 
-cutoff=$((now - period))
-printf 'period_days=%s\ncutoff=%s\n' "$days" "$(_utc "$cutoff")" >>"$facts"
+if ((since > now)); then
+  # A clock set back: keep the rule, its dates never more than a notice ahead.
+  echo "WARNING: $state is dated in the future; its dates are capped at now. Check the host's clock." >&2
+  since=$now
+  ((grace <= now + notice * 86400)) || grace=$((now + notice * 86400))
+  if [[ -n $inforce ]] && ((inforce_grace > grace)); then inforce_grace=$grace; fi
+  upgraded=1
+fi
+if ((recorded != days)); then
+  # The rule actually in force before this change: the recorded period once
+  # its grace had passed (or when nothing older was in force), else what both
+  # it and the older rule allowed.
+  if ((now >= grace)) || [[ -z $inforce ]]; then
+    in_force=$recorded in_force_grace=$grace
+  else
+    in_force=$((inforce > recorded ? inforce : recorded)) in_force_grace=$inforce_grace
+  fi
+  echo ">> BACKUP_RETENTION_DAYS changed from $recorded to $days: the new period takes effect now" >&2
+  if ((days >= in_force)); then
+    # Longer: it applies at once; nothing that was announced moves earlier.
+    since=$now grace=$((now > in_force_grace ? now : in_force_grace)) inforce='' inforce_grace=''
+  else
+    # Shorter: what it makes due sooner gets the notice, never less than the
+    # grace already running; meanwhile the rule in force still deletes.
+    old_grace=$grace
+    since=$now grace=$((now + notice * 86400))
+    ((old_grace <= now || old_grace <= grace)) || grace=$old_grace
+    inforce=$in_force inforce_grace=$in_force_grace
+  fi
+  _record_state "$since" "$grace" "$inforce" "$inforce_grace"
+elif [[ -n $upgraded ]]; then
+  if ! (umask 022 && printf '%s %s %s%s\n' "$since" "$days" "$grace" "${inforce:+ $inforce $inforce_grace}" \
+    >"$state.tmp.$$" && mv -f "$state.tmp.$$" "$state") 2>/dev/null; then
+    rm -f "$state.tmp.$$"
+    echo "WARNING: cannot rewrite $state with this account; its dates are used as read." >&2
+  fi
+fi
+
 deleted=0
 not_deleted=0
-
-if ((now < since + notice * 86400)); then
-  echo ">> pruning takes effect on $(_utc $((since + notice * 86400))): until then no backup is deleted" >&2
-  printf 'deleted=0\nnot_deleted=0\n' >>"$facts"
+if ((now >= grace)); then
+  cutoff=$((now - period))
+elif [[ -n $inforce ]] && ((now >= inforce_grace)); then
+  # During the grace only what both the new period and the rule in force
+  # make due goes: nothing sooner than announced, nothing later either.
+  cutoff=$((now - (inforce > days ? inforce : days) * 86400))
+  echo ">> until $(_utc "$grace") only backups older than $((inforce > days ? inforce : days)) day(s) are deleted" >&2
+else
+  cutoff=$((now - period))
+  echo ">> pruning takes effect on $(_utc "$grace"): until then no backup is deleted" >&2
+  printf 'period_days=%s\ncutoff=%s\ngrace_until=%s\n%sdeleted=0\nnot_deleted=0\n' \
+    "$days" "$(_utc "$cutoff")" "$(_utc "$grace")" "${inforce:+in_force_days=$inforce
+}" >>"$facts"
   exit 0
+fi
+printf 'period_days=%s\ncutoff=%s\n' "$days" "$(_utc "$cutoff")" >>"$facts"
+if ((now < grace)); then
+  printf 'grace_until=%s\nin_force_days=%s\n' "$(_utc "$grace")" "$inforce" >>"$facts"
 fi
 
 if [[ $store == neo4j ]]; then
@@ -143,14 +224,18 @@ for path in "$dir/$store"-*; do
     continue
   fi
   ((written < cutoff)) || continue
-  rm -f -- "$path" 2>/dev/null || true
-  if [[ -e $path ]]; then
+  # Without -f, so a file another pruning removed first is not counted here;
+  # stdin is not a terminal, so rm never asks about a write-protected file.
+  # shellcheck disable=SC2217
+  if rm -- "$path" </dev/null 2>/dev/null; then
+    printf 'file=%s\n' "$name" >>"$facts"
+    deleted=$((deleted + 1))
+  elif [[ -e $path ]]; then
     echo "ERROR: cannot delete $name with this account: remove $name as root." >&2
     not_deleted=$((not_deleted + 1))
-    continue
+  else
+    echo ">> already gone: $name (deleted by another pruning)" >&2
   fi
-  printf 'file=%s\n' "$name" >>"$facts"
-  deleted=$((deleted + 1))
 done
 printf 'deleted=%s\nnot_deleted=%s\n' "$deleted" "$not_deleted" >>"$facts"
 echo ">> pruned $deleted backup(s) of $store older than $days day(s)" >&2

@@ -58,8 +58,8 @@ make bundle                   # airgap tarball from the latest release tag (curr
 make backup REASON="..."      # neo4j (offline dump) + qdrant (online snapshot), encrypted with age — recorded; purpose needed by default
 make backup-neo4j             # neo4j only — briefly STOPS the service
 make backup-qdrant            # qdrant only — online, no downtime
-make backup-prune             # delete backups older than BACKUP_RETENTION_DAYS (default 30); every backup also does it — recorded
                               # backups need age on the host and the public keys in backup/recipients.txt (BACKUP_RECIPIENTS)
+make backup-prune             # delete backups older than BACKUP_RETENTION_DAYS (default 30); every backup also does it — recorded
 make restore-neo4j DUMP=<file> IDENTITY=<key>                     # REPLACE the neo4j database from an encrypted dump in backup/snapshots (asks)
 make restore-qdrant COLLECTION=<c> SNAPSHOT=<file> IDENTITY=<key> # REPLACE one collection from an encrypted snapshot (asks)
 
