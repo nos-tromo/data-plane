@@ -5,13 +5,13 @@
 # scripts/audit-admin.sh, which records it as delete / backup.prune.<store>.
 #
 #   BACKUP_RETENTION_DAYS=<1..365> BACKUP_DIR=<dir> AUDIT_FACTS=<file> \
-#     scripts/backup_prune.sh <neo4j|qdrant> [--now <epoch seconds>]
+#     scripts/backup_prune.sh qdrant [--now <epoch seconds>]
 #   BACKUP_RETENTION_DAYS=<1..365> scripts/backup_prune.sh check
 #       exit 0 when the period is valid, 2 otherwise; touches nothing. make runs
 #       it before a backup asks admin-audit or a store for anything.
 #
 # A backup's age is the UTC time in its name, the last one before the suffix:
-# neo4j-<YYYYmmddTHHMMSSZ>.dump[.age], qdrant-<collection>-<stamp>[-n].snapshot[.age].
+# qdrant-<collection>-<YYYYmmddTHHMMSSZ>[-n].snapshot[.age].
 # Encrypted backups and the plaintext ones of earlier versions follow the same
 # rule. Never deleted, only named: unfinished files (.part), names without a
 # stamp or that the audit record cannot carry (only letters, digits and ._-),
@@ -41,7 +41,7 @@
 set -euo pipefail
 
 usage() {
-  echo "usage: BACKUP_RETENTION_DAYS=<1..365> BACKUP_DIR=<dir> $0 <neo4j|qdrant> [--now <epoch>] | $0 check" >&2
+  echo "usage: BACKUP_RETENTION_DAYS=<1..365> BACKUP_DIR=<dir> $0 qdrant [--now <epoch>] | $0 check" >&2
   exit 2
 }
 
@@ -50,7 +50,7 @@ usage() {
 
 [[ $# -eq 1 || $# -eq 3 ]] || usage
 store=$1
-case $store:$# in neo4j:* | qdrant:* | check:1) ;; *) usage ;; esac
+case $store:$# in qdrant:* | check:1) ;; *) usage ;; esac
 now=$(date -u +%s)
 if [[ $# -eq 3 ]]; then
   [[ $2 == --now && $3 =~ ^[0-9]+$ ]] || usage
@@ -202,11 +202,7 @@ if ((now < grace)); then
   printf 'grace_until=%s\nin_force_days=%s\n' "$(_utc "$grace")" "$inforce" >>"$facts"
 fi
 
-if [[ $store == neo4j ]]; then
-  pattern='^neo4j-([0-9]{8}T[0-9]{6}Z)\.dump(\.age)?$'
-else
-  pattern='^qdrant-[A-Za-z0-9._-]+-([0-9]{8}T[0-9]{6}Z)(-[0-9]+)?\.snapshot(\.age)?$'
-fi
+pattern='^qdrant-[A-Za-z0-9._-]+-([0-9]{8}T[0-9]{6}Z)(-[0-9]+)?\.snapshot(\.age)?$'
 shopt -s nullglob
 for path in "$dir/$store"-*; do
   name=${path##*/}

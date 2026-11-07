@@ -1,27 +1,25 @@
 # data-plane
 
-Stateful services for the nos-tromo apps. This project owns the named
-Docker volumes for graph and vector data; the apps (chorus, docint) stay
+The stateful service for the nos-tromo apps. This project owns Qdrant and
+the named Docker volumes for its vector data; docint, which uses them, stays
 stateless and disposable.
 
 ## What lives here
 
 | Compose service | Used by | Network alias on `data-net` | Why |
 |---|---|---|---|
-| `neo4j` | chorus | `neo4j` | Graph + native vectors |
 | `qdrant-cpu` / `qdrant-cuda` | docint | `qdrant` | Document vector store — one variant runs at a time, picked by `PROFILE` |
 | `admin-audit` | operators (make targets) | — (no network) | Records direct database access, backups and restores in the audit trail ([Audit trail](#audit-trail)) |
 
-Both stores attach to the external `data-net` network; the app
-backends reach them by alias. `data-net` carries data-plane traffic
-only — inference traffic runs on a separate `inference-net`.
+Qdrant attaches to the external `data-net` network; the app backends
+reach it by alias. `data-net` carries data-plane traffic only — inference
+traffic runs on a separate `inference-net`.
 
 ## Why a separate compose project
 
-The chorus and docint application compose files declare **no**
-application-state volumes. The worst case from `docker compose down -v`
-in those projects is a service restart — they cannot wipe graph or
-vector data because that data lives in volumes owned by *this* project.
+docint's compose file declares **none** of these volumes. The worst case
+from `docker compose down -v` there is a service restart — it cannot wipe
+vector data, because that data lives in volumes owned by *this* project.
 
 Those volumes are declared `external`, so even `docker compose down -v`
 *here* leaves them intact — only `make nuke`, which deletes them by name
@@ -32,26 +30,24 @@ behind an interactive confirmation, can wipe the data set. Backups
 
 ```bash
 cp .env.example .env
-$EDITOR .env                  # set NEO4J_PASSWORD and QDRANT_API_KEY (openssl rand -hex 32)
+$EDITOR .env                  # set QDRANT_API_KEY (openssl rand -hex 32)
 
 make network                  # create the external data-net (idempotent)
 make volumes                  # create the external data volumes (idempotent)
 make up                       # start with the CPU Qdrant profile (default), plus admin-audit
 make up PROFILE=cuda          # GPU profile
-make up-dev                   # publish ports on the host (Neo4j Browser, Qdrant UI)
-make up-admin REASON="..."    # production + loopback-only dashboard ports, recorded (see Admin access)
+make up-dev                   # publish ports on the host (Qdrant UI)
+make up-admin REASON="..."    # production + the loopback-only dashboard port, recorded (see Admin access)
 ```
 
-`make network` creates the external `data-net` if it does not exist; the
-app backends (chorus, docint) join it when they come up. `make volumes`
-pre-creates the named data volumes — they are declared `external`, so
-compose will not create them itself. Both targets are idempotent and run
-automatically as prerequisites of `make up`, so a fresh host can also just
-run `make up`.
+`make network` creates the external `data-net` if it does not exist;
+docint's backend joins it when it comes up. `make volumes` pre-creates the
+named data volumes — they are declared `external`, so compose will not
+create them itself. Both targets are idempotent and run automatically as
+prerequisites of `make up`, so a fresh host can also just run `make up`.
 
-`NEO4J_PASSWORD` and `QDRANT_API_KEY` are both required: compose refuses
-every command without them. docint must be given the same `QDRANT_API_KEY`
-in its own `.env`.
+`QDRANT_API_KEY` is required: compose refuses every command without it.
+docint must be given the same `QDRANT_API_KEY` in its own `.env`.
 
 **Upgrading an existing deployment to 0.5.0:** set `QDRANT_API_KEY` in
 data-plane's `.env` and the same value in docint's `.env` (docint >= v2.5.0)
@@ -80,21 +76,20 @@ rewritten with its grace end on the first run; 0.7.0 also reads the new one.
 ## Admin access (production)
 
 Production shape publishes no ports, and the edge-plane gateway deliberately
-does not route Neo4j Browser or the Qdrant dashboard (see
+does not route the Qdrant dashboard (see
 [`../edge-plane/README.md`](../edge-plane/README.md), "What is deliberately
-NOT routed") — the SSH tunnel is their access model. `make up-admin` gives
+NOT routed") — the SSH tunnel is its access model. `make up-admin` gives
 that tunnel a target, on demand: it layers `docker/compose.admin.yaml`, which
-binds 7474/7687 (Neo4j http + bolt) and 6333 (Qdrant http) to `127.0.0.1`
-only. Nothing becomes reachable from the network. Production runs plain
-`make up` (deploy's bring-up too); the ports are open only between a
-`make up-admin` and the next `make up` or `make down`.
+binds 6333 (Qdrant http) to `127.0.0.1` only. Nothing becomes reachable from
+the network. Production runs plain `make up` (deploy's bring-up too); the
+ports are open only between a `make up-admin` and the next `make up` or
+`make down`.
 
 ```bash
-make up-admin CASE_REF=case-0001 REASON="inspect the graph schema"   # on the host
-ssh -L 7474:localhost:7474 -L 7687:localhost:7687 -L 6333:localhost:6333 <host>   # from your machine
-# Neo4j Browser:    http://localhost:7474   (connects to bolt://localhost:7687)
+make up-admin CASE_REF=case-0001 REASON="inspect a collection"   # on the host
+ssh -L 6333:localhost:6333 <host>   # from your machine
 # Qdrant dashboard: http://localhost:6333/dashboard
-make up                       # drop the loopback ports again (brief container restart)
+make up                       # drop the loopback port again (brief container restart)
 ```
 
 Opening the ports always needs `CASE_REF=` or `REASON=`, and is recorded
@@ -107,24 +102,22 @@ the operator can read. `make health` says whether the ports are open, and
 since when. `make stop` does not close them (a start brings them back), and
 `make nuke` does not record the close; the next `make up` does.
 
-Neo4j Browser always asks for the `NEO4J_USER` / `NEO4J_PASSWORD` login, and
-the Qdrant dashboard for the `QDRANT_API_KEY` from `.env`. Every Qdrant API
-call needs that key as the `api-key` header — docint's, and yours over the
+The Qdrant dashboard asks for the `QDRANT_API_KEY` from `.env`. Every Qdrant
+API call needs that key as the `api-key` header — docint's, and yours over the
 tunnel; `make backup-qdrant`, `make qdrant-shell` and `make restore-qdrant`
 send the server's own key themselves.
 
 **What is done over these ports is not recorded**, only that they were open,
-by whom, why and for how long: neither store logs it, and admin-audit only
+by whom, why and for how long: Qdrant does not log it, and admin-audit only
 sees the make targets. For access that is recorded session by session, use
-`make db-shell` / `make qdrant-shell` ([Audit trail](#audit-trail)).
+`make qdrant-shell` ([Audit trail](#audit-trail)).
 
 ## Operating
 
 ```bash
 make ps                       # service state
 make health                   # health + uptime, the admin ports; fails while admin-audit cannot record
-make logs S=neo4j             # tail logs for one service
-make db-shell REASON="..."    # cypher-shell on Neo4j — recorded, needs a purpose
+make logs S=qdrant-cpu        # tail logs for one service
 make qdrant-shell REASON="..." # shell with Qdrant's HTTP API — recorded, needs a purpose
 make down                     # stop, keep volumes
 make bundle                   # airgap tarball from the latest release tag
@@ -135,18 +128,14 @@ make nuke                     # interactive: DESTROY all volumes
 
 ## Container hardening (deploy ADR 0001)
 
-All services run with `no-new-privileges` and `cap_drop: ALL`. Neo4j re-adds
-the five capabilities its entrypoint needs to chown/chmod its directories and
-drop to the internal `neo4j` user, plus `KILL`, without which its init cannot
-pass `docker stop`'s SIGTERM on to the server; and it stops with a 2-minute
-grace period, as its shutdown outlasts Docker's default 10 s — verified
-empirically, see the compose comment; Qdrant needs none. `admin-audit` also runs as `nobody` on a
-read-only root filesystem, with no network and no data volumes (only
-read-only binds of its code and the `VERSION` file).
+All services run with `no-new-privileges` and `cap_drop: ALL`; Qdrant needs
+no capability back. `admin-audit` also runs as `nobody` on a read-only root
+filesystem, with no network and no data volumes (only read-only binds of its
+code and the `VERSION` file).
 
-For the two databases, `user:` and `read_only:` are **deliberately deferred**:
-both manage their own on-disk state on external volumes with image-managed
-ownership, and this repo's CI does not run them, so a UID change would land
+For Qdrant, `user:` and `read_only:` are **deliberately deferred**: it
+manages its own on-disk state on external volumes with image-managed
+ownership, and this repo's CI does not run it, so a UID change would land
 untested. The residual root-daemon exposure is compensated host-side via
 `userns-remap` — runbook in
 [`../deploy/docs/runbooks/userns-remap.md`](../deploy/docs/runbooks/userns-remap.md),
@@ -155,18 +144,16 @@ rationale in
 
 ## Backup / restore
 
-`make backup` writes a Neo4j offline dump and Qdrant snapshots, each
-encrypted with [age](https://age-encryption.org) on its way out of the store,
-to the public keys in `backup/recipients.txt` (`BACKUP_RECIPIENTS`); the
-identity that decrypts stays offline, and no unencrypted dump or snapshot
-rests on the host. age comes from the host's package manager. The Neo4j dump
-requires a brief stop of the service; Qdrant snapshots are online.
-`make restore-neo4j DUMP=<file> IDENTITY=<file>` and
+`make backup` writes Qdrant snapshots, online, each encrypted with
+[age](https://age-encryption.org) on its way out of the store, to the public
+keys in `backup/recipients.txt` (`BACKUP_RECIPIENTS`); the identity that
+decrypts stays offline, and no unencrypted snapshot rests on the host. age
+comes from the host's package manager.
 `make restore-qdrant COLLECTION=<name> SNAPSHOT=<file> IDENTITY=<file>`
-decrypt one back with the identity given for that run (each asks for
-confirmation first). All of them are recorded in the audit trail; a backup
+decrypts one back with the identity given for that run (it asks for
+confirmation first). Both are recorded in the audit trail; a backup
 needs a stated purpose by default (`make backup REASON="scheduled backup"`).
-After every backup that succeeded, that store's backups older than
+After every backup that succeeded, the backups older than
 `BACKUP_RETENTION_DAYS` (default 30) are deleted; `make backup-prune` does it
 on its own. Full runbook with installing age, the key pair, retention,
 off-host copy, scheduling and verify-restore steps in
@@ -175,18 +162,18 @@ off-host copy, scheduling and verify-restore steps in
 ## Audit trail
 
 What data-plane contributes to the federation's data-protection audit log
-(§76 BDSG as the reference standard). The apps record what their users do
-with the data in Neo4j and Qdrant; access that bypasses them is recorded
-here, because neither store keeps a record of its own — Neo4j Community has
-no query log, Qdrant no access log. The events are hash-chained JSON lines
-(`audit/audit_event.py`, vendored from `nos-tromo/.github`). The store, its
-retention, the chain verifier and who may read the trail are obs-plane's —
-see [obs-plane's `docs/audit.md`](../obs-plane/docs/audit.md).
+(§76 BDSG as the reference standard). docint records what its users do
+with the data in Qdrant; access that bypasses it is recorded here, because
+Qdrant keeps no record of its own (no access log). The events are
+hash-chained JSON lines (`audit/audit_event.py`, vendored from
+`nos-tromo/.github`). The store, its retention, the chain verifier and who
+may read the trail are obs-plane's — see
+[obs-plane's `docs/audit.md`](../obs-plane/docs/audit.md).
 
 ### The admin-audit service
 
 `admin-audit` runs `audit/admin_audit.py` (stdlib Python, mounted read-only)
-on the pinned python image. `make up` starts it with the stores, and
+on the pinned python image. `make up` starts it with Qdrant, and
 `make health` checks that it can record. Its own chain records its
 configuration (`admin` / `config.audit`, with `require_purpose` and
 `shells_require_purpose`) and beats every minute. Each record below is a chain of its own (`service: data-plane`),
@@ -216,14 +203,11 @@ loudly: record it by other means.
 
 | Target | `action` / `operation` | Written | `target` | Purpose |
 |---|---|---|---|---|
-| `make db-shell` | `admin` / `db.shell.open`, then `db.shell.close` | open before the session, close after it (its `parent_event_id` is the open) | `store`: `neo4j` | always required |
-| `make qdrant-shell` | `admin` / `db.shell.open`, then `db.shell.close` | as above | `store`: `qdrant` | always required |
-| `make up-admin`, then `make up` or `make down` | `admin` / `db.ports.open`, then `db.ports.close` | open before the ports are published, close when `make up` has removed them or before `make down` does (its `parent_event_id` is the open) | `store`: `neo4j`, `qdrant` | always required (for the opening) |
-| `make backup-neo4j`, `make backup` | `disclose` / `backup.neo4j`, `recipient: file:backup` | after the dump | `database`: `neo4j` | when `AUDIT_REQUIRE_PURPOSE` lists `disclose` (the default) |
-| `make backup-qdrant`, `make backup` | `disclose` / `backup.qdrant`, `recipient: file:backup` | after the snapshots | `collection`: each one snapshotted; beyond 200, `backup.qdrant.ids` events continue the list | as above |
-| `make backup-neo4j`, `make backup-qdrant`, `make backup`, `make backup-prune` | `delete` / `backup.prune.neo4j`, `backup.prune.qdrant` | after the store's backup succeeded (or on its own) | `file`: each backup deleted, by name; beyond 200, `backup.prune.<store>.ids` events continue the list | when it lists `delete` (not by default) |
-| `make restore-neo4j DUMP=… IDENTITY=…` | `modify` / `restore.neo4j` | after the load | `database`: `neo4j` | when it lists `modify` (not by default) |
-| `make restore-qdrant COLLECTION=… SNAPSHOT=… IDENTITY=…` | `modify` / `restore.qdrant` | after the recovery | `collection`: the one recovered | as above |
+| `make qdrant-shell` | `admin` / `db.shell.open`, then `db.shell.close` | open before the session, close after it (its `parent_event_id` is the open) | `store`: `qdrant` | always required |
+| `make up-admin`, then `make up` or `make down` | `admin` / `db.ports.open`, then `db.ports.close` | open before the ports are published, close when `make up` has removed them or before `make down` does (its `parent_event_id` is the open) | `store`: `qdrant` | always required (for the opening) |
+| `make backup-qdrant`, `make backup` | `disclose` / `backup.qdrant`, `recipient: file:backup` | after the snapshots | `collection`: each one snapshotted; beyond 200, `backup.qdrant.ids` events continue the list | when `AUDIT_REQUIRE_PURPOSE` lists `disclose` (the default) |
+| `make backup-qdrant`, `make backup`, `make backup-prune` | `delete` / `backup.prune.qdrant` | after the backup succeeded (or on its own) | `file`: each backup deleted, by name; beyond 200, `backup.prune.qdrant.ids` events continue the list | when it lists `delete` (not by default) |
+| `make restore-qdrant COLLECTION=… SNAPSHOT=… IDENTITY=…` | `modify` / `restore.qdrant` | after the recovery | `collection`: the one recovered | when it lists `modify` (not by default) |
 
 Every event names the operator, `actor: {user: <sudo user, else the login
 user>, via: "cli"}`, and carries `purpose: {case_ref, reason}` when one was
@@ -235,23 +219,21 @@ stated. The `criteria`:
 | `db.shell.close` | `store`, `exit_status`, `duration_s` |
 | `db.ports.open` | `ports` (the loopback bindings) |
 | `db.ports.close` | `ports`, `by` (`up`, `down`, or `up-admin` when the opening failed and published nothing), `exit_status`, `duration_s` (how long they were open) |
-| `backup.neo4j` | `file` (the encrypted dump's name), `size_bytes`, `encryption` (`age`), `recipients` (how many public keys can read it), `recipients_sha256` (the fingerprint of that set of keys, [`backup/README.md`](backup/README.md)), `exit_status`, `duration_s` |
-| `backup.qdrant` | `snapshots`, `size_bytes` (the encrypted files' total), `failed` (collections not backed up), `encryption`, `recipients`, `recipients_sha256`, `exit_status`, `duration_s` |
-| `backup.prune.<store>` | `period_days`, `cutoff` (backups written before it were due), `deleted`, `not_deleted` (files the account could not delete), `exit_status`, `duration_s`; while a grace runs `grace_until` and, after a change of the period, `in_force_days` (the period still deleting meanwhile) |
-| `restore.neo4j` | `file`, `size_bytes`, `encryption`, `exit_status`, `duration_s` |
+| `backup.qdrant` | `snapshots`, `size_bytes` (the encrypted files' total), `failed` (collections not backed up), `encryption` (`age`), `recipients` (how many public keys can read them), `recipients_sha256` (the fingerprint of that set of keys, [`backup/README.md`](backup/README.md)), `exit_status`, `duration_s` |
+| `backup.prune.qdrant` | `period_days`, `cutoff` (backups written before it were due), `deleted`, `not_deleted` (files the account could not delete), `exit_status`, `duration_s`; while a grace runs `grace_until` and, after a change of the period, `in_force_days` (the period still deleting meanwhile) |
 | `restore.qdrant` | `collection`, `snapshot`, `encryption`, `exit_status`, `duration_s` |
 
 A refusal is the operation's event with `outcome: denied`, its criteria and
 no target. A backup or restore recorded as `ok` always states its encryption:
 admin-audit refuses such a record without it. Never recorded: what a session
 read or changed, file contents, paths (file names only — a path can name a
-user), the Neo4j password, the Qdrant key, the public keys, or the identity a
-restore used and where it is.
+user), the Qdrant key, the public keys, or the identity a restore used and
+where it is.
 
 ### Stating the purpose
 
 ```bash
-make db-shell CASE_REF=case-0001 REASON="verify a reported duplicate"
+make qdrant-shell CASE_REF=case-0001 REASON="verify a reported duplicate"
 make backup REASON="scheduled backup"   # a scheduled backup states one too
 ```
 
@@ -262,7 +244,7 @@ recipe's environment, quotes included (a `$` is expanded by make).
 `AUDIT_REQUIRE_PURPOSE` (in `.env`, read by admin-audit) lists the actions
 whose records need a stated purpose. Unset, it is `query,disclose`: backups
 need one, restores do not. `AUDIT_REQUIRE_PURPOSE=` (empty) requires none;
-`query,disclose,modify` requires one for restores too. The shells need one
+`query,disclose,modify` requires one for restores too. The shell needs one
 whatever it says, and so does opening the admin ports. An unknown action
 stops admin-audit, and every target refuses until it is fixed: a typo never
 switches the requirement off.
@@ -270,7 +252,7 @@ switches the requirement off.
 ### What it does not cover
 
 The records cover the make targets. Whoever can use the Docker daemon can
-reach the stores without them (`docker exec`, or publishing ports by hand,
+reach Qdrant without them (`docker exec`, or publishing ports by hand,
 which `make health` then reports as open without an open record). That
 access is root-equivalent and is the host's to audit. Inside a shell session,
 nothing the session does is recorded, nor what is done over the admin ports
@@ -305,7 +287,6 @@ data-plane/
   scripts/
     audit-admin.sh        runs an operation and records it through admin-audit
     admin-ports.sh        opens and closes the admin overlay's ports, recorded
-    neo4j_admin.sh        cypher-shell session, offline dump and load
     qdrant_admin.sh       API shell, snapshot of every collection, recovery of one
     qdrant_api.sh         Qdrant's HTTP API over /dev/tcp, run inside the container
     backup_age.sh         the age encryption of backups: recipients and identity checks
@@ -319,9 +300,6 @@ data-plane/
 
 ## Pointers
 
-- chorus architecture contract: `../chorus/docs/architecture.md`
-  ("Data-plane integration contract")
-- chorus invariant — vectors live in Neo4j, not Qdrant: `../chorus/docs/decisions/0003-vectors-in-neo4j.md`
 - docint Qdrant usage: `../docint/docker/compose.yaml`
 - Ordered federation bring-up: [`../deploy/README.md`](../deploy/README.md)
 - Questions and bugs: <https://github.com/nos-tromo/data-plane/issues>

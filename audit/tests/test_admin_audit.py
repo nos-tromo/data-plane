@@ -40,9 +40,9 @@ ENVELOPE = frozenset(
 )
 OPERATOR = {"user": "ops.example", "via": "cli"}
 PURPOSE = {"case_ref": "case-0001", "reason": "verify a reported duplicate"}
-DUMP = "neo4j-20260131T020000Z.dump"
-LOOPBACK = ["127.0.0.1:7474", "127.0.0.1:7687", "127.0.0.1:6333"]
-BOTH_STORES = {"kind": "store", "ids": ["neo4j", "qdrant"], "count": 2}
+SNAPSHOT = "qdrant-docs-20260131T020000Z.snapshot"
+LOOPBACK = ["127.0.0.1:6333"]
+PORTS_TARGET = {"kind": "store", "ids": ["qdrant"], "count": 1}
 FINGERPRINT = hashlib.sha256(b"age1synthetic0recipient\n").hexdigest()
 # What a backup reports about its encryption, and how its record shows it.
 ENCRYPTED = ("encryption=age", "recipients=2", f"recipients_sha256={FINGERPRINT}")
@@ -213,9 +213,9 @@ class HelperTest(unittest.TestCase):
 
     def test_file_name(self) -> None:
         """Only a base name is accepted: a path could name a user."""
-        for good in (DUMP, "docs-1714953600-2026-01-31-02-00-00.snapshot", "a"):
+        for good in (f"{SNAPSHOT}.age", "docs-1714953600-2026-01-31-02-00-00.snapshot", "a"):
             self.assertEqual(admin_audit.file_name(good), good)
-        for bad in ("", ".hidden", "../neo4j.dump", "backup/neo4j.dump", "a b", "a:b", "x" * 256):
+        for bad in ("", ".hidden", "../docs.snapshot", "backup/docs.snapshot", "a b", "a:b", "x" * 256):
             with self.assertRaises(ValueError, msg=bad):
                 admin_audit.file_name(bad)
 
@@ -274,9 +274,9 @@ class HelperTest(unittest.TestCase):
 
     def test_operation_names(self) -> None:
         """The operations the records carry."""
-        self.assertEqual(admin_audit.operation_of("shell", "neo4j"), "db.shell.open")
+        self.assertEqual(admin_audit.operation_of("shell", "qdrant"), "db.shell.open")
         self.assertEqual(admin_audit.operation_of("backup", "qdrant"), "backup.qdrant")
-        self.assertEqual(admin_audit.operation_of("restore", "neo4j"), "restore.neo4j")
+        self.assertEqual(admin_audit.operation_of("restore", "qdrant"), "restore.qdrant")
         self.assertEqual(admin_audit.operation_of("ports", None), "db.ports.open")
         self.assertEqual(admin_audit.OPENED_KINDS["ports"][1], "db.ports.close")
 
@@ -286,7 +286,7 @@ class BeginTest(Workspace):
 
     def test_shell_opening_is_recorded(self) -> None:
         """One admin event before the session, by the operator, with the purpose."""
-        status, opened, events = self.begin(self.purposed(), "shell", "neo4j")
+        status, opened, events = self.begin(self.purposed(), "shell", "qdrant")
         self.assertEqual(status, 0)
         self.assertEqual([event["operation"] for event in events], ["start", "db.shell.open", "shutdown"])
         (event,) = records(events)
@@ -296,8 +296,8 @@ class BeginTest(Workspace):
         self.assertEqual((event["action"], event["outcome"]), ("admin", "ok"))
         self.assertEqual(event["actor"], OPERATOR)
         self.assertEqual(event["purpose"], PURPOSE)
-        self.assertEqual(event["target"], {"kind": "store", "ids": ["neo4j"], "count": 1})
-        self.assertEqual(event["criteria"], {"store": "neo4j"})
+        self.assertEqual(event["target"], {"kind": "store", "ids": ["qdrant"], "count": 1})
+        self.assertEqual(event["criteria"], {"store": "qdrant"})
         self.assertEqual(set(event), ENVELOPE | {"purpose", "target", "criteria"})
         self.assertIn("recorded admin db.shell.open", self.stderr.getvalue())
         self.assert_chains_intact()
@@ -328,7 +328,7 @@ class BeginTest(Workspace):
         self.assert_chains_intact()
 
     def test_admin_ports_opening_is_recorded(self) -> None:
-        """The opening of make up-admin: both stores, the loopback bindings, the purpose."""
+        """The opening of make up-admin: the store, the loopback binding, the purpose."""
         status, opened, events = self.begin(self.purposed(), "ports", None)
         self.assertEqual(status, 0)
         (event,) = records(events)
@@ -336,7 +336,7 @@ class BeginTest(Workspace):
         self.assertEqual((event["action"], event["operation"], event["outcome"]), ("admin", "db.ports.open", "ok"))
         self.assertEqual(event["actor"], OPERATOR)
         self.assertEqual(event["purpose"], PURPOSE)
-        self.assertEqual(event["target"], BOTH_STORES)
+        self.assertEqual(event["target"], PORTS_TARGET)
         self.assertEqual(event["criteria"], {"ports": LOOPBACK})
         self.assert_chains_intact()
 
@@ -348,17 +348,17 @@ class BeginTest(Workspace):
         self.assertEqual((event["operation"], event["outcome"]), ("db.ports.open", "denied"))
         self.assertEqual(event["criteria"], {"ports": LOOPBACK})
         self.assertNotIn("target", event)
-        status, _, events = self.begin(self.purposed(), "ports", "neo4j")
+        status, _, events = self.begin(self.purposed(), "ports", "qdrant")
         self.assertEqual((status, events), (2, []))
         self.assert_chains_intact()
 
     def test_backup_follows_require_purpose(self) -> None:
         """Under query,disclose a backup without a purpose is refused; without the knob it may run."""
-        status, _, events = self.begin(self.environ(AUDIT_REQUIRE_PURPOSE="query,disclose"), "backup", "neo4j")
+        status, _, events = self.begin(self.environ(AUDIT_REQUIRE_PURPOSE="query,disclose"), "backup", "qdrant")
         self.assertEqual(status, 2)
         (event,) = records(events)
         self.assertEqual(
-            (event["action"], event["operation"], event["outcome"]), ("disclose", "backup.neo4j", "denied")
+            (event["action"], event["operation"], event["outcome"]), ("disclose", "backup.qdrant", "denied")
         )
         self.assertEqual(set(event), ENVELOPE)
         for environ in (self.environ(AUDIT_REQUIRE_PURPOSE=""), self.purposed(AUDIT_REQUIRE_PURPOSE="query,disclose")):
@@ -368,35 +368,38 @@ class BeginTest(Workspace):
 
     def test_restore_follows_require_purpose(self) -> None:
         """A restore is a modify: refused only when AUDIT_REQUIRE_PURPOSE lists it."""
+        restore = ("collection=docs", f"snapshot={SNAPSHOT}.age")
         status, _, events = self.begin(
-            self.environ(AUDIT_REQUIRE_PURPOSE="query,disclose"), "restore", "neo4j", f"file={DUMP}"
+            self.environ(AUDIT_REQUIRE_PURPOSE="query,disclose"), "restore", "qdrant", *restore
         )
         self.assertEqual((status, events), (0, []))
-        status, _, events = self.begin(self.environ(AUDIT_REQUIRE_PURPOSE="modify"), "restore", "neo4j", f"file={DUMP}")
+        status, _, events = self.begin(self.environ(AUDIT_REQUIRE_PURPOSE="modify"), "restore", "qdrant", *restore)
         self.assertEqual(status, 2)
         (event,) = records(events)
-        self.assertEqual((event["action"], event["operation"], event["outcome"]), ("modify", "restore.neo4j", "denied"))
-        self.assertEqual(event["criteria"], {"file": DUMP})
+        self.assertEqual(
+            (event["action"], event["operation"], event["outcome"]), ("modify", "restore.qdrant", "denied")
+        )
+        self.assertEqual(event["criteria"], {"collection": "docs", "snapshot": f"{SNAPSHOT}.age"})
         self.assertNotIn("target", event)
         self.assert_chains_intact()
 
     def test_malformed_purpose_writes_nothing(self) -> None:
         """A purpose with control characters or over 256 characters is refused unrecorded."""
         for extra in ({"AUDIT_REASON": "line\nbreak"}, {"AUDIT_CASE_REF": "x" * 257}):
-            status, _, events = self.begin(self.environ(**extra), "shell", "neo4j")
+            status, _, events = self.begin(self.environ(**extra), "shell", "qdrant")
             self.assertEqual((status, events), (2, []), extra)
         self.assertIn("not accepted", self.stderr.getvalue())
 
     def test_bad_arguments_write_nothing(self) -> None:
         """Unknown operations, missing or malformed parameters: exit 2, no event."""
         bad = [
-            ("vacuum", "neo4j"),
+            ("vacuum", "qdrant"),
             ("shell", "postgres"),
-            ("restore", "neo4j"),
-            ("restore", "neo4j", "file=../neo4j.dump"),
+            ("restore", "qdrant"),
+            ("restore", "qdrant", "collection=docs", "snapshot=../docs.snapshot.age"),
             ("restore", "qdrant", "collection=docs"),
-            ("backup", "neo4j", f"file={DUMP}"),
-            ("shell", "neo4j", "store=qdrant"),
+            ("backup", "qdrant", "collection=docs"),
+            ("shell", "qdrant", "store=qdrant"),
         ]
         for args in bad:
             status, _, events = self.begin(self.purposed(), *args)
@@ -411,7 +414,7 @@ class BeginTest(Workspace):
         ]
         for environ in environs:
             for kind in ("shell", "backup"):
-                status, _, events = self.begin(environ, kind, "neo4j")
+                status, _, events = self.begin(environ, kind, "qdrant")
                 self.assertEqual((status, events), (1, []), (environ, kind))
 
 
@@ -420,16 +423,16 @@ class EndTest(Workspace):
 
     def test_shell_close_points_at_its_opening(self) -> None:
         """The close carries the duration and exit status, linked to the opening."""
-        _, opened, _ = self.begin(self.purposed(), "shell", "neo4j")
-        status, events = self.end(self.purposed(), "shell", "neo4j", duration_s=42, opened=opened)
+        _, opened, _ = self.begin(self.purposed(), "shell", "qdrant")
+        status, events = self.end(self.purposed(), "shell", "qdrant", duration_s=42, opened=opened)
         self.assertEqual(status, 0)
         (event,) = records(events)
         self.assertEqual((event["action"], event["operation"], event["outcome"]), ("admin", "db.shell.close", "ok"))
         self.assertEqual(event["parent_event_id"], opened)
         self.assertEqual(event["actor"], OPERATOR)
         self.assertEqual(event["purpose"], PURPOSE)
-        self.assertEqual(event["target"], {"kind": "store", "ids": ["neo4j"], "count": 1})
-        self.assertEqual(event["criteria"], {"store": "neo4j", "exit_status": 0, "duration_s": 42})
+        self.assertEqual(event["target"], {"kind": "store", "ids": ["qdrant"], "count": 1})
+        self.assertEqual(event["criteria"], {"store": "qdrant", "exit_status": 0, "duration_s": 42})
         self.assertEqual(set(event), ENVELOPE | {"parent_event_id", "purpose", "target", "criteria"})
         self.assert_chains_intact()
 
@@ -445,7 +448,7 @@ class EndTest(Workspace):
     def test_shell_close_needs_its_opening(self) -> None:
         """No or a malformed opening id: exit 2, nothing written."""
         for opened in (None, "not-an-event-id"):
-            status, events = self.end(self.purposed(), "shell", "neo4j", opened=opened)
+            status, events = self.end(self.purposed(), "shell", "qdrant", opened=opened)
             self.assertEqual((status, events), (2, []), opened)
 
     def test_admin_ports_close_points_at_the_opening(self) -> None:
@@ -456,7 +459,7 @@ class EndTest(Workspace):
         (event,) = records(events)
         self.assertEqual((event["action"], event["operation"], event["outcome"]), ("admin", "db.ports.close", "ok"))
         self.assertEqual(event["parent_event_id"], opened)
-        self.assertEqual(event["target"], BOTH_STORES)
+        self.assertEqual(event["target"], PORTS_TARGET)
         self.assertEqual(event["criteria"], {"ports": LOOPBACK, "by": "up", "exit_status": 0, "duration_s": 600})
         self.assertNotIn("purpose", event)
         self.assert_chains_intact()
@@ -468,48 +471,46 @@ class EndTest(Workspace):
             status, events = self.end(self.environ(), "ports", None, *pairs, opened=opening)
             self.assertEqual((status, events), (2, []), pairs)
 
-    def test_neo4j_backup_is_a_disclosure_to_file_backup(self) -> None:
-        """The dump's name and size, its encryption, the database, the recipient."""
-        status, events = self.end(self.purposed(), "backup", "neo4j", f"file={DUMP}", "size_bytes=22430", *ENCRYPTED)
+    def test_backup_is_a_disclosure_to_file_backup(self) -> None:
+        """The collection snapshotted, the recipient, the purpose."""
+        facts = ["collection=docs", "snapshots=1", "size_bytes=22512", "failed=0", *ENCRYPTED]
+        status, events = self.end(self.purposed(), "backup", "qdrant", *facts)
         self.assertEqual(status, 0)
         (event,) = records(events)
-        self.assertEqual((event["action"], event["operation"], event["outcome"]), ("disclose", "backup.neo4j", "ok"))
+        self.assertEqual((event["action"], event["operation"], event["outcome"]), ("disclose", "backup.qdrant", "ok"))
         self.assertEqual(event["recipient"], "file:backup")
-        self.assertEqual(event["target"], {"kind": "database", "ids": ["neo4j"], "count": 1})
-        self.assertEqual(
-            event["criteria"],
-            {"file": DUMP, "size_bytes": 22430, **ENCRYPTED_CRITERIA, "exit_status": 0, "duration_s": 7},
-        )
+        self.assertEqual(event["target"], {"kind": "collection", "ids": ["docs"], "count": 1})
         self.assertEqual(event["purpose"], PURPOSE)
         self.assertNotIn("parent_event_id", event)
         self.assert_chains_intact()
 
     def test_backup_records_its_encryption(self) -> None:
         """The record names the encryption, how many recipients and their set's fingerprint; never a key."""
-        pairs = (f"file={DUMP}.age", "size_bytes=22512", *ENCRYPTED)
-        status, events = self.end(self.purposed(), "backup", "neo4j", *pairs)
+        facts = ["collection=docs", "snapshots=1", "size_bytes=4096", "failed=0", *ENCRYPTED]
+        status, events = self.end(self.purposed(), "backup", "qdrant", *facts)
         self.assertEqual(status, 0)
         (event,) = records(events)
         self.assertEqual(
             event["criteria"],
-            {"file": f"{DUMP}.age", "size_bytes": 22512, **ENCRYPTED_CRITERIA, "exit_status": 0, "duration_s": 7},
+            {
+                "snapshots": 1,
+                "size_bytes": 4096,
+                "failed": 0,
+                **ENCRYPTED_CRITERIA,
+                "exit_status": 0,
+                "duration_s": 7,
+            },
         )
-        facts = ["collection=docs", "snapshots=1", "size_bytes=4096", "failed=0", *ENCRYPTED]
-        _, events = self.end(self.purposed(), "backup", "qdrant", *facts)
-        (event,) = records(events)
-        self.assertEqual(event["criteria"]["recipients"], 2)
-        self.assertEqual(event["criteria"]["recipients_sha256"], FINGERPRINT)
         self.assertNotIn("age1", json.dumps(event))
         self.assert_chains_intact()
 
     def test_success_must_state_the_encryption(self) -> None:
         """An ok backup without its encryption facts, or an ok restore without its: exit 2, nothing written."""
         restore_qdrant = ("collection=docs", "snapshot=qdrant-docs-1.snapshot.age")
+        backup_qdrant = ("collection=docs", "snapshots=1", "size_bytes=1", "failed=0")
         for kind, store, pairs in (
-            ("backup", "neo4j", (f"file={DUMP}.age", "size_bytes=1")),
-            ("backup", "neo4j", (f"file={DUMP}.age", "encryption=age", "recipients=2")),
-            ("backup", "qdrant", ("collection=docs", "snapshots=1", "size_bytes=1", "failed=0")),
-            ("restore", "neo4j", (f"file={DUMP}.age", "size_bytes=1")),
+            ("backup", "qdrant", backup_qdrant),
+            ("backup", "qdrant", (*backup_qdrant, "encryption=age", "recipients=2")),
             ("restore", "qdrant", restore_qdrant),
         ):
             status, events = self.end(self.purposed(), kind, store, *pairs)
@@ -521,7 +522,7 @@ class EndTest(Workspace):
 
     def test_failed_backup_is_an_error(self) -> None:
         """A backup that failed is recorded with what is known."""
-        _, events = self.end(self.environ(), "backup", "neo4j", status=1, duration_s=None)
+        _, events = self.end(self.environ(), "backup", "qdrant", status=1, duration_s=None)
         (event,) = records(events)
         self.assertEqual(event["outcome"], "error")
         self.assertEqual(event["criteria"], {"exit_status": 1})
@@ -556,25 +557,13 @@ class EndTest(Workspace):
         self.assertEqual(ids, names)
         self.assert_chains_intact()
 
-    def test_neo4j_restore_is_a_modification(self) -> None:
-        """The dump loaded, by name and size; no recipient."""
-        pairs = (f"file={DUMP}.age", "size_bytes=22512", "encryption=age")
-        _, events = self.end(self.environ(), "restore", "neo4j", *pairs)
-        (event,) = records(events)
-        self.assertEqual((event["action"], event["operation"], event["outcome"]), ("modify", "restore.neo4j", "ok"))
-        self.assertEqual(event["target"], {"kind": "database", "ids": ["neo4j"], "count": 1})
-        self.assertEqual(
-            event["criteria"],
-            {"file": f"{DUMP}.age", "size_bytes": 22512, "encryption": "age", "exit_status": 0, "duration_s": 7},
-        )
-        self.assertNotIn("recipient", event)
-        self.assert_chains_intact()
-
     def test_qdrant_restore_names_its_collection(self) -> None:
-        """The collection replaced is the target; the snapshot and its encryption are criteria."""
+        """A modification: the collection replaced is the target; the snapshot and its encryption are criteria."""
         pairs = ["collection=docs", "snapshot=qdrant-docs-20260131T020000Z.snapshot.age", "encryption=age"]
         _, events = self.end(self.purposed(), "restore", "qdrant", *pairs)
         (event,) = records(events)
+        self.assertEqual((event["action"], event["operation"], event["outcome"]), ("modify", "restore.qdrant", "ok"))
+        self.assertNotIn("recipient", event)
         self.assertEqual(event["target"], {"kind": "collection", "ids": ["docs"], "count": 1})
         self.assertEqual(
             event["criteria"],
@@ -591,23 +580,23 @@ class EndTest(Workspace):
     def test_bad_arguments_write_nothing(self) -> None:
         """Unknown or malformed facts, missing parameters: exit 2, no event."""
         bad = [
-            ("restore", "neo4j", "size_bytes=10"),
-            ("backup", "neo4j", "size_bytes=ten"),
-            ("backup", "neo4j", "path=/srv/backup/neo4j.dump"),
-            ("backup", "neo4j", f"file={DUMP}", f"file={DUMP}"),
+            ("restore", "qdrant", "encryption=age"),
+            ("backup", "qdrant", "size_bytes=ten"),
+            ("backup", "qdrant", "path=/srv/backup/docs.snapshot.age"),
+            ("backup", "qdrant", "snapshots=1", "snapshots=1"),
             ("restore", "qdrant", "collection=docs", "snapshot=x.snapshot.age", "source=host"),
-            ("backup", "neo4j", "encryption=none"),
-            ("backup", "neo4j", "recipients=0"),
+            ("backup", "qdrant", "encryption=none"),
+            ("backup", "qdrant", "recipients=0"),
             ("backup", "qdrant", "recipients_sha256=0123"),
-            ("backup", "neo4j", "recipient=age1synthetic0recipient"),
-            ("restore", "neo4j", f"file={DUMP}", "encryption=gpg"),
-            ("restore", "neo4j", f"file={DUMP}", "recipients=2"),
+            ("backup", "qdrant", "recipient=age1synthetic0recipient"),
+            ("restore", "qdrant", "collection=docs", f"snapshot={SNAPSHOT}.age", "encryption=gpg"),
+            ("restore", "qdrant", "collection=docs", f"snapshot={SNAPSHOT}.age", "recipients=2"),
         ]
         for args in bad:
             status, events = self.end(self.purposed(), *args)
             self.assertEqual((status, events), (2, []), args)
         for status, duration_s in ((-1, 1), (0, -1)):
-            code, events = self.end(self.purposed(), "backup", "neo4j", status=status, duration_s=duration_s)
+            code, events = self.end(self.purposed(), "backup", "qdrant", status=status, duration_s=duration_s)
             self.assertEqual((code, events), (2, []))
 
     def test_unwritable_stream_fails_the_record(self) -> None:
@@ -620,10 +609,10 @@ class EndTest(Workspace):
             def write(self, s: str) -> int:
                 raise OSError("disk full")
 
-        code, events = self.end(self.purposed(AUDIT_OUTPUT="nowhere"), "backup", "neo4j", *ENCRYPTED)
+        code, events = self.end(self.purposed(AUDIT_OUTPUT="nowhere"), "backup", "qdrant", *ENCRYPTED)
         self.assertEqual((code, events), (1, []))
         with contextlib.redirect_stdout(Broken()), contextlib.redirect_stderr(self.stderr):
-            code = admin_audit.end(self.purposed(), "backup", "neo4j", list(ENCRYPTED), status=0)
+            code = admin_audit.end(self.purposed(), "backup", "qdrant", list(ENCRYPTED), status=0)
         self.assertEqual(code, 1)
         self.assertIn("could not write the record", self.stderr.getvalue())
 
@@ -636,11 +625,13 @@ class PruneRecordTest(Workspace):
 
     def test_prune_is_a_deletion_of_files(self) -> None:
         """The deleted files are the target, by name; the rule and the counts are criteria."""
-        names = [f"{DUMP}.age", "neo4j-20260130T020000Z.dump"]
-        status, events = self.end(self.environ(), "prune", "neo4j", *PRUNE_FACTS, *[f"file={n}" for n in names])
+        names = [f"{SNAPSHOT}.age", "qdrant-docs-20260130T020000Z.snapshot"]
+        status, events = self.end(self.environ(), "prune", "qdrant", *PRUNE_FACTS, *[f"file={n}" for n in names])
         self.assertEqual(status, 0)
         (event,) = records(events)
-        self.assertEqual((event["action"], event["operation"], event["outcome"]), ("delete", "backup.prune.neo4j", "ok"))
+        self.assertEqual(
+            (event["action"], event["operation"], event["outcome"]), ("delete", "backup.prune.qdrant", "ok")
+        )
         self.assertEqual(event["target"], {"kind": "file", "ids": names, "count": 2})
         self.assertEqual(
             event["criteria"],
@@ -678,35 +669,43 @@ class PruneRecordTest(Workspace):
         """An ok pruning without its period, cutoff or count is refused and writes nothing."""
         for missing in ("period_days", "cutoff", "deleted"):
             facts = [fact for fact in PRUNE_FACTS if not fact.startswith(f"{missing}=")]
-            status, events = self.end(self.environ(), "prune", "neo4j", *facts)
+            status, events = self.end(self.environ(), "prune", "qdrant", *facts)
             self.assertEqual((status, events), (2, []), missing)
 
     def test_malformed_facts_are_refused(self) -> None:
         """A path instead of a file name, or a cutoff that is not UTC, is never recorded."""
-        for bad in ("file=../neo4j.dump", "file=dir/neo4j.dump", "cutoff=2026-01-01", "cutoff=2026-01-01T02:00:00+01:00"):
-            status, events = self.end(self.environ(), "prune", "neo4j", *PRUNE_FACTS, bad)
+        bad_facts = (
+            "file=../docs.snapshot",
+            "file=dir/docs.snapshot",
+            "cutoff=2026-01-01",
+            "cutoff=2026-01-01T02:00:00+01:00",
+        )
+        for bad in bad_facts:
+            status, events = self.end(self.environ(), "prune", "qdrant", *PRUNE_FACTS, bad)
             self.assertEqual((status, events), (2, []), bad)
 
     def test_the_grace_and_the_period_in_force_are_recorded(self) -> None:
         """While a grace runs, the record states until when, and which period still deletes meanwhile."""
         grace = ("grace_until=2026-03-31T00:00:00Z", "in_force_days=30")
-        status, events = self.end(self.environ(), "prune", "neo4j", *PRUNE_FACTS, *grace)
+        status, events = self.end(self.environ(), "prune", "qdrant", *PRUNE_FACTS, *grace)
         self.assertEqual(status, 0)
         (event,) = records(events)
         criteria = event["criteria"]
         self.assertEqual((criteria["grace_until"], criteria["in_force_days"]), ("2026-03-31T00:00:00Z", 30))
         for bad in ("grace_until=2026-03-31", "in_force_days=0", "in_force_days=x"):
-            status, events = self.end(self.environ(), "prune", "neo4j", *PRUNE_FACTS, bad)
+            status, events = self.end(self.environ(), "prune", "qdrant", *PRUNE_FACTS, bad)
             self.assertEqual((status, events), (2, []), bad)
 
     def test_prune_follows_require_purpose(self) -> None:
         """Without delete in AUDIT_REQUIRE_PURPOSE a pruning needs no purpose; with it, it does."""
-        status, _, _ = self.begin(self.environ(AUDIT_REQUIRE_PURPOSE="query,disclose"), "prune", "neo4j")
+        status, _, _ = self.begin(self.environ(AUDIT_REQUIRE_PURPOSE="query,disclose"), "prune", "qdrant")
         self.assertEqual(status, 0)
-        status, _, events = self.begin(self.environ(AUDIT_REQUIRE_PURPOSE="delete"), "prune", "neo4j")
+        status, _, events = self.begin(self.environ(AUDIT_REQUIRE_PURPOSE="delete"), "prune", "qdrant")
         self.assertEqual(status, 2)
         (event,) = records(events)
-        self.assertEqual((event["action"], event["operation"], event["outcome"]), ("delete", "backup.prune.neo4j", "denied"))
+        self.assertEqual(
+            (event["action"], event["operation"], event["outcome"]), ("delete", "backup.prune.qdrant", "denied")
+        )
 
 
 class ServeTest(Workspace):
@@ -760,7 +759,7 @@ class ServeTest(Workspace):
 
     def test_verify(self) -> None:
         """Intact chains verify; an altered or removed line, or no events, fails."""
-        _, _, _ = self.begin(self.purposed(), "shell", "neo4j")
+        _, _, _ = self.begin(self.purposed(), "shell", "qdrant")
         log = ["2026-01-31 02:00:00,000 INFO admin-audit: ready", *self.streams[0].getvalue().splitlines()]
         out = io.StringIO()
         self.assertEqual(admin_audit.verify(log, out), 0)
@@ -801,22 +800,22 @@ class CommandLineTest(Workspace):
 
     def test_begin_and_end(self) -> None:
         """The opening's id printed by begin is taken back by end with --opened."""
-        status, events, other = self.run_main(self.purposed(), ["begin", "shell", "neo4j"])
+        status, events, other = self.run_main(self.purposed(), ["begin", "shell", "qdrant"])
         self.assertEqual(status, 0)
         self.assertEqual(other, [records(events)[0]["event_id"]])
-        argv = ["end", "shell", "neo4j", "--status", "0", "--duration-s", "5", "--opened", other[0]]
+        argv = ["end", "shell", "qdrant", "--status", "0", "--duration-s", "5", "--opened", other[0]]
         status, events, _ = self.run_main(self.purposed(), argv)
         self.assertEqual(status, 0)
         self.assertEqual(records(events)[0]["parent_event_id"], other[0])
         argv = [
             "end",
             "backup",
-            "neo4j",
+            "qdrant",
             "--status",
             "0",
             "--duration-s",
             "3",
-            f"file={DUMP}",
+            "collection=docs",
             "size_bytes=10",
             *ENCRYPTED,
         ]
@@ -836,7 +835,7 @@ class CommandLineTest(Workspace):
 
     def test_usage_errors_exit_2(self) -> None:
         """Unknown kinds and a missing status are usage errors."""
-        for argv in (["begin", "vacuum", "neo4j"], ["end", "backup", "neo4j"]):
+        for argv in (["begin", "vacuum", "qdrant"], ["end", "backup", "qdrant"]):
             with self.assertRaises(SystemExit) as raised:
                 self.run_main(self.purposed(), argv)
             self.assertEqual(raised.exception.code, 2)
@@ -961,14 +960,14 @@ class WrapperScriptTest(ComposeStandIn):
     def test_shell_session_is_recorded_open_and_close(self) -> None:
         """begin, the session, end: the close points at the opening; both by the sudo user."""
         status, calls, events, _ = self.run_wrapper(
-            "shell", "neo4j", "--", "sh", "-c", 'echo session >> "$FAKE_LOG"', CASE_REF="case-0001", REASON="review"
+            "shell", "qdrant", "--", "sh", "-c", 'echo session >> "$FAKE_LOG"', CASE_REF="case-0001", REASON="review"
         )
         self.assertEqual(status, 0)
         self.assertEqual(len(calls), 3)
         self.assertIn(" exec -T -e AUDIT_CLI_USER -e AUDIT_CASE_REF -e AUDIT_REASON admin-audit ", calls[0])
-        self.assertTrue(calls[0].endswith("admin_audit.py begin shell neo4j"), calls[0])
+        self.assertTrue(calls[0].endswith("admin_audit.py begin shell qdrant"), calls[0])
         self.assertEqual(calls[1], "session")
-        self.assertIn(" end shell neo4j --status 0 --duration-s ", calls[2])
+        self.assertIn(" end shell qdrant --status 0 --duration-s ", calls[2])
         opening, close = records(events)
         self.assertEqual(opening["operation"], "db.shell.open")
         self.assertEqual(close["operation"], "db.shell.close")
@@ -993,19 +992,19 @@ class WrapperScriptTest(ComposeStandIn):
     def test_nothing_runs_while_admin_audit_cannot_record(self) -> None:
         """admin-audit down: exit 1 before the command."""
         status, calls, events, stderr = self.run_wrapper(
-            "backup", "neo4j", "--", "sh", "-c", 'echo dump >> "$FAKE_LOG"', REASON="nightly backup", FAKE_DOWN="1"
+            "backup", "qdrant", "--", "sh", "-c", 'echo snapshot >> "$FAKE_LOG"', REASON="nightly backup", FAKE_DOWN="1"
         )
         self.assertEqual((status, len(calls), events), (1, 1, []))
         self.assertIn("Nothing was done", stderr)
 
     def test_reported_facts_reach_the_record(self) -> None:
         """What the command writes to AUDIT_FACTS is recorded; its status is passed on."""
-        command = f'printf "file={DUMP}\\nsize_bytes=2048\\n" >> "$AUDIT_FACTS"; exit 3'
-        status, _, events, _ = self.run_wrapper("backup", "neo4j", "--", "sh", "-c", command, REASON="nightly backup")
+        command = 'printf "collection=docs\\nsize_bytes=2048\\n" >> "$AUDIT_FACTS"; exit 3'
+        status, _, events, _ = self.run_wrapper("backup", "qdrant", "--", "sh", "-c", command, REASON="nightly backup")
         self.assertEqual(status, 3)
         (event,) = records(events)
-        self.assertEqual((event["operation"], event["outcome"]), ("backup.neo4j", "error"))
-        self.assertEqual(event["criteria"]["file"], DUMP)
+        self.assertEqual((event["operation"], event["outcome"]), ("backup.qdrant", "error"))
+        self.assertEqual(event["target"]["ids"], ["docs"])
         self.assertEqual(event["criteria"]["size_bytes"], 2048)
         self.assertEqual(event["criteria"]["exit_status"], 3)
         self.assertEqual(event["purpose"], {"reason": "nightly backup"})
@@ -1016,19 +1015,26 @@ class WrapperScriptTest(ComposeStandIn):
         """A restore's parameters are checked at begin and recorded at end."""
         status, calls, events, _ = self.run_wrapper(
             "restore",
-            "neo4j",
-            f"file={DUMP}",
+            "qdrant",
+            "collection=docs",
+            f"snapshot={SNAPSHOT}.age",
             "--",
             "sh",
             "-c",
-            'printf "size_bytes=10\\nencryption=age\\n" >> "$AUDIT_FACTS"',
+            'printf "encryption=age\\n" >> "$AUDIT_FACTS"',
         )
         self.assertEqual(status, 0)
-        self.assertTrue(calls[0].endswith(f"begin restore neo4j file={DUMP}"), calls[0])
+        self.assertTrue(calls[0].endswith(f"begin restore qdrant collection=docs snapshot={SNAPSHOT}.age"), calls[0])
         (event,) = records(events)
         self.assertEqual(
             event["criteria"],
-            {"file": DUMP, "size_bytes": 10, "encryption": "age", "exit_status": 0, "duration_s": 0},
+            {
+                "collection": "docs",
+                "snapshot": f"{SNAPSHOT}.age",
+                "encryption": "age",
+                "exit_status": 0,
+                "duration_s": 0,
+            },
         )
         self.assert_chains_intact()
 
@@ -1036,20 +1042,20 @@ class WrapperScriptTest(ComposeStandIn):
         """The records read no stdin, so a piped session gets all of it."""
         status, calls, _, _ = self.run_wrapper(
             "shell",
-            "neo4j",
+            "qdrant",
             "--",
             "sh",
             "-c",
             'cat >> "$FAKE_LOG"',
-            stdin="MATCH (n) RETURN count(n);\n",
+            stdin="qdrant GET /collections\n",
             REASON="count",
         )
         self.assertEqual(status, 0)
-        self.assertIn("MATCH (n) RETURN count(n);", calls)
+        self.assertIn("qdrant GET /collections", calls)
 
     def test_interrupted_operation_is_recorded(self) -> None:
         """An interrupt during the command is recorded as error, status 130."""
-        status, _, events, _ = self.run_wrapper("shell", "neo4j", "--", "sh", "-c", "kill -INT $PPID", REASON="review")
+        status, _, events, _ = self.run_wrapper("shell", "qdrant", "--", "sh", "-c", "kill -INT $PPID", REASON="review")
         self.assertEqual(status, 130)
         close = records(events)[-1]
         self.assertEqual((close["operation"], close["outcome"]), ("db.shell.close", "error"))
@@ -1067,7 +1073,7 @@ class WrapperScriptTest(ComposeStandIn):
 
     def test_usage(self) -> None:
         """Too few arguments or no command: exit 2, nothing called."""
-        for args in (("shell",), ("shell", "neo4j", "--"), ("shell", "neo4j", "true")):
+        for args in (("shell",), ("shell", "qdrant", "--"), ("shell", "qdrant", "true")):
             status, calls, _, _ = self.run_wrapper(*args)
             self.assertEqual((status, calls), (2, []), args)
 
@@ -1234,10 +1240,10 @@ class AgeStandIn(unittest.TestCase):
         return sorted(path.name for path in self.private.iterdir())
 
 
-# A stand-in for `docker compose` for the store scripts: logs every call and
-# plays the part of neo4j-admin and of the Qdrant container. FAKE_INTERRUPT
-# names a call that is interrupted like ^C: SIGINT to the whole process group.
-# FAKE_SWAP replaces the recipients file's content as Neo4j is stopped.
+# A stand-in for `docker compose` for scripts/qdrant_admin.sh: logs every call
+# and plays the part of the Qdrant container. FAKE_INTERRUPT names a call that
+# is interrupted like ^C: SIGINT to the whole process group. FAKE_SWAP replaces
+# the recipients file's content as the collections are listed.
 FAKE_STORE_COMPOSE = r"""#!/usr/bin/env bash
 call="$*"
 printf 'compose %s\n' "${call//$'\n'/\\n}" >> "$FAKE_LOG"
@@ -1249,18 +1255,6 @@ done
 last=${args[${#args[@]} - 1]}
 interrupt() { [[ ${FAKE_INTERRUPT:-} != "$1" ]] || kill -INT 0; }
 case " $* " in
-  *" stop neo4j "*)
-    [[ -z ${FAKE_SWAP:-} ]] || printf '%s\n' "$FAKE_SWAP" > "$BACKUP_RECIPIENTS"
-    exit "${FAKE_STOP:-0}" ;;
-  *" start neo4j "*) exit "${FAKE_START:-0}" ;;
-  *" run --rm -T --entrypoint neo4j-admin neo4j database dump neo4j --to-stdout "*)
-    printf 'DZV1 synthetic dump of Alice Example'
-    interrupt dump
-    exit "${FAKE_RUN:-0}" ;;
-  *" run --rm -T --entrypoint neo4j-admin neo4j database load "*)
-    cat > "${FAKE_LOG%/*}/loaded"
-    exit "${FAKE_LOAD:-0}" ;;
-  *" run --rm "*) exit "${FAKE_RUN:-0}" ;;
   *" sh -c command -v bash"*) exit "${FAKE_NO_BASH:-0}" ;;
   *"shopt -s globstar"*) echo "${FAKE_LEFTOVERS:-0}" ;;
   *" cat /qdrant/snapshots/"*)
@@ -1270,7 +1264,9 @@ case " $* " in
   *" sh -c "*"cat >"*) cat > "${FAKE_LOG%/*}/streamed" ;;
 esac
 case $api in
-  collections) printf '%b' "${FAKE_COLLECTIONS-docs\n}" ;;
+  collections)
+    [[ -z ${FAKE_SWAP:-} ]] || printf '%s\n' "$FAKE_SWAP" > "$BACKUP_RECIPIENTS"
+    printf '%b' "${FAKE_COLLECTIONS-docs\n}" ;;
   snapshot) [[ $last != "${FAKE_SNAPSHOT_FAIL:-}" ]] || exit 1; printf '%s-1-2026-11-04-02-00-00.snapshot\n' "$last" ;;
   drop-snapshot) exit "${FAKE_DROP:-0}" ;;
   recover) exit "${FAKE_RECOVER:-0}" ;;
@@ -1281,7 +1277,7 @@ exit 0
 
 @unittest.skipUnless(HAS_SCRIPTS, "needs bash and the repo's scripts/")
 class StoreScriptTest(AgeStandIn):
-    """scripts/neo4j_admin.sh and scripts/qdrant_admin.sh with a stand-in compose and age."""
+    """scripts/qdrant_admin.sh with a stand-in compose and age."""
 
     @override
     def setUp(self) -> None:
@@ -1300,7 +1296,7 @@ class StoreScriptTest(AgeStandIn):
         """Run a store script, in a process group of its own (as a terminal would).
 
         Args:
-            script: ``neo4j_admin.sh`` or ``qdrant_admin.sh``.
+            script: The store script, ``qdrant_admin.sh``.
             *args: Its arguments.
             **env: More environment.
 
@@ -1377,72 +1373,6 @@ class StoreScriptTest(AgeStandIn):
                 steps.append("leftovers" if "shopt -s globstar" in call else call)
         return steps
 
-    def test_dump_streams_through_age_into_the_backup_directory(self) -> None:
-        """Stopped, dumped to stdout, encrypted on the way, started again: one encrypted file, nothing else."""
-        status, calls, facts = self.run_script("neo4j_admin.sh", "dump")
-        self.assertEqual(status, 0, self.stderr)
-        self.assertEqual([call.split()[0] for call in calls], ["stop", "run", "start"])
-        self.assertEqual(calls[1], "run --rm -T --entrypoint neo4j-admin neo4j database dump neo4j --to-stdout")
-        ((name, content),) = self.backups().items()
-        self.assertRegex(name, r"^neo4j-\d{8}T\d{6}Z\.dump\.age$")
-        self.assertEqual(content, AGE_HEADER + b"DZV1 synthetic dump of Alice Example")
-        self.assertEqual(
-            self.age_calls(),
-            ["age -R <copy> -o /dev/null", f"age -R <copy> -o {self.backup_dir}/{name}.part"],
-        )
-        self.assertEqual(self.left_private(), [])
-        self.assertEqual(facts, [*self.encryption_facts(), f"file={name}", f"size_bytes={len(content)}"])
-        self.assertEqual((self.backup_dir / name).stat().st_mode & 0o777, 0o600)
-
-    def test_dump_refuses_without_recipients(self) -> None:
-        """No recipients file: refused before Neo4j is touched, saying how to make a key pair."""
-        for recipients in ("", str(self.tmp / "missing.txt")):
-            status, calls, facts = self.run_script("neo4j_admin.sh", "dump", BACKUP_RECIPIENTS=recipients)
-            self.assertEqual((status, calls, facts), (2, [], []), recipients)
-            self.assertIn("age-keygen -o", self.stderr)
-        self.assertEqual(self.backups(), {})
-
-    def test_failed_dump_still_starts_neo4j(self) -> None:
-        """A failing neo4j-admin never leaves Neo4j down; no file is kept or reported."""
-        status, calls, facts = self.run_script("neo4j_admin.sh", "dump", FAKE_RUN="1")
-        self.assertEqual(status, 1)
-        self.assertEqual([call.split()[0] for call in calls], ["stop", "run", "start"])
-        self.assertEqual(facts, self.encryption_facts())
-        self.assertEqual(self.backups(), {})
-        self.assertEqual(self.left_private(), [])
-
-    def test_failed_encryption_keeps_nothing(self) -> None:
-        """Age failing after it wrote part of the file leaves no file, not even the part."""
-        status, calls, facts = self.run_script("neo4j_admin.sh", "dump", FAKE_AGE_FAIL="encrypt")
-        self.assertEqual(status, 1)
-        self.assertEqual(calls[-1], "start neo4j")
-        self.assertEqual(self.backups(), {})
-        self.assertEqual(facts, self.encryption_facts())
-
-    def test_interrupted_dump_starts_neo4j_again(self) -> None:
-        """^C during the dump: the unfinished file goes, Neo4j starts again, exit 130."""
-        status, calls, _ = self.run_script("neo4j_admin.sh", "dump", FAKE_INTERRUPT="dump")
-        self.assertEqual(status, 130)
-        self.assertEqual([call.split()[0] for call in calls], ["stop", "run", "start"])
-        self.assertEqual(self.backups(), {})
-        self.assertEqual(self.left_private(), [])
-
-    def test_the_keys_checked_are_the_keys_encrypted_to(self) -> None:
-        """A recipients file changed after the check changes neither whom the dump is encrypted to nor its record."""
-        original = self.recipients.read_text(encoding="utf-8")
-        status, _, facts = self.run_script("neo4j_admin.sh", "dump", FAKE_SWAP=RECIPIENT_KEYS[0])
-        self.assertEqual(status, 0, self.stderr)
-        self.assertEqual(self.recipients.read_text(encoding="utf-8"), f"{RECIPIENT_KEYS[0]}\n")
-        self.assertEqual(self.age_read(), [original, original])
-        self.assertEqual(facts[:3], self.encryption_facts())
-        self.assertEqual(self.left_private(), [])
-
-    def test_nothing_runs_when_neo4j_cannot_be_stopped(self) -> None:
-        """No dump against a running database."""
-        status, calls, _ = self.run_script("neo4j_admin.sh", "dump", FAKE_STOP="1")
-        self.assertNotEqual(status, 0)
-        self.assertEqual([call.split()[0] for call in calls], ["stop"])
-
     def encrypted(self, name: str, plaintext: bytes) -> Path:
         """Put a backup encrypted by the stand-in into the backup directory.
 
@@ -1472,79 +1402,6 @@ class StoreScriptTest(AgeStandIn):
         path.write_text(f"# created offline\n{secret}\n", encoding="utf-8")
         return str(path)
 
-    def test_load_checks_the_whole_file_then_streams_it_in(self) -> None:
-        """Decrypted whole while Neo4j runs, then stopped, decrypted into neo4j-admin, started again."""
-        dump = self.encrypted(f"{DUMP}.age", b"DZV1 synthetic dump of Alice Example")
-        identity = self.identity()
-        status, calls, facts = self.run_script("neo4j_admin.sh", "load", dump.name, IDENTITY=identity)
-        self.assertEqual(status, 0, self.stderr)
-        self.assertEqual(self.age_calls(), [f"age -d -i {identity} {dump}"] * 2)
-        self.assertEqual(
-            calls,
-            [
-                "stop neo4j",
-                "run --rm -T --entrypoint neo4j-admin neo4j"
-                " database load neo4j --from-stdin --overwrite-destination=true",
-                "start neo4j",
-            ],
-        )
-        self.assertEqual((self.tmp / "loaded").read_bytes(), b"DZV1 synthetic dump of Alice Example")
-        self.assertEqual(facts, [f"size_bytes={dump.stat().st_size}", "encryption=age"])
-        self.assertEqual(sorted(path.name for path in self.backup_dir.iterdir()), [dump.name])
-
-    def test_load_refuses_before_anything_without_a_usable_identity_or_file(self) -> None:
-        """No identity, an unreadable one, a plaintext dump, a missing or odd name: exit 2, nothing run."""
-        dump = self.encrypted(f"{DUMP}.age", b"DZV1 synthetic dump")
-        (self.backup_dir / DUMP).write_bytes(b"DZV1 an earlier, unencrypted dump")
-        cases: list[tuple[str, dict[str, str]]] = [
-            (dump.name, {}),
-            (dump.name, {"IDENTITY": str(self.tmp / "missing.key")}),
-            (DUMP, {"IDENTITY": self.identity()}),
-            ("neo4j-20260101T000000Z.dump.age", {"IDENTITY": self.identity()}),
-            ("../neo4j.dump", {"IDENTITY": self.identity()}),
-            ("a:b.dump", {"IDENTITY": self.identity()}),
-        ]
-        for name, env in cases:
-            status, calls, _ = self.run_script("neo4j_admin.sh", "load", name, **env)
-            self.assertEqual((status, calls), (2, []), (name, env))
-        self.assertEqual(self.age_calls(), [])
-
-    def test_another_identity_never_stops_neo4j(self) -> None:
-        """The whole-file check fails: Neo4j keeps running untouched."""
-        dump = self.encrypted(f"{DUMP}.age", b"DZV1 synthetic dump")
-        status, calls, facts = self.run_script(
-            "neo4j_admin.sh", "load", dump.name, IDENTITY=self.identity("AGE-SECRET-KEY-1ZZOTHER")
-        )
-        self.assertEqual((status, calls), (1, []))
-        self.assertIn("does not decrypt with this identity", self.stderr)
-        self.assertIn("encryption=age", facts)
-
-    def test_a_file_that_holds_no_dump_never_stops_neo4j(self) -> None:
-        """An encrypted Qdrant snapshot given as a dump decrypts, but is refused before the stop."""
-        snapshot = self.encrypted("qdrant-docs-20260131T020000Z.snapshot.age", b"a tar archive, not a dump")
-        status, calls, _ = self.run_script("neo4j_admin.sh", "load", snapshot.name, IDENTITY=self.identity())
-        self.assertEqual((status, calls), (1, []))
-        self.assertIn("holds no Neo4j dump", self.stderr)
-
-    def test_a_decryption_that_fails_at_once_never_starts_the_load(self) -> None:
-        """The second decryption fails before any byte (a mistyped passphrase): neo4j-admin never runs."""
-        dump = self.encrypted(f"{DUMP}.age", b"DZV1 synthetic dump")
-        second_fails = {"FAKE_AGE_FAIL": "decrypt", "FAKE_AGE_FAIL_FROM": "2"}
-        status, calls, _ = self.run_script(
-            "neo4j_admin.sh", "load", dump.name, IDENTITY=self.identity(), **second_fails
-        )
-        self.assertEqual(status, 1)
-        self.assertEqual(calls, ["stop neo4j", "start neo4j"])
-        self.assertFalse((self.tmp / "loaded").exists())
-        self.assertIn("the database was not touched", self.stderr)
-
-    def test_a_failed_load_still_starts_neo4j(self) -> None:
-        """neo4j-admin failing never leaves Neo4j down."""
-        dump = self.encrypted(f"{DUMP}.age", b"DZV1 synthetic dump")
-        status, calls, _ = self.run_script("neo4j_admin.sh", "load", dump.name, IDENTITY=self.identity(), FAKE_LOAD="1")
-        self.assertEqual(status, 1)
-        self.assertEqual([call.split()[0] for call in calls], ["stop", "run", "start"])
-
     def test_snapshots_leave_the_volume_encrypted(self) -> None:
         """Per collection: snapshot, copy out through age, delete in the volume; a file and a fact each."""
         docs = "docs-1-2026-11-04-02-00-00.snapshot"
@@ -1572,6 +1429,8 @@ class StoreScriptTest(AgeStandIn):
         self.assertRegex(cases_file, r"^qdrant-case_files_2026-\d{8}T\d{6}Z\.snapshot\.age$")
         self.assertRegex(docs_file, r"^qdrant-docs-\d{8}T\d{6}Z\.snapshot\.age$")
         self.assertEqual(files[docs_file], AGE_HEADER + f"snapshot bytes of /qdrant/snapshots/docs/{docs}".encode())
+        for name in files:
+            self.assertEqual((self.backup_dir / name).stat().st_mode & 0o777, 0o600, name)
         total = sum(len(content) for content in files.values())
         self.assertEqual(
             facts,
@@ -1596,6 +1455,24 @@ class StoreScriptTest(AgeStandIn):
         self.assertTrue(name.startswith("qdrant-notes-"), name)
         size = len(self.backups()[name])
         self.assertEqual(facts[3:], ["collection=notes", "snapshots=1", f"size_bytes={size}", "failed=1"])
+
+    def test_failed_encryption_keeps_nothing(self) -> None:
+        """Age failing part-way leaves no file, not even the part; the snapshot still leaves the volume."""
+        status, calls, facts = self.run_script("qdrant_admin.sh", "snapshot", FAKE_AGE_FAIL="encrypt")
+        self.assertEqual(status, 1)
+        self.assertIn("api drop-snapshot docs docs-1-2026-11-04-02-00-00.snapshot", self.qdrant_steps(calls))
+        self.assertEqual(self.backups(), {})
+        self.assertEqual(facts, [*self.encryption_facts(), "snapshots=0", "size_bytes=0", "failed=1"])
+
+    def test_the_keys_checked_are_the_keys_encrypted_to(self) -> None:
+        """A recipients file changed after the check changes neither whom a snapshot is encrypted to nor its record."""
+        original = self.recipients.read_text(encoding="utf-8")
+        status, _, facts = self.run_script("qdrant_admin.sh", "snapshot", FAKE_SWAP=RECIPIENT_KEYS[0])
+        self.assertEqual(status, 0, self.stderr)
+        self.assertEqual(self.recipients.read_text(encoding="utf-8"), f"{RECIPIENT_KEYS[0]}\n")
+        self.assertEqual(self.age_read(), [original, original])
+        self.assertEqual(facts[:3], self.encryption_facts())
+        self.assertEqual(self.left_private(), [])
 
     def test_a_snapshot_left_in_the_volume_fails_the_backup(self) -> None:
         """A snapshot that cannot be deleted is an error, though its encrypted copy is kept."""
@@ -1625,12 +1502,12 @@ class StoreScriptTest(AgeStandIn):
     def test_unencrypted_leftovers_are_reported(self) -> None:
         """Plaintext an earlier version left, in the volume or the backup directory, is named, never touched."""
         self.backup_dir.mkdir()
-        (self.backup_dir / DUMP).write_bytes(b"an earlier, unencrypted dump")
+        (self.backup_dir / SNAPSHOT).write_bytes(b"an earlier, unencrypted snapshot")
         status, _, _ = self.run_script("qdrant_admin.sh", "snapshot", FAKE_LEFTOVERS="3")
         self.assertEqual(status, 0, self.stderr)
         self.assertIn("1 unencrypted backup file(s)", self.stderr)
         self.assertIn("3 unencrypted file(s) remain in the qdrant-snapshots volume", self.stderr)
-        self.assertTrue((self.backup_dir / DUMP).is_file())
+        self.assertTrue((self.backup_dir / SNAPSHOT).is_file())
 
     def test_recover_decrypts_into_the_volume_and_cleans_up(self) -> None:
         """Decrypted into a private .part, renamed, recovered from, then deleted from the volume."""
@@ -1794,7 +1671,7 @@ class BackupPruneTest(unittest.TestCase):
         """Run the pruning of one store.
 
         Args:
-            store: ``neo4j`` or ``qdrant``.
+            store: The store, ``qdrant``.
             days: ``BACKUP_RETENTION_DAYS``.
             now: The clock.
             notice: ``RETENTION_NOTICE_DAYS``; unset by default.
@@ -1835,12 +1712,12 @@ class BackupPruneTest(unittest.TestCase):
         return sorted(path.name for path in self.dir.iterdir() if path.name != ".prune-since")
 
     def test_old_backups_of_the_store_go(self) -> None:
-        """Older than the period: deleted and named; the other store's files and young ones stay."""
+        """Older than the period: deleted and named; young ones and files not named for the store stay."""
         self.since(400)
-        old, young = f"neo4j-{stamp(31)}.dump.age", f"neo4j-{stamp(29)}.dump.age"
-        other = f"qdrant-docs-{stamp(40)}.snapshot.age"
+        old, young = f"qdrant-docs-{stamp(31)}.snapshot.age", f"qdrant-docs-{stamp(29)}.snapshot.age"
+        other = f"docs-{stamp(40)}.snapshot.age"
         self.backups(old, young, other)
-        status, facts = self.prune("neo4j")
+        status, facts = self.prune("qdrant")
         self.assertEqual(status, 0, self.stderr)
         self.assertEqual(self.left(), sorted([young, other]))
         self.assertEqual(facts["file"], [old])
@@ -1863,56 +1740,58 @@ class BackupPruneTest(unittest.TestCase):
     def test_plaintext_leftovers_by_the_same_rule(self) -> None:
         """Unencrypted backups of earlier versions go once they are older than the period."""
         self.since(400)
-        self.backups(f"neo4j-{stamp(90)}.dump", f"neo4j-{stamp(2)}.dump")
-        status, facts = self.prune("neo4j")
+        self.backups(f"qdrant-docs-{stamp(90)}.snapshot", f"qdrant-docs-{stamp(2)}.snapshot")
+        status, facts = self.prune("qdrant")
         self.assertEqual(status, 0, self.stderr)
-        self.assertEqual(self.left(), [f"neo4j-{stamp(2)}.dump"])
-        self.assertEqual(facts["file"], [f"neo4j-{stamp(90)}.dump"])
+        self.assertEqual(self.left(), [f"qdrant-docs-{stamp(2)}.snapshot"])
+        self.assertEqual(facts["file"], [f"qdrant-docs-{stamp(90)}.snapshot"])
 
     def test_the_backup_just_written_never_goes(self) -> None:
         """Written now, even under the shortest period: kept."""
         self.since(400)
-        self.backups(f"neo4j-{stamp(0)}.dump.age")
-        status, facts = self.prune("neo4j", days="1")
-        self.assertEqual((status, self.left(), facts["deleted"]), (0, [f"neo4j-{stamp(0)}.dump.age"], ["0"]))
+        self.backups(f"qdrant-docs-{stamp(0)}.snapshot.age")
+        status, facts = self.prune("qdrant", days="1")
+        self.assertEqual((status, self.left(), facts["deleted"]), (0, [f"qdrant-docs-{stamp(0)}.snapshot.age"], ["0"]))
 
     def test_an_old_only_backup_still_goes(self) -> None:
         """No backup outlives the period, not even the last one left."""
         self.since(400)
-        self.backups(f"neo4j-{stamp(40)}.dump.age")
-        status, _ = self.prune("neo4j")
+        self.backups(f"qdrant-docs-{stamp(40)}.snapshot.age")
+        status, _ = self.prune("qdrant")
         self.assertEqual((status, self.left()), (0, []))
 
     def test_grace_on_first_run(self) -> None:
         """The first pruning records when it took effect and deletes nothing for one period."""
-        self.backups(f"neo4j-{stamp(100)}.dump.age")
-        status, facts = self.prune("neo4j")
-        self.assertEqual((status, self.left(), facts["deleted"]), (0, [f"neo4j-{stamp(100)}.dump.age"], ["0"]))
+        self.backups(f"qdrant-docs-{stamp(100)}.snapshot.age")
+        status, facts = self.prune("qdrant")
+        self.assertEqual(
+            (status, self.left(), facts["deleted"]), (0, [f"qdrant-docs-{stamp(100)}.snapshot.age"], ["0"])
+        )
         self.assertEqual(
             (self.dir / ".prune-since").read_text(encoding="utf-8").strip(), f"{PRUNE_NOW} 30 {PRUNE_NOW + 30 * DAY_S}"
         )
         self.assertEqual((self.dir / ".prune-since").stat().st_mode & 0o777, 0o644)
         self.assertIn("2026-03-31", self.stderr)
         self.assertEqual(facts["grace_until"], ["2026-03-31T00:00:00Z"])
-        status, _ = self.prune("neo4j", now=PRUNE_NOW + 29 * DAY_S)
+        status, _ = self.prune("qdrant", now=PRUNE_NOW + 29 * DAY_S)
         self.assertEqual(len(self.left()), 1)
         self.facts.unlink()
-        status, facts = self.prune("neo4j", now=PRUNE_NOW + 30 * DAY_S)
+        status, facts = self.prune("qdrant", now=PRUNE_NOW + 30 * DAY_S)
         self.assertEqual((status, self.left(), facts["deleted"][-1]), (0, [], "1"))
         self.assertNotIn("grace_until", facts)
 
     def test_the_grace_lasts_the_notice_period_not_the_retention_period(self) -> None:
         """A one-day retention still waits the notice period (RETENTION_NOTICE_DAYS, default 30) at first."""
-        self.backups(f"neo4j-{stamp(100)}.dump.age")
-        self.prune("neo4j", days="1")
-        self.prune("neo4j", days="1", now=PRUNE_NOW + 29 * DAY_S)
+        self.backups(f"qdrant-docs-{stamp(100)}.snapshot.age")
+        self.prune("qdrant", days="1")
+        self.prune("qdrant", days="1", now=PRUNE_NOW + 29 * DAY_S)
         self.assertEqual(len(self.left()), 1)
-        self.prune("neo4j", days="1", now=PRUNE_NOW + 30 * DAY_S)
+        self.prune("qdrant", days="1", now=PRUNE_NOW + 30 * DAY_S)
         self.assertEqual(self.left(), [])
         (self.dir / ".prune-since").unlink()
-        self.backups(f"neo4j-{stamp(100)}.dump.age")
-        self.prune("neo4j", days="1", notice="7")
-        status, _ = self.prune("neo4j", days="1", notice="7", now=PRUNE_NOW + 7 * DAY_S)
+        self.backups(f"qdrant-docs-{stamp(100)}.snapshot.age")
+        self.prune("qdrant", days="1", notice="7")
+        status, _ = self.prune("qdrant", days="1", notice="7", now=PRUNE_NOW + 7 * DAY_S)
         self.assertEqual((status, self.left()), (0, []))
 
     def state(self) -> str:
@@ -1926,93 +1805,93 @@ class BackupPruneTest(unittest.TestCase):
     def test_shortening_spares_only_what_falls_due_sooner(self) -> None:
         """A shorter period: what the period in force makes due still goes on time; nothing goes sooner."""
         self.since(400, days=30)
-        due, newly = f"neo4j-{stamp(40)}.dump.age", f"neo4j-{stamp(5)}.dump.age"
+        due, newly = f"qdrant-docs-{stamp(40)}.snapshot.age", f"qdrant-docs-{stamp(5)}.snapshot.age"
         self.backups(due, newly)
-        status, facts = self.prune("neo4j", days="7")
+        status, facts = self.prune("qdrant", days="7")
         self.assertEqual((status, self.left(), facts["file"]), (0, [newly], [due]))
         self.assertEqual(self.state(), f"{PRUNE_NOW} 7 {PRUNE_NOW + 30 * DAY_S} 30 {PRUNE_NOW - 370 * DAY_S}")
         self.assertEqual(facts["in_force_days"], ["30"])
         # 7 days alone would delete it on day 3; the 30 in force keep it until it is older than 30.
-        self.prune("neo4j", days="7", now=PRUNE_NOW + 25 * DAY_S)
+        self.prune("qdrant", days="7", now=PRUNE_NOW + 25 * DAY_S)
         self.assertEqual(self.left(), [newly])
-        self.prune("neo4j", days="7", now=PRUNE_NOW + 26 * DAY_S)
+        self.prune("qdrant", days="7", now=PRUNE_NOW + 26 * DAY_S)
         self.assertEqual(self.left(), [])
 
     def test_lengthening_takes_effect_at_once(self) -> None:
         """A longer period never pauses deletion: what is older than it goes now."""
         self.since(400, days=7)
-        old, young = f"neo4j-{stamp(40)}.dump.age", f"neo4j-{stamp(10)}.dump.age"
+        old, young = f"qdrant-docs-{stamp(40)}.snapshot.age", f"qdrant-docs-{stamp(10)}.snapshot.age"
         self.backups(old, young)
-        status, facts = self.prune("neo4j", days="30")
+        status, facts = self.prune("qdrant", days="30")
         self.assertEqual((status, self.left(), facts["file"]), (0, [young], [old]))
 
     def test_changing_back_and_forth_postpones_nothing(self) -> None:
         """30 → 29 → 30 within the notice period: what 30 days made due still goes on time."""
         self.since(400, days=30)
-        self.prune("neo4j", days="29")
-        name = f"neo4j-{stamp(31)}.dump.age"
+        self.prune("qdrant", days="29")
+        name = f"qdrant-docs-{stamp(31)}.snapshot.age"
         self.backups(name)
-        status, _ = self.prune("neo4j", days="30", now=PRUNE_NOW + DAY_S)
+        status, _ = self.prune("qdrant", days="30", now=PRUNE_NOW + DAY_S)
         self.assertEqual((status, self.left()), (0, []))
 
     def test_a_change_during_the_first_grace_keeps_its_announced_end(self) -> None:
         """Changing the period before the first grace ended never moves that end later."""
-        name = f"neo4j-{stamp(100)}.dump.age"
+        name = f"qdrant-docs-{stamp(100)}.snapshot.age"
         self.backups(name)
-        self.prune("neo4j")
-        self.prune("neo4j", days="7", now=PRUNE_NOW + 20 * DAY_S)
+        self.prune("qdrant")
+        self.prune("qdrant", days="7", now=PRUNE_NOW + 20 * DAY_S)
         self.assertEqual(
             self.state(), f"{PRUNE_NOW + 20 * DAY_S} 7 {PRUNE_NOW + 50 * DAY_S} 30 {PRUNE_NOW + 30 * DAY_S}"
         )
-        self.prune("neo4j", days="7", now=PRUNE_NOW + 29 * DAY_S)
+        self.prune("qdrant", days="7", now=PRUNE_NOW + 29 * DAY_S)
         self.assertEqual(self.left(), [name])
-        self.prune("neo4j", days="7", now=PRUNE_NOW + 30 * DAY_S)
+        self.prune("qdrant", days="7", now=PRUNE_NOW + 30 * DAY_S)
         self.assertEqual(self.left(), [])
 
     def test_raising_then_lowering_gives_the_notice(self) -> None:
         """7 → 30 → 7: the 30 days were in force, so a backup they keep gets the full notice."""
         self.since(400, days=7)
-        self.prune("neo4j", days="30")
-        name = f"neo4j-{stamp(-1)}.dump.age"
+        self.prune("qdrant", days="30")
+        name = f"qdrant-docs-{stamp(-1)}.snapshot.age"
         self.backups(name)
-        self.prune("neo4j", days="7", now=PRUNE_NOW + 10 * DAY_S)
+        self.prune("qdrant", days="7", now=PRUNE_NOW + 10 * DAY_S)
         self.assertEqual(self.left(), [name])
-        self.prune("neo4j", days="7", now=PRUNE_NOW + 31 * DAY_S)
+        self.prune("qdrant", days="7", now=PRUNE_NOW + 31 * DAY_S)
         self.assertEqual(self.left(), [name])
-        self.prune("neo4j", days="7", now=PRUNE_NOW + 41 * DAY_S)
+        self.prune("qdrant", days="7", now=PRUNE_NOW + 41 * DAY_S)
         self.assertEqual(self.left(), [])
 
     def test_a_lower_notice_never_ends_a_running_grace_sooner(self) -> None:
         """Changing the period and lowering the notice together keeps the grace already announced."""
-        name = f"neo4j-{stamp(100)}.dump.age"
+        name = f"qdrant-docs-{stamp(100)}.snapshot.age"
         self.backups(name)
-        self.prune("neo4j")
-        self.prune("neo4j", days="7", notice="7", now=PRUNE_NOW + DAY_S)
-        self.prune("neo4j", days="7", notice="7", now=PRUNE_NOW + 8 * DAY_S)
+        self.prune("qdrant")
+        self.prune("qdrant", days="7", notice="7", now=PRUNE_NOW + DAY_S)
+        self.prune("qdrant", days="7", notice="7", now=PRUNE_NOW + 8 * DAY_S)
         self.assertEqual(self.left(), [name])
-        self.prune("neo4j", days="7", notice="7", now=PRUNE_NOW + 30 * DAY_S)
+        self.prune("qdrant", days="7", notice="7", now=PRUNE_NOW + 30 * DAY_S)
         self.assertEqual(self.left(), [])
 
     def test_an_old_state_is_upgraded_so_the_notice_moves_nothing(self) -> None:
         """A state of the release before is rewritten with its grace end on the first run."""
         (self.dir / ".prune-since").write_text(f"{PRUNE_NOW - 5 * DAY_S} 30\n", encoding="utf-8")
-        name = f"neo4j-{stamp(100)}.dump.age"
+        name = f"qdrant-docs-{stamp(100)}.snapshot.age"
         self.backups(name)
-        self.prune("neo4j")
+        self.prune("qdrant")
         self.assertEqual(self.state(), f"{PRUNE_NOW - 5 * DAY_S} 30 {PRUNE_NOW + 25 * DAY_S}")
-        self.prune("neo4j", notice="1", now=PRUNE_NOW + 2 * DAY_S)
+        self.prune("qdrant", notice="1", now=PRUNE_NOW + 2 * DAY_S)
         self.assertEqual(self.left(), [name])
 
     def test_the_period_in_force_is_recorded_during_a_full_grace(self) -> None:
         """A change during the first grace records the period in force, even while nothing can go."""
-        self.prune("neo4j")
+        self.prune("qdrant")
         self.facts.unlink()
-        status, facts = self.prune("neo4j", days="7", now=PRUNE_NOW + DAY_S)
+        status, facts = self.prune("qdrant", days="7", now=PRUNE_NOW + DAY_S)
         self.assertEqual((status, facts["in_force_days"], facts["deleted"]), (0, ["30"], ["0"]))
 
     def test_a_state_with_impossible_values_is_refused(self) -> None:
         """Zero days, values beyond any clock, or a grace before its start delete nothing and record nothing."""
-        name = f"neo4j-{stamp(100)}.dump.age"
+        name = f"qdrant-docs-{stamp(100)}.snapshot.age"
         self.backups(name)
         for line in (
             f"{PRUNE_NOW - 400 * DAY_S} 0",
@@ -2022,52 +1901,52 @@ class BackupPruneTest(unittest.TestCase):
             f"{PRUNE_NOW - 40 * DAY_S} 30 {PRUNE_NOW} 7",
         ):
             (self.dir / ".prune-since").write_text(line + "\n", encoding="utf-8")
-            status, facts = self.prune("neo4j")
+            status, facts = self.prune("qdrant")
             self.assertEqual((status, facts, self.left()), (2, {}, [name]), line)
 
     def test_a_notice_change_alone_moves_nothing(self) -> None:
         """Lowering RETENTION_NOTICE_DAYS during the grace never ends the grace sooner than announced."""
-        name = f"neo4j-{stamp(100)}.dump.age"
+        name = f"qdrant-docs-{stamp(100)}.snapshot.age"
         self.backups(name)
-        self.prune("neo4j")
-        self.prune("neo4j", notice="7", now=PRUNE_NOW + 10 * DAY_S)
+        self.prune("qdrant")
+        self.prune("qdrant", notice="7", now=PRUNE_NOW + 10 * DAY_S)
         self.assertEqual(self.left(), [name])
         self.assertEqual(self.state(), f"{PRUNE_NOW} 30 {PRUNE_NOW + 30 * DAY_S}")
 
     def test_a_state_dated_in_the_future_restarts_the_grace(self) -> None:
         """A state file ahead of the clock never blocks pruning for long: warned, the grace starts now."""
         self.since(-100)
-        name = f"neo4j-{stamp(100)}.dump.age"
+        name = f"qdrant-docs-{stamp(100)}.snapshot.age"
         self.backups(name)
-        status, _ = self.prune("neo4j")
+        status, _ = self.prune("qdrant")
         self.assertEqual((status, self.left()), (0, [name]))
         self.assertIn("future", self.stderr)
         self.assertEqual(self.state(), f"{PRUNE_NOW} 30 {PRUNE_NOW + 30 * DAY_S}")
-        self.prune("neo4j", now=PRUNE_NOW + 30 * DAY_S)
+        self.prune("qdrant", now=PRUNE_NOW + 30 * DAY_S)
         self.assertEqual(self.left(), [])
 
     def test_a_clock_stepped_back_keeps_what_is_due(self) -> None:
         """A clock set back a few seconds after a change caps the state at now; it never restarts the grace."""
-        name = f"neo4j-{stamp(100)}.dump.age"
+        name = f"qdrant-docs-{stamp(100)}.snapshot.age"
         self.backups(name)
         (self.dir / ".prune-since").write_text(f"{PRUNE_NOW} 30 {PRUNE_NOW}\n", encoding="utf-8")
-        self.prune("neo4j", now=PRUNE_NOW - 5)
+        self.prune("qdrant", now=PRUNE_NOW - 5)
         self.assertIn("future", self.stderr)
         self.assertEqual(self.state(), f"{PRUNE_NOW - 5} 30 {PRUNE_NOW}")
-        self.prune("neo4j", now=PRUNE_NOW)
+        self.prune("qdrant", now=PRUNE_NOW)
         self.assertEqual(self.left(), [])
 
     def test_a_capped_state_keeps_the_period_in_force(self) -> None:
         """Capping a state dated in the future keeps the period still deleting meanwhile."""
         line = f"{PRUNE_NOW} 7 {PRUNE_NOW + 30 * DAY_S} 30 {PRUNE_NOW - 370 * DAY_S}"
         (self.dir / ".prune-since").write_text(line + "\n", encoding="utf-8")
-        self.prune("neo4j", days="7", now=PRUNE_NOW - 5)
+        self.prune("qdrant", days="7", now=PRUNE_NOW - 5)
         self.assertEqual(self.state(), f"{PRUNE_NOW - 5} 7 {PRUNE_NOW + 30 * DAY_S - 5} 30 {PRUNE_NOW - 370 * DAY_S}")
 
     def test_a_backup_another_pruning_removed_is_not_counted(self) -> None:
         """Two prunings at once: the file the other one deleted is neither named nor counted here."""
         self.since(400)
-        name = f"neo4j-{stamp(90)}.dump.age"
+        name = f"qdrant-docs-{stamp(90)}.snapshot.age"
         self.backups(name)
         stub = self.tmp / "bin"
         stub.mkdir()
@@ -2075,7 +1954,7 @@ class BackupPruneTest(unittest.TestCase):
         assert real_rm is not None
         (stub / "rm").write_text(f'#!/bin/sh\n{real_rm} -f "$(eval echo \\${{$#}})"\nexec {real_rm} "$@"\n')
         (stub / "rm").chmod(0o755)
-        status, facts = self.prune("neo4j", path_prefix=stub)
+        status, facts = self.prune("qdrant", path_prefix=stub)
         self.assertEqual((status, self.left()), (0, []))
         self.assertEqual(facts["deleted"], ["0"])
         self.assertNotIn("file", facts)
@@ -2084,19 +1963,19 @@ class BackupPruneTest(unittest.TestCase):
     def test_bad_notice_refuses(self) -> None:
         """RETENTION_NOTICE_DAYS takes whole days from 1 to 365 only."""
         self.since(400)
-        self.backups(f"neo4j-{stamp(90)}.dump.age")
+        self.backups(f"qdrant-docs-{stamp(90)}.snapshot.age")
         for notice in ("0", "366", "off"):
-            status, facts = self.prune("neo4j", notice=notice)
+            status, facts = self.prune("qdrant", notice=notice)
             self.assertEqual((status, facts), (2, {}), notice)
 
     @unittest.skipIf(os.geteuid() == 0, "root reads anything")
     def test_an_unreadable_state_says_so(self) -> None:
         """A state file this account cannot read refuses without telling anyone to delete it."""
         self.since(400)
-        self.backups(f"neo4j-{stamp(90)}.dump.age")
+        self.backups(f"qdrant-docs-{stamp(90)}.snapshot.age")
         (self.dir / ".prune-since").chmod(0)
         self.addCleanup((self.dir / ".prune-since").chmod, 0o644)
-        status, facts = self.prune("neo4j")
+        status, facts = self.prune("qdrant")
         self.assertEqual((status, facts), (2, {}))
         self.assertIn("cannot read", self.stderr)
         self.assertNotIn("Delete it", self.stderr)
@@ -2114,18 +1993,18 @@ class BackupPruneTest(unittest.TestCase):
 
     def test_a_damaged_state_is_refused(self) -> None:
         """A state file that holds no time refuses, deleting nothing."""
-        self.backups(f"neo4j-{stamp(100)}.dump.age")
+        self.backups(f"qdrant-docs-{stamp(100)}.snapshot.age")
         (self.dir / ".prune-since").write_text("yesterday\n", encoding="utf-8")
-        status, facts = self.prune("neo4j")
+        status, facts = self.prune("qdrant")
         self.assertEqual((status, facts), (2, {}))
         self.assertEqual(len(self.left()), 1)
 
     def test_part_files_and_unparsable_names_stay_and_are_named(self) -> None:
         """An unfinished file and a name without a stamp are never deleted; the operator is told."""
         self.since(400)
-        part, odd = f"neo4j-{stamp(90)}.dump.age.part", "neo4j-copy.dump.age"
+        part, odd = f"qdrant-docs-{stamp(90)}.snapshot.age.part", "qdrant-docs-copy.snapshot.age"
         self.backups(part, odd)
-        status, facts = self.prune("neo4j")
+        status, facts = self.prune("qdrant")
         self.assertEqual((status, self.left(), facts["deleted"]), (0, sorted([part, odd]), ["0"]))
         self.assertIn(part, self.stderr)
         self.assertIn(odd, self.stderr)
@@ -2133,9 +2012,9 @@ class BackupPruneTest(unittest.TestCase):
     def test_future_stamp_is_kept_with_a_warning(self) -> None:
         """A clock set back makes a backup look written later than now: kept, and said."""
         self.since(400)
-        name = f"neo4j-{stamp(-3)}.dump.age"
+        name = f"qdrant-docs-{stamp(-3)}.snapshot.age"
         self.backups(name)
-        status, _ = self.prune("neo4j")
+        status, _ = self.prune("qdrant")
         self.assertEqual((status, self.left()), (0, [name]))
         self.assertIn("future", self.stderr)
 
@@ -2143,11 +2022,11 @@ class BackupPruneTest(unittest.TestCase):
     def test_undeletable_file_is_reported_not_failed(self) -> None:
         """A file the account cannot delete is named, counted as not deleted, and the pruning succeeds."""
         self.since(400)
-        name = f"neo4j-{stamp(90)}.dump"
+        name = f"qdrant-docs-{stamp(90)}.snapshot"
         self.backups(name)
         self.dir.chmod(0o555)
         self.addCleanup(self.dir.chmod, 0o755)
-        status, facts = self.prune("neo4j")
+        status, facts = self.prune("qdrant")
         self.assertEqual(status, 0, self.stderr)
         self.assertEqual((facts["deleted"], facts["not_deleted"]), (["0"], ["1"]))
         self.assertNotIn("file", facts)
@@ -2156,9 +2035,9 @@ class BackupPruneTest(unittest.TestCase):
     def test_bad_period_refuses(self) -> None:
         """Only whole days from 1 to 365: anything else refuses before anything is deleted."""
         self.since(400)
-        self.backups(f"neo4j-{stamp(90)}.dump.age")
+        self.backups(f"qdrant-docs-{stamp(90)}.snapshot.age")
         for days in ("0", "366", "abc", "", "30d"):
-            status, facts = self.prune("neo4j", days=days)
+            status, facts = self.prune("qdrant", days=days)
             self.assertEqual((status, facts), (2, {}), days)
         self.assertEqual(len(self.left()), 1)
 
@@ -2177,7 +2056,7 @@ class BackupPruneTest(unittest.TestCase):
 
     def test_usage(self) -> None:
         """An unknown store or a missing argument: exit 2."""
-        for args in ((), ("chorus",), ("neo4j", "--now"), ("check", "neo4j")):
+        for args in ((), ("chorus",), ("qdrant", "--now"), ("check", "qdrant")):
             result = subprocess.run(
                 ["bash", str(SCRIPTS / "backup_prune.sh"), *args],
                 env={"PATH": os.environ["PATH"], "BACKUP_RETENTION_DAYS": "30", "BACKUP_DIR": str(self.dir)},
@@ -2444,10 +2323,10 @@ class BackupAgeTest(AgeStandIn):
         )
 
     def test_unencrypted_backups_are_warned_about(self) -> None:
-        """Dumps and snapshots without .age in the backup directory: counted, left alone."""
+        """Snapshots without .age in the backup directory: counted, left alone."""
         backups = self.tmp / "snapshots"
         backups.mkdir()
-        for name in (DUMP, "docs-1.snapshot", f"{DUMP}.age", "qdrant-docs-1.snapshot.age.part"):
+        for name in (SNAPSHOT, "docs-1.snapshot", f"{SNAPSHOT}.age", "qdrant-docs-1.snapshot.age.part"):
             (backups / name).write_bytes(b"x")
         result = self.sourced('warn_plaintext "$1"', str(backups))
         self.assertEqual(result.returncode, 0)
@@ -2460,9 +2339,9 @@ class BackupAgeTest(AgeStandIn):
         identity = self.tmp / "backup-identity.txt"
         identity.write_text(f"{AGE_SECRET}\n", encoding="utf-8")
         files = {
-            "binary": AGE_HEADER + b"DZV1",
+            "binary": AGE_HEADER + b"synthetic snapshot tar",
             "armored": b"-----BEGIN AGE ENCRYPTED FILE-----\r\nYWdl\r\n-----END AGE ENCRYPTED FILE-----\r\n",
-            "plaintext": b"DZV1 an earlier, unencrypted dump",
+            "plaintext": b"an earlier, unencrypted snapshot",
         }
         for name, content in files.items():
             (self.tmp / name).write_bytes(content)
@@ -2545,7 +2424,7 @@ class MakefileTest(AgeStandIn):
 
     def test_a_backup_that_cannot_be_encrypted_does_nothing(self) -> None:
         """No recipients file: every backup target refuses before admin-audit or a store is asked."""
-        for target in ("backup", "backup-neo4j", "backup-qdrant"):
+        for target in ("backup", "backup-qdrant"):
             result, calls = self.make(target, f"BACKUP_RECIPIENTS={self.tmp / 'missing.txt'}", "REASON=zz backup")
             self.assertNotEqual(result.returncode, 0, target)
             self.assertEqual(calls, [], target)
@@ -2554,19 +2433,20 @@ class MakefileTest(AgeStandIn):
         self.assertFalse(self.backup_dir.exists())
 
     def test_a_backup_carries_its_recipients_to_the_record(self) -> None:
-        """BACKUP_RECIPIENTS reaches the dump, and the encryption facts reach admin-audit's record."""
-        result, calls = self.make("backup-neo4j", f"BACKUP_RECIPIENTS={self.recipients}", "REASON=zz backup")
+        """BACKUP_RECIPIENTS reaches the snapshot, and the encryption facts reach admin-audit's record."""
+        result, calls = self.make("backup-qdrant", f"BACKUP_RECIPIENTS={self.recipients}", "REASON=zz backup")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertTrue(calls[0].endswith("admin_audit.py begin backup neo4j"), calls[0])
-        self.assertEqual([call.split()[0] for call in calls[1:4]], ["stop", "run", "start"])
+        self.assertTrue(calls[0].endswith("admin_audit.py begin backup qdrant"), calls[0])
+        self.assertEqual(self.age_read(), [self.recipients.read_text(encoding="utf-8")] * 3)
         (name,) = [entry for entry in os.listdir(self.backup_dir) if entry != ".prune-since"]
-        record = f"{calls[4]} "
-        self.assertIn(" end backup neo4j --status 0 ", record)
-        fingerprint = recipients_fingerprint(RECIPIENT_KEYS)
-        self.assertIn(f" encryption=age recipients=2 recipients_sha256={fingerprint} file={name} ", record)
+        size = (self.backup_dir / name).stat().st_size
+        record = f"{calls[7]} "
+        self.assertIn(" end backup qdrant --status 0 ", record)
+        encryption = f"encryption=age recipients=2 recipients_sha256={recipients_fingerprint(RECIPIENT_KEYS)}"
+        self.assertIn(f" {encryption} collection=docs snapshots=1 size_bytes={size} ", record)
 
     def old_backup(self) -> str:
-        """Put a Neo4j backup older than the default period in place, past the grace period.
+        """Put a Qdrant backup older than the default period in place, past the grace period.
 
         Returns:
             Its name.
@@ -2574,19 +2454,19 @@ class MakefileTest(AgeStandIn):
         self.backup_dir.mkdir(exist_ok=True)
         now = int(time.time())
         (self.backup_dir / ".prune-since").write_text(f"{now - 400 * DAY_S} 30\n", encoding="utf-8")
-        name = f"neo4j-{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime(now - 40 * DAY_S))}.dump.age"
+        name = f"qdrant-docs-{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime(now - 40 * DAY_S))}.snapshot.age"
         (self.backup_dir / name).write_bytes(AGE_HEADER + b"old")
         return name
 
     def test_a_backup_prunes_after_it_succeeded(self) -> None:
         """The backup is recorded first, then the pruning, as a deletion of the old file."""
         old = self.old_backup()
-        result, calls = self.make("backup-neo4j", f"BACKUP_RECIPIENTS={self.recipients}", "REASON=zz backup")
+        result, calls = self.make("backup-qdrant", f"BACKUP_RECIPIENTS={self.recipients}", "REASON=zz backup")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn(" end backup neo4j --status 0 ", f"{calls[4]} ")
-        self.assertTrue(calls[5].endswith("admin_audit.py begin prune neo4j"), calls[5])
-        record = f"{calls[6]} "
-        self.assertIn(" end prune neo4j --status 0 ", record)
+        self.assertIn(" end backup qdrant --status 0 ", f"{calls[7]} ")
+        self.assertTrue(calls[8].endswith("admin_audit.py begin prune qdrant"), calls[8])
+        record = f"{calls[9]} "
+        self.assertIn(" end prune qdrant --status 0 ", record)
         self.assertIn(" period_days=30 ", record)
         self.assertIn(" deleted=1 ", record)
         self.assertIn(f" file={old} ", record)
@@ -2597,54 +2477,55 @@ class MakefileTest(AgeStandIn):
         """When the backup fails, nothing is pruned: the old backup stays the newest restore point."""
         old = self.old_backup()
         result, calls = self.make(
-            "backup-neo4j", f"BACKUP_RECIPIENTS={self.recipients}", "REASON=zz backup", env={"FAKE_RUN": "1"}
+            "backup-qdrant",
+            f"BACKUP_RECIPIENTS={self.recipients}",
+            "REASON=zz backup",
+            env={"FAKE_SNAPSHOT_FAIL": "docs"},
         )
         self.assertNotEqual(result.returncode, 0)
         self.assertFalse(any(" prune " in f" {call} " for call in calls), calls)
         self.assertTrue((self.backup_dir / old).exists())
 
     def test_backup_prune_target(self) -> None:
-        """make backup-prune prunes both stores, each recorded, without a backup."""
+        """The backup-prune target prunes, recorded, without a backup."""
         old = self.old_backup()
         result, calls = self.make("backup-prune")
         self.assertEqual(result.returncode, 0, result.stderr)
         begins = [call.rsplit("admin_audit.py ", 1)[1] for call in calls if " begin " in call]
-        self.assertEqual(begins, ["begin prune neo4j", "begin prune qdrant"])
+        self.assertEqual(begins, ["begin prune qdrant"])
         self.assertFalse((self.backup_dir / old).exists())
 
     def test_a_bad_period_refuses_the_backup_before_anything(self) -> None:
         """BACKUP_RETENTION_DAYS out of range: no store and no admin-audit call."""
-        for target in ("backup-neo4j", "backup-qdrant", "backup-prune"):
+        for target in ("backup", "backup-qdrant", "backup-prune"):
             result, calls = self.make(target, f"BACKUP_RECIPIENTS={self.recipients}", "BACKUP_RETENTION_DAYS=400")
             self.assertNotEqual(result.returncode, 0, target)
             self.assertEqual(calls, [], target)
             self.assertIn("BACKUP_RETENTION_DAYS", result.stderr)
 
     def restorable(self) -> str:
-        """Put an encrypted dump, an earlier plaintext one and an encrypted snapshot in place, and an identity.
+        """Put an encrypted snapshot and an earlier plaintext one in place, and an identity.
 
         Returns:
             The identity file's path.
         """
         self.backup_dir.mkdir()
-        (self.backup_dir / f"{DUMP}.age").write_bytes(AGE_HEADER + b"DZV1 synthetic dump")
-        (self.backup_dir / DUMP).write_bytes(b"DZV1 an earlier, unencrypted dump")
-        (self.backup_dir / "qdrant-docs-1.snapshot.age").write_bytes(AGE_HEADER + b"synthetic snapshot tar")
+        (self.backup_dir / f"{SNAPSHOT}.age").write_bytes(AGE_HEADER + b"synthetic snapshot tar")
+        (self.backup_dir / SNAPSHOT).write_bytes(b"an earlier, unencrypted snapshot")
         identity = self.tmp / "offline" / "backup-identity.txt"
         identity.parent.mkdir()
         identity.write_text(f"{AGE_SECRET}\n", encoding="utf-8")
         return str(identity)
 
     def test_a_restore_without_a_usable_identity_asks_nothing(self) -> None:
-        """No IDENTITY, or a plaintext dump: refused before the confirmation; nothing is called."""
+        """No IDENTITY, or a plaintext snapshot: refused before the confirmation; nothing is called."""
         identity = self.restorable()
         cases = [
-            ("restore-neo4j", f"DUMP={DUMP}.age"),
-            ("restore-neo4j", f"DUMP={DUMP}", f"IDENTITY={identity}"),
-            ("restore-qdrant", "COLLECTION=docs", "SNAPSHOT=qdrant-docs-1.snapshot.age"),
+            ("COLLECTION=docs", f"SNAPSHOT={SNAPSHOT}.age"),
+            ("COLLECTION=docs", f"SNAPSHOT={SNAPSHOT}", f"IDENTITY={identity}"),
         ]
-        for target, *args in cases:
-            result, calls = self.make(target, *args, stdin="restore\n")
+        for args in cases:
+            result, calls = self.make("restore-qdrant", *args, stdin="restore\n")
             self.assertNotEqual(result.returncode, 0, args)
             self.assertEqual(calls, [], args)
             self.assertNotIn("REPLACES", result.stdout, args)
@@ -2653,14 +2534,15 @@ class MakefileTest(AgeStandIn):
     def test_a_restore_decrypts_with_the_identity_of_the_run(self) -> None:
         """Confirmed, then recorded at both ends; the identity's path reaches no record."""
         identity = self.restorable()
-        result, calls = self.make("restore-neo4j", f"DUMP={DUMP}.age", f"IDENTITY={identity}", stdin="restore\n")
+        args = ("COLLECTION=docs", f"SNAPSHOT={SNAPSHOT}.age", f"IDENTITY={identity}")
+        result, calls = self.make("restore-qdrant", *args, stdin="restore\n")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertTrue(calls[0].endswith(f"admin_audit.py begin restore neo4j file={DUMP}.age"), calls[0])
-        self.assertEqual([call.split()[0] for call in calls[1:4]], ["stop", "run", "start"])
-        self.assertIn(" end restore neo4j --status 0 ", calls[4])
-        self.assertTrue(calls[4].endswith(" encryption=age"), calls[4])
+        begin = f"admin_audit.py begin restore qdrant collection=docs snapshot={SNAPSHOT}.age"
+        self.assertTrue(calls[0].endswith(begin), calls[0])
+        self.assertIn(" end restore qdrant --status 0 ", calls[-1])
+        self.assertTrue(calls[-1].endswith(" encryption=age"), calls[-1])
         self.assertNotIn("offline", "".join(calls))
-        self.assertEqual(self.age_calls(), [f"age -d -i {identity} {self.backup_dir}/{DUMP}.age"] * 2)
+        self.assertEqual(self.age_calls(), [f"age -d -i {identity} {self.backup_dir}/{SNAPSHOT}.age"])
 
 
 @unittest.skipUnless(ADMIN_OVERLAY.is_file(), "needs the repo's docker/")
@@ -2715,7 +2597,7 @@ class AdminPortsTest(ComposeStandIn):
             The open event's id.
         """
         status, _, events, stderr, _ = self.run_ports(
-            "open", "--", "sh", "-c", 'echo publish >> "$FAKE_LOG"', REASON="inspect the graph schema", **env
+            "open", "--", "sh", "-c", 'echo publish >> "$FAKE_LOG"', REASON="inspect a collection", **env
         )
         self.assertEqual(status, 0, stderr)
         return str(records(events)[-1]["event_id"])
@@ -2737,7 +2619,7 @@ class AdminPortsTest(ComposeStandIn):
         self.assertEqual(calls[1], "publish")
         (event,) = records(events)
         self.assertEqual((event["operation"], event["outcome"], event["event_id"]), ("db.ports.open", "ok", opened))
-        self.assertEqual(event["purpose"], {"reason": "inspect the graph schema"})
+        self.assertEqual(event["purpose"], {"reason": "inspect a collection"})
         self.assertEqual(event["actor"], OPERATOR)
         self.assertRegex(self.state.read_text(encoding="utf-8"), rf"\Aopened={opened}\nopened_at=\d+\n\Z")
         self.assertEqual(self.state.stat().st_mode & 0o777, 0o600)
@@ -2785,7 +2667,7 @@ class AdminPortsTest(ComposeStandIn):
     def test_a_failed_opening_with_ports_up_stays_open(self) -> None:
         """Some port is published after all: the window stays for make up to close."""
         status, _, events, _, _ = self.run_ports(
-            "open", "--", "sh", "-c", "exit 3", REASON="inspect", FAKE_PUBLISHED="127.0.0.1:7474 \n"
+            "open", "--", "sh", "-c", "exit 3", REASON="inspect", FAKE_PUBLISHED="127.0.0.1:6333 \n"
         )
         self.assertEqual(status, 3)
         self.assertEqual([event["operation"] for event in records(events)], ["db.ports.open"])
@@ -2834,16 +2716,13 @@ class AdminPortsTest(ComposeStandIn):
 
     def test_status(self) -> None:
         """The line make health prints: closed, open, open without a record, or a close still owed."""
-        published = "127.0.0.1:7474 127.0.0.1:7687 \n127.0.0.1:6333 \n"
+        dev = "0.0.0.0:6334 0.0.0.0:6333 \n\n"
         self.assertEqual(self.run_ports("status")[4], "admin ports: closed\n")
-        self.assertIn("without an open record", self.run_ports("status", FAKE_PUBLISHED=published)[4])
+        out = self.run_ports("status", FAKE_PUBLISHED=dev)[4]
+        self.assertIn("OPEN (0.0.0.0:6333 0.0.0.0:6334) without an open record", out)
         self.write_state("01a1a557-d62a-71a3-b278-0d559f15c636", 1_800_000_000)
-        out = self.run_ports("status", FAKE_PUBLISHED=published)[4]
-        self.assertEqual(
-            out,
-            "admin ports: OPEN since 2027-01-15T08:00:00Z (127.0.0.1:6333 127.0.0.1:7474 127.0.0.1:7687); "
-            "make up closes them\n",
-        )
+        out = self.run_ports("status", FAKE_PUBLISHED="127.0.0.1:6333 \n\n")[4]
+        self.assertEqual(out, "admin ports: OPEN since 2027-01-15T08:00:00Z (127.0.0.1:6333); make up closes them\n")
         self.assertIn("no close record yet", self.run_ports("status")[4])
 
     def test_a_damaged_state_is_refused(self) -> None:

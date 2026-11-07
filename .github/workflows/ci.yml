@@ -19,9 +19,9 @@ jobs:
     # and bundle-lib drift-checks.
     #
     # compose-files is deliberately omitted: the reusable workflow's
-    # compose-config job stubs only NEO4J_PASSWORD and OPENAI_API_KEY, not
-    # this repo's required QDRANT_API_KEY, so it would fail `docker compose
-    # config` here. compose-config below validates the files instead.
+    # compose-config job does not stub this repo's required QDRANT_API_KEY,
+    # so it would fail `docker compose config` here. compose-config below
+    # validates the files instead.
     uses: nos-tromo/.github/.github/workflows/infra-validation.yml@2715bedabe594a449e411182393e68da59c791f3 # v3.22
     with:
       dockerfiles-glob: 'docker/Dockerfile.*'

@@ -6,7 +6,7 @@
 # the recipients file BACKUP_RECIPIENTS (make's default: backup/recipients.txt):
 # one public key per line, # comments allowed. Only public keys belong on this
 # host; the identity that decrypts stays offline. Plaintext never reaches a
-# file on the host: the dumps and snapshots stream through age.
+# file on the host: the snapshots stream through age.
 #
 # The recipients file decides who can read every backup, so only root and the
 # account running the backup may be able to change it: the file and every
@@ -27,10 +27,10 @@
 # Both exit 2 otherwise, saying what to do. make runs them before a backup or
 # a restore asks admin-audit (or the operator) for anything.
 #
-# scripts/neo4j_admin.sh and scripts/qdrant_admin.sh source this file for the
-# same checks (age_recipients, age_identity), for the facts of the audit
-# record (age_facts: the encryption, how many distinct public keys, and the
-# SHA-256 of that set, never a key) and for the backup directory.
+# scripts/qdrant_admin.sh sources this file for the same checks
+# (age_recipients, age_identity), for the facts of the audit record
+# (age_facts: the encryption, how many distinct public keys, and the SHA-256
+# of that set, never a key) and for the backup directory.
 
 # Set by age_recipients: the private copy of the recipients that age is to
 # encrypt to, how many distinct public keys it holds, and the SHA-256 of their
@@ -269,10 +269,10 @@ file_size() {
   stat -c %s "$1" 2>/dev/null || stat -f %z "$1" 2>/dev/null
 }
 
-# warn_plaintext DIR: warn about backups an earlier version left unencrypted in DIR.
+# warn_plaintext DIR: warn about snapshots an earlier version left unencrypted in DIR.
 warn_plaintext() {
   local file count=0
-  for file in "$1"/*.dump "$1"/*.snapshot; do
+  for file in "$1"/*.snapshot; do
     if [[ -e $file ]]; then
       count=$((count + 1))
     fi
