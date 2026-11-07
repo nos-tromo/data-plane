@@ -1,19 +1,18 @@
 # Backup + restore runbook
 
-Backups for the two stateful services this project owns.
+Backups for Qdrant, the stateful service this project owns.
 
 Every backup is encrypted with [age](https://age-encryption.org) on its way
 out of the store, to the public keys in a recipients file. The identity that
 decrypts stays offline; a restore takes it for that run only. No unencrypted
-dump or snapshot rests on the host: the Neo4j dump streams from `neo4j-admin`
-through age, each Qdrant snapshot is streamed out of the container through age
-and deleted from Qdrant's volume at once, and a restore decrypts straight into
-the store, never to a file.
+snapshot rests on the host: each snapshot is streamed out of the Qdrant
+container through age and deleted from Qdrant's volume at once, and a restore
+decrypts straight into the store, never to a file.
 
 Every backup and restore target is recorded in the data-protection audit
 trail by `admin-audit` (README § Audit trail): a backup as `disclose` /
-`backup.<store>` to `file:backup`, with its encryption and how many public
-keys can read it, a restore as `modify` / `restore.<store>`. They refuse to
+`backup.qdrant` to `file:backup`, with its encryption and how many public
+keys can read it, a restore as `modify` / `restore.qdrant`. They refuse to
 run while admin-audit cannot record them (start it with `make up`). Under the
 default `AUDIT_REQUIRE_PURPOSE` a backup also needs a stated purpose; a
 scheduled one passes a fixed reason ([Scheduling](#scheduling)).
@@ -109,7 +108,6 @@ backup/
   README.md            this file
   recipients.txt       the public keys backups are encrypted to (operator-provided, gitignored)
   snapshots/           the encrypted backups (gitignored; created on demand)
-    neo4j-<ISO8601-utc>.dump.age
     qdrant-<collection>-<ISO8601-utc>.snapshot.age
     .prune-since         when pruning took effect on this host (Retention, below)
 ```
@@ -117,85 +115,9 @@ backup/
 The files belong to whoever ran the backup, mode `0600`. Copy `snapshots/`
 off-host as soon as the backup finishes: this directory is *staging*, not
 durable storage. The copies stay encrypted; keep the identity apart from them.
-Every backup deletes the store's backups older than the retention period
+Every backup deletes the backups older than the retention period
 afterwards ([Retention](#retention)); the off-host copies are pruned at the
 same age by the operator.
-
-## Neo4j (community edition)
-
-Community edition has **no online backup**. The supported path is an
-offline `neo4j-admin database dump` while the service is stopped.
-
-### Backup
-
-```bash
-make backup-neo4j REASON="scheduled backup"
-# checks the recipients file, then runs scripts/neo4j_admin.sh dump through scripts/audit-admin.sh:
-#   docker compose stop neo4j
-#   docker compose run --rm -T --entrypoint neo4j-admin neo4j \
-#     database dump neo4j --to-stdout \
-#     | age -R backup/recipients.txt -o backup/snapshots/neo4j-<ISO8601-utc>.dump.age.part
-#   mv ….dump.age.part ….dump.age       # only when neo4j-admin and age both succeeded
-#   docker compose start neo4j          # also when the dump failed or was interrupted
-# records disclose / backup.neo4j with the file's name and size, encryption: age and the recipients
-```
-
-Downtime: around 20 seconds for a small graph (a clean stop alone takes
-about 10 s), growing roughly linearly with dataset size. Schedule it during the maintenance window
-chorus already publishes for retention sweeps.
-
-The dump needs Neo4j to have shut down cleanly. That is why its container
-keeps `CAP_KILL`: without it tini cannot pass `docker stop`'s SIGTERM on to
-the server, the server is killed, and `neo4j-admin` refuses the store
-("Active logical log detected"). It also stops with a 2-minute grace period:
-the shutdown takes about 10 s even for a small graph, longer than Docker's
-default.
-
-### Restore
-
-```bash
-make restore-neo4j DUMP=neo4j-<ISO8601-utc>.dump.age IDENTITY=<identity file>   # a dump in ./backup/snapshots; asks first
-# checks the identity and that the dump is age-encrypted, asks, then runs
-# scripts/neo4j_admin.sh load through scripts/audit-admin.sh:
-#   age -d -i <identity> <dump>          # the whole file, checked to hold a Neo4j dump, while Neo4j still runs
-#   docker compose stop neo4j
-#   age -d -i <identity> <dump> \
-#     | docker compose run --rm -T --entrypoint neo4j-admin neo4j \
-#         database load neo4j --from-stdin --overwrite-destination=true
-#                                        # neo4j-admin starts only once the dump's first bytes arrived
-#   docker compose start neo4j          # also when the load failed
-# records modify / restore.neo4j with the dump's name and size, encryption: age
-```
-
-This **overwrites** the neo4j database in the data volume. `neo4j-admin`
-replaces the database before it has read a byte of its input: an empty or
-broken stream leaves Neo4j with an empty database. Hence the first pass,
-which decrypts the whole file (age authenticates every part of it) and checks
-that it holds a Neo4j dump: another identity, a damaged file, or a Qdrant
-snapshot given as a dump never stops Neo4j. And the load starts only once the
-second decryption has delivered the dump's first bytes, so one that fails at
-once (a mistyped passphrase) never reaches it. A passphrase-protected
-identity is therefore asked for twice. A restore that is interrupted while
-`neo4j-admin` loads leaves a partial database behind; run it again.
-
-The identity is used for that run only and is never stored or recorded; take
-it off the host again afterwards. A restore takes only encrypted dumps ([Plaintext
-from earlier versions](#plaintext-from-earlier-versions)). Chorus migrations
-re-run idempotently on the next chorus deploy and bring the schema forward if
-needed.
-
-Validate after restore: run `MATCH (n) RETURN count(n);` in
-`make db-shell REASON="validate restore"` (recorded), or in the Neo4j Browser
-(dev: `make up-dev`; production: `make up-admin REASON="validate restore"`
-+ SSH tunnel, recorded, see README § Admin access; `make up` closes the ports
-again), and spot-check entity counts against the record kept at backup time.
-
-### Cadence
-
-Default suggestion: **nightly** dumps. Each one deletes the dumps older than
-`BACKUP_RETENTION_DAYS` (default 30) in `backup/snapshots/`; keep the off-host
-copies no longer ([Retention](#retention)). The offline dump window is the
-binding constraint.
 
 ## Qdrant
 
@@ -283,12 +205,12 @@ snapshots older than `BACKUP_RETENTION_DAYS` (default 30) in
 ## Retention
 
 Backups are short-lived restore points, not an archive: the data in the
-stores has a retention period of its own, and a backup kept longer would keep
-what the stores have already deleted. After every backup that succeeded,
-`make backup-neo4j` / `make backup-qdrant` delete that store's backups older
+store has a retention period of its own, and a backup kept longer would keep
+what the store has already deleted. After every backup that succeeded,
+`make backup-qdrant` (and with it `make backup`) deletes the backups older
 than `BACKUP_RETENTION_DAYS` days (default `30`, whole days from 1 to 365,
 in `.env` or on the command line); `make backup-prune` does it on its own. A
-backup that failed prunes nothing, and so does a Qdrant backup in which a
+backup that failed prunes nothing, and so does a backup in which a
 collection failed: the old snapshots stay the last restore point of that
 collection until a backup succeeds again.
 
@@ -299,9 +221,8 @@ collection until a backup succeeds again.
     names without a time or that the record cannot carry (anything but
     letters, digits and `._-`), and times in the future (check the host's
     clock).
-  - A file the backup account cannot delete (an unencrypted dump an earlier
-    version wrote as root) is named and counted as not deleted; remove it as
-    root.
+  - A file the backup account cannot delete (one root wrote) is named and
+    counted as not deleted; remove it as root.
 - **Grace.** A period that is new on the host takes effect when a pruning
   first sees it, and nothing is deleted for `RETENTION_NOTICE_DAYS` (default
   30) after that, so nothing an earlier version left is deleted without
@@ -323,7 +244,7 @@ collection until a backup succeeds again.
   refused and nothing is deleted. Deleting the file restarts the grace period.
 - **Off-host copies** are backups too. This repo cannot reach them: prune them
   at the same age, on the medium they are kept on.
-- **Recorded.** Each pruning is `delete` / `backup.prune.<store>` in the audit
+- **Recorded.** Each pruning is `delete` / `backup.prune.qdrant` in the audit
   trail, attributed like the backup that ran it, with the files deleted (by
   name), the period, the cutoff in effect and the counts; while a grace runs,
   also when it ends and, after a change, the period still in force
@@ -342,10 +263,9 @@ checkout:
 make backup REASON="scheduled backup"
 ```
 
-nightly, in the maintenance window (Neo4j stops for the dump), or
-`make backup-neo4j REASON="scheduled backup"` nightly and `make backup-qdrant
-REASON="scheduled backup"` hourly for the cadences above. `REASON=` is the
-purpose the default `AUDIT_REQUIRE_PURPOSE` asks of a backup (`disclose`).
+nightly, or hourly for the cadence above: the snapshots are online, so
+neither needs a maintenance window. `REASON=` is the purpose the default
+`AUDIT_REQUIRE_PURPOSE` asks of a backup (`disclose`).
 The unit runs as an account that may use Docker; the records name that
 account as the operator. Exit status: `0` when the backup was written and
 recorded; non-zero when it was refused (no usable recipients, no purpose,
@@ -356,11 +276,10 @@ their owner only (The recipients file, above).
 
 ## Plaintext from earlier versions
 
-Up to 0.5, backups were written unencrypted: Neo4j dumps (`*.dump`, written
-by a container, so owned by root) in `backup/snapshots/`, Qdrant snapshots in
-the `qdrant-snapshots` volume and wherever they were copied. Every backup reports what is left, on
-the host and in the volume, until it is gone; a restore takes only encrypted
-files.
+Up to 0.5, backups were written unencrypted: Qdrant snapshots in the
+`qdrant-snapshots` volume and wherever they were copied. Every backup reports
+what is left, on the host and in the volume, until it is gone; a restore takes
+only encrypted files.
 
 - To keep an unencrypted backup, encrypt it to the recipients, then delete
   the plaintext; it restores like any other:
@@ -382,10 +301,9 @@ files.
 A backup you have never restored is not a backup. Quarterly:
 
 1. Spin up a scratch data-plane project (`docker compose -p data-plane-drill ...`).
-2. Restore the most recent Neo4j dump and most recent Qdrant snapshot, each
-   with a keyholder's identity: this also proves the identity still
-   decrypts.
-3. Run the chorus and docint health endpoints against the drill stack.
+2. Restore the most recent Qdrant snapshot with a keyholder's identity: this
+   also proves the identity still decrypts.
+3. Run docint's health endpoint against the drill stack.
 4. Tear down the drill project.
 
 **The volumes are external and named.** A scratch project started from
