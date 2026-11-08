@@ -125,6 +125,8 @@ Full procedure in `backup/README.md`. The constraints to know when touching the 
 
 - **Qdrant snapshots are online**, via `POST /collections/<name>/snapshots`, one collection at a time from the host (invariant 6). The script reports what it wrote (collection names, the encrypted files' total size, the encryption) to `$AUDIT_FACTS` for the record; its progress goes to stderr. The encrypted files land in `backup/snapshots/`, the one directory the off-host copy takes. `restore-qdrant` streams the decrypted snapshot in through `docker compose exec` instead of `docker compose cp`, which keeps the host file's owner and mode: Qdrant runs as root without capabilities and cannot open a file it does not own.
 
+`.env.example` follows deploy's shared format (deploy `docs/runbooks/env-sync.md`, For member authors); check with `python3 -B ../deploy/scripts/check_env_examples.py .`
+
 ## Git & PR Workflow
 
 - Never commit directly to `main`; always branch (`feat/`, `fix/`) and open a PR.
